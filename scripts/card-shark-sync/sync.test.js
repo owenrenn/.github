@@ -11,7 +11,7 @@ test("any pm:-prefixed label counts, including one not yet in canon", () => {
   assert.ok(isPmLabel("pm:awareness"));
   assert.ok(isPmLabel("pm:action"));
   assert.ok(isPmLabel("pm:future-tier"));
-  assert.ok(!isPmLabel("product:arcade"));
+  assert.ok(!isPmLabel("product:example-repo"));
   assert.ok(!isPmLabel("type:bug"));
 });
 
@@ -142,7 +142,7 @@ const node = (over = {}) => ({
   content: over.content === null ? null : {
     __typename: over.__typename || "Issue",
     number: over.number || 15,
-    repository: { name: over.repo || "arcade", owner: { login: over.owner || "icntcloud" } },
+    repository: { name: over.repo || "example-repo", owner: { login: over.owner || "example-org" } },
   },
   fieldValues: { nodes: over.fieldValues || [] },
 });
@@ -156,7 +156,7 @@ test("a short board read reports unreadable rather than absent", () => {
   // when the read was provably complete.
   const r = resolveRemoval({
     boardNodes: [node()], received: 1, declared: 613,
-    owner: "icntcloud", repo: "arcade", number: 99,
+    owner: "example-org", repo: "example-repo", number: 99,
   });
   assert.equal(r.status, "unreadable");
 });
@@ -164,7 +164,7 @@ test("a short board read reports unreadable rather than absent", () => {
 test("a complete read that finds no match reports absent", () => {
   const r = resolveRemoval({
     boardNodes: [node()], received: 1, declared: 1,
-    owner: "icntcloud", repo: "arcade", number: 99,
+    owner: "example-org", repo: "example-repo", number: 99,
   });
   assert.equal(r.status, "absent");
 });
@@ -172,7 +172,7 @@ test("a complete read that finds no match reports absent", () => {
 test("a complete read finds the matching item id", () => {
   const r = resolveRemoval({
     boardNodes: [node({ id: "PVTI_lAHOABLEFc4BRJ30zg0-bOE" })], received: 1, declared: 1,
-    owner: "icntcloud", repo: "arcade", number: 15,
+    owner: "example-org", repo: "example-repo", number: 15,
   });
   assert.equal(r.status, "found");
   assert.equal(r.itemId, "PVTI_lAHOABLEFc4BRJ30zg0-bOE");
@@ -183,8 +183,8 @@ test("matching is scoped by OWNER too, not just repo name and number", () => {
   // one org and not the other -- but nothing stops one being created, and a
   // cross-owner collision would delete the wrong board item.
   const r = resolveRemoval({
-    boardNodes: [node({ owner: "owenrenn" })], received: 1, declared: 1,
-    owner: "icntcloud", repo: "arcade", number: 15,
+    boardNodes: [node({ owner: "other-org" })], received: 1, declared: 1,
+    owner: "example-org", repo: "example-repo", number: 15,
   });
   assert.equal(r.status, "absent");
 });
@@ -194,8 +194,8 @@ test("matching is scoped by repo NAME too", () => {
   // covered above; without this one, a same-owner same-number issue in a
   // different repo would resolve to this item and delete it.
   const r = resolveRemoval({
-    boardNodes: [node({ repo: "stravinsky" })], received: 1, declared: 1,
-    owner: "icntcloud", repo: "arcade", number: 15,
+    boardNodes: [node({ repo: "other-repo" })], received: 1, declared: 1,
+    owner: "example-org", repo: "example-repo", number: 15,
   });
   assert.equal(r.status, "absent");
 });
@@ -205,7 +205,7 @@ test("a pull request on the board is never matched as an issue", () => {
   // entirely and published `clear` over a large batch of strands.
   const r = resolveRemoval({
     boardNodes: [node({ __typename: "PullRequest" })], received: 1, declared: 1,
-    owner: "icntcloud", repo: "arcade", number: 15,
+    owner: "example-org", repo: "example-repo", number: 15,
   });
   assert.equal(r.status, "absent");
 });
@@ -213,7 +213,7 @@ test("a pull request on the board is never matched as an issue", () => {
 test("a draft item with null content does not throw", () => {
   const r = resolveRemoval({
     boardNodes: [node({ content: null })], received: 1, declared: 1,
-    owner: "icntcloud", repo: "arcade", number: 15,
+    owner: "example-org", repo: "example-repo", number: 15,
   });
   assert.equal(r.status, "absent");
 });
@@ -232,7 +232,7 @@ test("the preservation comment names every date it is rescuing", () => {
   });
   assert.match(c, /Deferred until.*2026-11-01/s);
   assert.match(c, /Due date.*2026-09-09/s);
-  assert.match(c, /owen-ops#469/);
+  assert.match(c, /card-shark-sync\.yml/);
 });
 
 const fs = require("node:fs");

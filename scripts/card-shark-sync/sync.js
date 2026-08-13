@@ -130,7 +130,7 @@ function preservationComment({ dates, itemId }) {
     "|---|---|",
     rows,
     "",
-    `<sub>Deleted item \`${itemId}\`. Automated by \`card-shark-sync.yml\` — owen-ops#469.</sub>`,
+    `<sub>Deleted item \`${itemId}\`. Automated by \`card-shark-sync.yml\`.</sub>`,
   ].join("\n");
 }
 
