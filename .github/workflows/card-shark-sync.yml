@@ -1,0 +1,207 @@
+# Card Shark membership sync — the two-way rule (owen-ops#469 Plan B).
+#
+#   An issue carries a pm:* label IF AND ONLY IF it is on Card Shark.
+#
+# Called by a stub in each of the 20 fleet repos. Subsumes what used to be two
+# copy-pasted workflows: add-to-project.yml (pm-surface) and
+# escalate-to-card-shark.yml (agent-zone). One source, because a 20th copy of a
+# body that must stay byte-identical is the defect class already tracked in
+# owen-ops#448 and #457.
+#
+# WHY the removal path resolves from the PROJECT side rather than reading
+# issue.projectItems: projectItems does not traverse an org-owned repo's issue
+# to a user-owned project, and it fails by returning an EMPTY LIST rather than an
+# error -- so the obvious implementation would delete nothing and exit 0 in 15 of
+# the 20 repos, forever. See scripts/card-shark-sync/sync.js resolveRemoval().
+#
+# WHY this repo is checked out explicitly below: actions/checkout in a REUSABLE
+# workflow checks out the CALLER, not the repo the workflow lives in. Without
+# the explicit `repository:` the require() finds the caller's tree and fails.
+name: card-shark-sync
+
+on:
+  workflow_call:
+    inputs:
+      audience:
+        description: "pm-surface or agent-zone — selects add-trigger semantics"
+        required: true
+        type: string
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the sync logic
+        uses: actions/checkout@v4
+        with:
+          repository: owenrenn/.github
+          ref: main
+          path: .card-shark-sync
+
+      - name: Decide what this event implies
+        id: decide
+        uses: actions/github-script@v9
+        # WHY the input arrives via env rather than ${{ }} inside script:
+        # interpolating an expression into a script body is the script-injection
+        # shape GitHub's hardening guidance names. This particular input comes
+        # from a committed stub and is not attacker-reachable, but the pattern is
+        # worth not teaching -- this workflow is the fleet's template for reusable
+        # workflows, and the next one may take a genuinely untrusted input.
+        env:
+          AUDIENCE: ${{ inputs.audience }}
+        with:
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          script: |
+            const { decideAction } = require(`${process.env.GITHUB_WORKSPACE}/.card-shark-sync/scripts/card-shark-sync/sync.js`);
+
+            // A FRESH label read, not context.payload.issue.labels. The payload
+            // describes the moment the event fired; an issue that lost one of two
+            // pm:* labels must stay on the board, and only a current read can say.
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const currentLabels = issue.labels.map((l) => (typeof l === "string" ? l : l.name));
+
+            const decision = decideAction({
+              eventAction: context.payload.action,
+              audience: process.env.AUDIENCE,
+              eventLabel: context.payload.label?.name,
+              currentLabels,
+            });
+            core.info(`decision=${decision.kind} — ${decision.reason}`);
+            core.setOutput("kind", decision.kind);
+            core.setOutput("backfill", decision.backfillLabel || "");
+            core.setOutput("product", decision.applyProductLabel ? "yes" : "");
+
+      - name: Backfill pm:awareness
+        if: steps.decide.outputs.backfill != ''
+        uses: actions/github-script@v9
+        with:
+          # The PAT, not GITHUB_TOKEN: issues-triggered workflows get a read-only
+          # default token, so addLabels() 403s without it.
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          script: |
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ["${{ steps.decide.outputs.backfill }}"],
+            });
+
+      - name: Add to Card Shark
+        if: steps.decide.outputs.kind == 'add'
+        uses: actions/add-to-project@v2
+        with:
+          project-url: https://github.com/users/owenrenn/projects/5
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
+
+      - name: Apply product:<repo> label
+        if: steps.decide.outputs.product != ''
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          script: |
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: [`product:${context.repo.repo}`],
+            });
+
+      - name: Remove from Card Shark
+        if: steps.decide.outputs.kind == 'remove'
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          script: |
+            const { resolveRemoval, preservationComment } = require(`${process.env.GITHUB_WORKSPACE}/.card-shark-sync/scripts/card-shark-sync/sync.js`);
+            const PROJECT_ID = "PVT_kwHOABLEFc4BRJ30";
+
+            // archivedStates is NOT optional. ProjectV2.items excludes archived
+            // items by default and filters totalCount identically, so omitting it
+            // makes the received-vs-declared guard read clean over a partial board.
+            // __typename and repository.owner.login are equally load-bearing --
+            // resolveRemoval refuses to match without them, which fails SILENTLY as
+            // "nothing to remove".
+            const BOARD_QUERY = `
+              query($cursor: String) {
+                node(id: "${PROJECT_ID}") {
+                  ... on ProjectV2 {
+                    id
+                    items(first: 100, after: $cursor, archivedStates: [ARCHIVED, NOT_ARCHIVED]) {
+                      totalCount
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        id
+                        content {
+                          __typename
+                          ... on Issue { number repository { name owner { login } } }
+                        }
+                        fieldValues(first: 20) {
+                          nodes {
+                            ... on ProjectV2ItemFieldDateValue {
+                              date
+                              field { ... on ProjectV2FieldCommon { name } }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`;
+
+            let cursor = null, nodes = [], declared = null, projectId = null;
+            do {
+              const r = await github.graphql(BOARD_QUERY, { cursor });
+              const items = r.node.items;
+              projectId = r.node.id;
+              declared = items.totalCount;
+              nodes = nodes.concat(items.nodes);
+              cursor = items.pageInfo.hasNextPage ? items.pageInfo.endCursor : null;
+            } while (cursor);
+
+            // Assert the board we READ is the project we would WRITE to.
+            if (projectId !== PROJECT_ID) {
+              core.setFailed(`read project ${projectId}, expected ${PROJECT_ID}`);
+              return;
+            }
+
+            const r = resolveRemoval({
+              boardNodes: nodes, received: nodes.length, declared,
+              owner: context.repo.owner, repo: context.repo.repo, number: context.issue.number,
+            });
+
+            if (r.status === "unreadable") {
+              // Loud on purpose. A short read cannot tell "not on the board" from
+              // "did not see the whole board", and the second must never be
+              // reported as the first.
+              core.setFailed(`board read short: received ${r.received} of ${r.declared} — refusing to conclude absence`);
+              return;
+            }
+            if (r.status === "absent") {
+              core.info("not on Card Shark — nothing to remove");
+              return;
+            }
+
+            // Preserve first, delete second. If the comment fails, the delete does
+            // not happen -- losing a hand-set date silently is the failure this
+            // ordering exists to prevent.
+            if (r.dates.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: preservationComment({ dates: r.dates, itemId: r.itemId }),
+              });
+            }
+
+            await github.graphql(
+              `mutation($projectId: ID!, $itemId: ID!) {
+                 deleteProjectV2Item(input: {projectId: $projectId, itemId: $itemId}) { deletedItemId }
+               }`,
+              { projectId: PROJECT_ID, itemId: r.itemId },
+            );
+            core.info(`removed ${r.itemId} from Card Shark`);

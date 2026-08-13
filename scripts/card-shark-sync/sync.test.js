@@ -189,6 +189,17 @@ test("matching is scoped by OWNER too, not just repo name and number", () => {
   assert.equal(r.status, "absent");
 });
 
+test("matching is scoped by repo NAME too", () => {
+  // The third dimension of the match predicate. Owner and number collisions are
+  // covered above; without this one, a same-owner same-number issue in a
+  // different repo would resolve to this item and delete it.
+  const r = resolveRemoval({
+    boardNodes: [node({ repo: "stravinsky" })], received: 1, declared: 1,
+    owner: "icntcloud", repo: "arcade", number: 15,
+  });
+  assert.equal(r.status, "absent");
+});
+
 test("a pull request on the board is never matched as an issue", () => {
   // WHY __typename is load-bearing: deleting it once blanked Plan A's detector
   // entirely and published `clear` over ~121 strands.
@@ -222,4 +233,58 @@ test("the preservation comment names every date it is rescuing", () => {
   assert.match(c, /Deferred until.*2026-11-01/s);
   assert.match(c, /Due date.*2026-09-09/s);
   assert.match(c, /owen-ops#469/);
+});
+
+const fs = require("node:fs");
+const path = require("node:path");
+const WORKFLOW = fs.readFileSync(
+  path.join(__dirname, "../../.github/workflows/card-shark-sync.yml"), "utf8",
+);
+
+test("the board query asks for archived items explicitly", () => {
+  // archivedStates IS THE TRAP. ProjectV2.items excludes archived items by
+  // default AND filters totalCount the same way, so received-vs-declared reads
+  // clean over a partial board. Measured on the real board: 176 visible vs 607
+  // actual. Without this, resolveRemoval's guard is decorative.
+  assert.match(WORKFLOW, /archivedStates:\s*\[ARCHIVED,\s*NOT_ARCHIVED\]/);
+});
+
+test("the board query still asks each node for __typename", () => {
+  // Load-bearing and easy to mistake for noise: resolveRemoval refuses to match
+  // anything that is not an Issue, so without __typename it matches NOTHING and
+  // every removal reports `absent`. Silent, and on the success path.
+  assert.match(WORKFLOW, /__typename/);
+});
+
+test("the board query asks for the repository OWNER, not just the name", () => {
+  assert.match(WORKFLOW, /owner\s*\{\s*login/);
+});
+
+test("the workflow asserts the board it read is the project it will write to", () => {
+  // Same guard escalation-reconcile.yml carries: a wrong project id would page
+  // some other board, find no match, and report a clean `absent`.
+  assert.match(WORKFLOW, /PVT_kwHOABLEFc4BRJ30/);
+});
+
+test("the workflow pages the board rather than reading one page", () => {
+  // 613 items against a 100-item page. A single page IS a short read, which the
+  // guard would correctly call unreadable -- every removal would fail.
+  assert.match(WORKFLOW, /hasNextPage/);
+  assert.match(WORKFLOW, /endCursor/);
+});
+
+test("the reusable workflow declares its contract: workflow_call + a required audience input", () => {
+  // NOT a trigger assertion. `on: issues: types: [opened, labeled, unlabeled]`
+  // lives in the per-repo STUB -- a reusable workflow declares only
+  // workflow_call, so asserting the three event names against THIS file asserts
+  // something it can never contain. (It did, in an earlier draft of the plan.)
+  // The trigger coverage is asserted where the triggers actually live, against
+  // the script that emits the stub.
+  //
+  // What IS this file's contract is the input all 20 stubs must pass. Renaming
+  // or dropping it breaks every repo at once, and decideAction throws rather
+  // than silently choosing a branch -- loud, but only if the input still arrives.
+  assert.match(WORKFLOW, /workflow_call:/);
+  assert.match(WORKFLOW, /audience:/);
+  assert.match(WORKFLOW, /required:\s*true/);
 });

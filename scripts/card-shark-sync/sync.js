@@ -90,6 +90,11 @@ function resolveRemoval({ boardNodes, received, declared, owner, repo, number })
   if (received !== declared) {
     return { status: "unreadable", received, declared };
   }
+  // Leans on GraphQL's schema guarantees: Issue.repository, Repository.owner and
+  // RepositoryOwner.login are all non-null, so a node that IS an Issue always has
+  // these. A malformed nested shape would fall through to `absent` -- silent, and
+  // on the success path -- so if Task 3's query selection ever narrows, this
+  // assumption is what breaks first.
   const hit = (boardNodes || []).find((n) => {
     const c = n && n.content;
     if (!c || c.__typename !== "Issue") return false;
