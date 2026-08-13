@@ -296,6 +296,26 @@ test("the preservation comment is posted BEFORE the delete, with nothing catchin
   assert.ok(!/try\s*\{/.test(WORKFLOW_CODE));
 });
 
+test("the add path uses the idempotent mutation, not actions/add-to-project", () => {
+  // actions/add-to-project@v2 FAILS with "Content already exists in this project"
+  // when the issue is already on the board -- which is the ordinary promotion
+  // path (adding pm:action to an issue that already carries pm:awareness), not an
+  // edge case. It went red on every promotion while producing the right end
+  // state, and a habitually-red workflow is one whose real failures go unread.
+  //
+  // Asserted against WORKFLOW_CODE because the comment above the fix names the
+  // action it replaced -- matching raw text here would pass on a file that had
+  // been reverted to using it.
+  assert.match(WORKFLOW_CODE, /addProjectV2ItemById/);
+  assert.ok(!/uses:\s*actions\/add-to-project/.test(WORKFLOW_CODE));
+});
+
+test("the add mutation passes the issue node id, not the issue number", () => {
+  // addProjectV2ItemById takes a global node id. Passing context.issue.number
+  // would fail at runtime only, on a path no unit test reaches.
+  assert.match(WORKFLOW_CODE, /contentId:\s*context\.payload\.issue\.node_id/);
+});
+
 test("the workflow serializes per issue", () => {
   assert.match(WORKFLOW_CODE, /concurrency:/);
   assert.match(WORKFLOW_CODE, /cancel-in-progress:\s*false/);
