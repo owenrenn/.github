@@ -226,7 +226,13 @@ jobs:
               nodes = nodes.concat(items.nodes);
               cursor = items.pageInfo.hasNextPage ? items.pageInfo.endCursor : null;
               page++;
-              if (page >= 20) {
+              if (cursor && page >= 20) {
+                // Gated on `cursor` deliberately: without it, a read that
+                // legitimately COMPLETES on page 20 fails identically to a
+                // cursor that stopped advancing. Distinguishing those is the
+                // entire job of this guard, so conflating them here would be
+                // the same defect it exists to catch.
+                //
                 // Cap, not a guess: 614 items at 100/page is 7. Hitting 20 means
                 // the cursor stopped advancing, on a workflow that fires on every
                 // label event across 20 repos -- left unbounded this loops until

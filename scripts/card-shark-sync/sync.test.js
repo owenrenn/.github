@@ -304,8 +304,8 @@ test("the workflow serializes per issue", () => {
 test("the workflow pages the board rather than reading one page", () => {
   // 613 items against a 100-item page. A single page IS a short read, which the
   // guard would correctly call unreadable -- every removal would fail.
-  assert.match(WORKFLOW, /hasNextPage/);
-  assert.match(WORKFLOW, /endCursor/);
+  assert.match(WORKFLOW_CODE, /hasNextPage/);
+  assert.match(WORKFLOW_CODE, /endCursor/);
 });
 
 test("the reusable workflow declares its contract: workflow_call + a required audience input", () => {
@@ -319,7 +319,7 @@ test("the reusable workflow declares its contract: workflow_call + a required au
   // What IS this file's contract is the input all 20 stubs must pass. Renaming
   // or dropping it breaks every repo at once, and decideAction throws rather
   // than silently choosing a branch -- loud, but only if the input still arrives.
-  assert.match(WORKFLOW, /workflow_call:/);
-  assert.match(WORKFLOW, /audience:/);
-  assert.match(WORKFLOW, /required:\s*true/);
+  assert.match(WORKFLOW_CODE, /workflow_call:/);
+  assert.match(WORKFLOW_CODE, /audience:/);
+  assert.match(WORKFLOW_CODE, /required:\s*true/);
 });
