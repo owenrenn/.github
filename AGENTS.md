@@ -19,8 +19,37 @@ canon — where a rule must be duplicated, duplicate it in the **wider** directi
 `pm:` prefix test rather than an enumerated label set) and name the divergence in a
 comment.
 
-Never put a credential here. The project ID in `card-shark-sync.yml` is an identifier,
-not a secret; the PAT arrives via the caller's `secrets: inherit`.
+### The content rule — "no credentials" is not the whole of it
+
+Never put a credential here. That much is obvious, and it is **not the rule that actually
+binds.** This repo is public *by necessity* — a reusable workflow must be public to be
+callable from another organization — so everything committed here is published, including
+comments, test fixtures, and prose that would be unremarkable in a private repo.
+
+**Do not publish what the platform withholds.** GitHub returns `404` for a private
+repository to an anonymous caller: it will not even confirm the repo exists. Naming those
+repositories here does better than that, and defeats it. So:
+
+- Name **roles**, not repositories — "an agent-zone repo", "the operations repo", "a
+  caller". Never the actual name.
+- Keep the **mechanism**, drop the **incident**. *"`secrets: inherit` does not traverse
+  organizations"* is the durable lesson and belongs in the comment. *Which* repo it was
+  measured on is incidental, and is the part that leaks.
+- Test fixtures use synthetic names (`example-org`, `example-repo`). A fixture is
+  arbitrary data, so real names buy nothing and disclose an inventory.
+- Quote magnitudes, not counts. "Several hundred board items", not the exact figure.
+- Issue references are bare `#N` and point at the private operations repo. A reader with
+  access can follow them; a reader without learns nothing from the number.
+
+**The one deliberate exception** is the project ID in `card-shark-sync.yml`. It is a
+handle, not a key — verified 2026-08-13: an unauthenticated GraphQL request carrying it
+returns `403`, and an authenticated one still requires authorization on the project
+itself. It stays because the workflow cannot resolve the board without it. If that ever
+becomes removable at reasonable cost, remove it: it is the last thing here that confirms
+a private surface exists.
+
+The PAT is forwarded explicitly by each caller, never via `secrets: inherit` — see the
+stub comment for why.
 
 ## Working here
 
