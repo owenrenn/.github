@@ -1,9 +1,9 @@
-// Pure decision layer for the Card Shark exit valve (owen-ops#469 Plan B).
+// Pure decision layer for the Card Shark exit valve (#469 Plan B).
 //
 // Every decision this workflow makes lives here so it can be tested without a
 // board, a token, or an event. The workflow does I/O and nothing else.
 //
-// This repo is PUBLIC and the fleet canon (owen-ops/.github/labels.json,
+// This repo is PUBLIC and the fleet canon (the operations repo's labels.json,
 // fleet.json) is PRIVATE, so nothing here may depend on reading canon. Where a
 // rule must be duplicated rather than derived, it is duplicated in the WIDER
 // direction and the divergence is named in a comment.
@@ -78,13 +78,13 @@ function datesOf(boardNode) {
  * The obvious implementation -- read issue.projectItems and delete the match --
  * cannot be used: projectItems does not traverse an org-owned repo's issue to a
  * user-owned project, and it fails by returning an EMPTY LIST rather than an
- * error. It would run to completion, delete nothing, and exit 0 in 15 of the 20
- * fleet repos. Spec 2.
+ * error. It would run to completion, delete nothing, and exit 0 in most of the
+ * fleet's repos. Spec 2.
  *
  * Which means absence is only meaningful if the read was complete, so the
  * received-vs-declared guard runs BEFORE any matching. A short read reports
  * `unreadable`; it must never be reported as a difference. (Same rule, and the
- * same reason, as guardBoardRead in owen-ops scripts/escalation/reconcile.js.)
+ * same reason, as guardBoardRead in the operations repo's escalation reconciler.)
  */
 function resolveRemoval({ boardNodes, received, declared, owner, repo, number }) {
   if (received !== declared) {
@@ -113,9 +113,9 @@ function resolveRemoval({ boardNodes, received, declared, owner, repo, number })
  *
  * Engagement, Track and Priority all derive from labels and the autofill sweep
  * restores them on re-escalation. Deferred until and Due date do not -- they are
- * hand-set, and deleting the item is the only place they can be lost. 26 items
- * carry a deferral as of 2026-08-13 (the parking pass put them there), so this
- * is no longer the negligible loss the original spec priced.
+ * hand-set, and deleting the item is the only place they can be lost. Several
+ * dozen items carry a deferral as of 2026-08-13 (the parking pass put them
+ * there), so this is no longer the negligible loss the original spec priced.
  */
 function preservationComment({ dates, itemId }) {
   const rows = dates.map((d) => `| ${d.field} | ${d.date} |`).join("\n");

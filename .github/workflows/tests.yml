@@ -1,10 +1,10 @@
-# WHY this repo has CI at all: owen-ops#469 Plan B moved the fleet's board-sync
+# WHY this repo has CI at all: #469 Plan B moved the fleet's board-sync
 # logic here, because a public repo's reusable workflow is callable cross-org and
 # a private one is not. That made a community-health repo into a code repo.
 #
-# WHY the tests live here and not in owen-ops: the code EXECUTES from here. A
-# suite in owen-ops asserting against an owen-ops copy would be a mirror test --
-# it proves the two copies agree, not that the shipped one works.
+# WHY the tests live here and not in the operations repo: the code EXECUTES from
+# here. A suite in the operations repo asserting against a copy kept there would
+# be a mirror test -- it proves the two copies agree, not that the shipped one works.
 name: tests
 
 on:

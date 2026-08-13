@@ -5,7 +5,7 @@ const { resolveRemoval, datesOf, preservationComment } = require("./sync.js");
 
 test("any pm:-prefixed label counts, including one not yet in canon", () => {
   // WHY prefix rather than a derived set: reconcile.js derives the pm:* set from
-  // owen-ops/.github/labels.json, which is PRIVATE and unreachable from this
+  // the operations repo's labels.json, which is PRIVATE and unreachable from this
   // public repo. Prefix is the wider rule, so a third tier is swept here by
   // default rather than silently skipped -- the safe direction to diverge in.
   assert.ok(isPmLabel("pm:awareness"));
@@ -58,8 +58,8 @@ test("labeling pm:* on agent-zone adds and applies the product label", () => {
 });
 
 test("labeling pm:* on pm-surface adds but applies no product label", () => {
-  // WHY: owen-ops and zetaglobal are the meta repos; items there belong to no
-  // product. AGENTS.md 'No product:* labels'.
+  // WHY: the operations repo and the work-knowledge repo are the meta repos;
+  // items there belong to no product. AGENTS.md 'No product:* labels'.
   const d = decideAction({
     eventAction: "labeled",
     audience: "pm-surface",
@@ -124,7 +124,7 @@ test("an unknown audience throws rather than silently choosing a branch", () => 
 test("an agent-zone issue opened ALREADY carrying pm:* is still a noop", () => {
   // Looks like a silent loss and is not: GitHub fires issues.labeled for labels
   // applied at creation, so the `labeled` path always follows and delivers it.
-  // Measured rather than assumed -- icntcloud/stravinsky#788 was created
+  // Measured rather than assumed -- a real agent-zone repo's issue was created
   // 02:39:09Z, took pm:action at 02:39:11Z, and escalate-to-card-shark.yml ran
   // at 02:39:13Z with conclusion `success`, with the daily reconciler's next run
   // ~11h away and therefore unable to be what delivered it.
@@ -152,7 +152,7 @@ const dateValue = (name, date) => ({ date, field: { name } });
 test("a short board read reports unreadable rather than absent", () => {
   // WHY THIS IS THE WHOLE POINT: projectItems returns an EMPTY LIST, not an
   // error, for org-repo -> user-project. A no-match that we trusted would delete
-  // nothing and exit 0 in 15 of 20 repos. Spec 2. So absence is only believable
+  // nothing and exit 0 in most fleet repos. Spec 2. So absence is only believable
   // when the read was provably complete.
   const r = resolveRemoval({
     boardNodes: [node()], received: 1, declared: 613,
@@ -179,8 +179,8 @@ test("a complete read finds the matching item id", () => {
 });
 
 test("matching is scoped by OWNER too, not just repo name and number", () => {
-  // WHY: two orgs can hold a same-named repo. owenrenn/arbor exists and an
-  // icntcloud/arbor does not -- but nothing stops one being created, and a
+  // WHY: two orgs can hold a same-named repo. A repo of that name exists under
+  // one org and not the other -- but nothing stops one being created, and a
   // cross-owner collision would delete the wrong board item.
   const r = resolveRemoval({
     boardNodes: [node({ owner: "owenrenn" })], received: 1, declared: 1,
@@ -202,7 +202,7 @@ test("matching is scoped by repo NAME too", () => {
 
 test("a pull request on the board is never matched as an issue", () => {
   // WHY __typename is load-bearing: deleting it once blanked Plan A's detector
-  // entirely and published `clear` over ~121 strands.
+  // entirely and published `clear` over a large batch of strands.
   const r = resolveRemoval({
     boardNodes: [node({ __typename: "PullRequest" })], received: 1, declared: 1,
     owner: "icntcloud", repo: "arcade", number: 15,
@@ -249,8 +249,9 @@ const WORKFLOW_CODE = WORKFLOW.replace(/^\s*(#|\/\/).*$/gm, "");
 test("the board query asks for archived items explicitly", () => {
   // archivedStates IS THE TRAP. ProjectV2.items excludes archived items by
   // default AND filters totalCount the same way, so received-vs-declared reads
-  // clean over a partial board. Measured on the real board: 176 visible vs 607
-  // actual. Without this, resolveRemoval's guard is decorative.
+  // clean over a partial board. Measured on the real board: only a small
+  // fraction of items were visible against the majority sitting archived.
+  // Without this, resolveRemoval's guard is decorative.
   assert.match(WORKFLOW_CODE, /archivedStates:\s*\[ARCHIVED,\s*NOT_ARCHIVED\]/);
 });
 
@@ -322,8 +323,9 @@ test("the workflow serializes per issue", () => {
 });
 
 test("the workflow pages the board rather than reading one page", () => {
-  // 613 items against a 100-item page. A single page IS a short read, which the
-  // guard would correctly call unreadable -- every removal would fail.
+  // Several hundred items against a 100-item page. A single page IS a short
+  // read, which the guard would correctly call unreadable -- every removal
+  // would fail.
   assert.match(WORKFLOW_CODE, /hasNextPage/);
   assert.match(WORKFLOW_CODE, /endCursor/);
 });
