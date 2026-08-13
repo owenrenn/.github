@@ -126,10 +126,32 @@ jobs:
 
       - name: Add to Card Shark
         if: steps.decide.outputs.kind == 'add'
-        uses: actions/add-to-project@v2
+        uses: actions/github-script@v9
         with:
-          project-url: https://github.com/users/owenrenn/projects/5
           github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          # WHY the raw mutation instead of actions/add-to-project@v2: that action
+          # FAILS with "Content already exists in this project" when the issue is
+          # already on the board. That is not an edge case -- promoting an issue
+          # from pm:awareness to pm:action means adding a second pm:* label to an
+          # issue that is already there, so the routine promotion path went red
+          # every time while producing the correct end state. A workflow that is
+          # habitually red is one whose real failures nobody reads.
+          #
+          # addProjectV2ItemById is genuinely idempotent: measured 2026-08-13, it
+          # returns the EXISTING item id for content already in the project (and
+          # unarchives an archived one). Same call, no third-party action, and it
+          # drops the Node-20 deprecation warning that action carries.
+          script: |
+            const PROJECT_ID = "PVT_kwHOABLEFc4BRJ30";
+            const r = await github.graphql(
+              `mutation($projectId: ID!, $contentId: ID!) {
+                 addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+                   item { id }
+                 }
+               }`,
+              { projectId: PROJECT_ID, contentId: context.payload.issue.node_id },
+            );
+            core.info(`on Card Shark as ${r.addProjectV2ItemById.item.id}`);
 
       - name: Apply product:<repo> label
         if: steps.decide.outputs.product != ''
