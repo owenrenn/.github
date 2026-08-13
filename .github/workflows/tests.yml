@@ -1,0 +1,29 @@
+# WHY this repo has CI at all: owen-ops#469 Plan B moved the fleet's board-sync
+# logic here, because a public repo's reusable workflow is callable cross-org and
+# a private one is not. That made a community-health repo into a code repo.
+#
+# WHY the tests live here and not in owen-ops: the code EXECUTES from here. A
+# suite in owen-ops asserting against an owen-ops copy would be a mirror test --
+# it proves the two copies agree, not that the shipped one works.
+name: tests
+
+on:
+  push: { paths: &test_paths ["scripts/**", ".github/workflows/tests.yml", ".github/workflows/card-shark-sync.yml"] }
+  pull_request: { paths: *test_paths }
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Run card-shark-sync module tests
+        run: node --test scripts/card-shark-sync/*.test.js
+      - name: Validate workflow YAML
+        # The node suite asserts against the file's TEXT (regexes over raw
+        # content); nothing in it parses the file as YAML. A broken indent
+        # passes all 27+ text assertions and is a fleet-wide outage the next
+        # time any of the 20 stub repos calls this workflow.
+        run: python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/card-shark-sync.yml'))"
