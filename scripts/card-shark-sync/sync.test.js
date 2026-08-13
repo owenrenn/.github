@@ -240,30 +240,65 @@ const path = require("node:path");
 const WORKFLOW = fs.readFileSync(
   path.join(__dirname, "../../.github/workflows/card-shark-sync.yml"), "utf8",
 );
+// Assertions about CODE must not be satisfiable by a COMMENT. The __typename
+// test passed against a comment mentioning __typename while the query selection
+// had it removed -- the test defended nothing, in the file whose whole subject
+// is failures that look like successes.
+const WORKFLOW_CODE = WORKFLOW.replace(/^\s*(#|\/\/).*$/gm, "");
 
 test("the board query asks for archived items explicitly", () => {
   // archivedStates IS THE TRAP. ProjectV2.items excludes archived items by
   // default AND filters totalCount the same way, so received-vs-declared reads
   // clean over a partial board. Measured on the real board: 176 visible vs 607
   // actual. Without this, resolveRemoval's guard is decorative.
-  assert.match(WORKFLOW, /archivedStates:\s*\[ARCHIVED,\s*NOT_ARCHIVED\]/);
+  assert.match(WORKFLOW_CODE, /archivedStates:\s*\[ARCHIVED,\s*NOT_ARCHIVED\]/);
 });
 
 test("the board query still asks each node for __typename", () => {
   // Load-bearing and easy to mistake for noise: resolveRemoval refuses to match
   // anything that is not an Issue, so without __typename it matches NOTHING and
   // every removal reports `absent`. Silent, and on the success path.
-  assert.match(WORKFLOW, /__typename/);
+  assert.match(WORKFLOW_CODE, /__typename/);
 });
 
 test("the board query asks for the repository OWNER, not just the name", () => {
-  assert.match(WORKFLOW, /owner\s*\{\s*login/);
+  assert.match(WORKFLOW_CODE, /owner\s*\{\s*login/);
 });
 
 test("the workflow asserts the board it read is the project it will write to", () => {
-  // Same guard escalation-reconcile.yml carries: a wrong project id would page
-  // some other board, find no match, and report a clean `absent`.
-  assert.match(WORKFLOW, /PVT_kwHOABLEFc4BRJ30/);
+  // Same guard escalation-reconcile.yml carries, and now genuinely: resolving
+  // by NUMBER and asserting the ID means a wrong project id fails loudly
+  // instead of paging some other board and reporting a clean `absent`. (The
+  // node(id:) form this replaced made the comparison tautological -- a
+  // node(id: X) query always returns the node whose id is X, so the "guard"
+  // was dead code wearing this comment.)
+  assert.match(WORKFLOW_CODE, /PVT_kwHOABLEFc4BRJ30/);
+});
+
+test("the board query resolves the project by NUMBER, not by the id it asserts", () => {
+  // The guard is only meaningful if lookup key and asserted value are independent.
+  assert.match(WORKFLOW_CODE, /projectV2\(number:\s*5\)/);
+  assert.match(WORKFLOW_CODE, /project\.id !== PROJECT_ID/);
+});
+
+test("the sync logic is checked out from owenrenn/.github, not the caller", () => {
+  // actions/checkout in a REUSABLE workflow checks out the CALLER by default, so
+  // without this the require() resolves against the calling repo and every run
+  // dies at step 1. Named in the commit message as pinned; it was not.
+  assert.match(WORKFLOW_CODE, /repository:\s*owenrenn\/\.github/);
+});
+
+test("the preservation comment is posted BEFORE the delete, with nothing catching between", () => {
+  // The one unrecoverable-loss invariant in the file: a hand-set Deferred until
+  // exists nowhere else once the item is gone. Reordering these two currently
+  // ships green.
+  assert.ok(WORKFLOW_CODE.indexOf("createComment") < WORKFLOW_CODE.indexOf("deleteProjectV2Item"));
+  assert.ok(!/try\s*\{/.test(WORKFLOW_CODE));
+});
+
+test("the workflow serializes per issue", () => {
+  assert.match(WORKFLOW_CODE, /concurrency:/);
+  assert.match(WORKFLOW_CODE, /cancel-in-progress:\s*false/);
 });
 
 test("the workflow pages the board rather than reading one page", () => {

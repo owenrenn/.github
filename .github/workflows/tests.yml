@@ -21,3 +21,9 @@ jobs:
           node-version: "24"
       - name: Run card-shark-sync module tests
         run: node --test scripts/card-shark-sync/*.test.js
+      - name: Validate workflow YAML
+        # The node suite asserts against the file's TEXT (regexes over raw
+        # content); nothing in it parses the file as YAML. A broken indent
+        # passes all 27+ text assertions and is a fleet-wide outage the next
+        # time any of the 20 stub repos calls this workflow.
+        run: python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/card-shark-sync.yml'))"

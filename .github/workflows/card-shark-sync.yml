@@ -26,15 +26,43 @@ on:
         description: "pm-surface or agent-zone — selects add-trigger semantics"
         required: true
         type: string
+    secrets:
+      # Declared so a caller that passes secrets explicitly (rather than
+      # `secrets: inherit`) fails at the CALL boundary if it forgets this one,
+      # instead of every write step 403ing individually, late and confusingly.
+      ADD_TO_PROJECT_PAT:
+        required: true
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # Every write in this job goes through the PAT below, not GITHUB_TOKEN --
+    # this is the one permission a caller of a REUSABLE workflow cannot see, so
+    # it stays minimal here rather than inheriting whatever the caller granted.
+    permissions:
+      contents: read
+    # Label ops arrive as independent events. A demotion (remove pm:action, add
+    # pm:awareness) fires two runs; without this, the `unlabeled` run's fresh
+    # label read can land before the `labeled` run's board insert, decide
+    # `remove`, and delete an item that was just re-added -- the exact
+    # invariant (pm:* <=> on-board) this valve exists to hold. Same reasoning as
+    # escalation-reconcile.yml's concurrency group.
+    concurrency:
+      group: card-shark-sync-${{ github.repository }}-${{ github.event.issue.number }}
+      # false, not true: a cancelled run can land between the preservation
+      # comment and the delete, which is exactly the unrecoverable half-step
+      # that ordering exists to prevent. Queue behind the in-flight run instead.
+      cancel-in-progress: false
     steps:
       - name: Check out the sync logic
         uses: actions/checkout@v4
         with:
           repository: owenrenn/.github
+          # Callers are told to reference this reusable workflow as `@main`, not
+          # a version tag, so this ref and the caller's `uses:` line always name
+          # the same commit. Pinning a caller to `@v1` while this checkout stays
+          # on `main` would run workflow-v1 against scripts-from-main -- a
+          # silent split between the two halves of one release.
           ref: main
           path: .card-shark-sync
 
@@ -78,6 +106,12 @@ jobs:
       - name: Backfill pm:awareness
         if: steps.decide.outputs.backfill != ''
         uses: actions/github-script@v9
+        # Same reasoning as the AUDIENCE env above: this value is a step output,
+        # not attacker input, but interpolating ${{ }} into a script body is the
+        # pattern this file argues against in its own comments, and it is the
+        # template the fleet copies. Route it through env like everything else.
+        env:
+          BACKFILL: ${{ steps.decide.outputs.backfill }}
         with:
           # The PAT, not GITHUB_TOKEN: issues-triggered workflows get a read-only
           # default token, so addLabels() 403s without it.
@@ -87,7 +121,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              labels: ["${{ steps.decide.outputs.backfill }}"],
+              labels: [process.env.BACKFILL],
             });
 
       - name: Add to Card Shark
@@ -125,10 +159,20 @@ jobs:
             // __typename and repository.owner.login are equally load-bearing --
             // resolveRemoval refuses to match without them, which fails SILENTLY as
             // "nothing to remove".
+            //
+            // WHY resolve by NUMBER, not by re-fetching node(id: PROJECT_ID): that
+            // form makes the read and the guard the SAME hardcoded value, so
+            // asserting they match is dead code -- a `node(id: X)` query always
+            // returns the node whose id is X. Resolving by the owner+number
+            // instead means the two hardcoded board references in this file (this
+            // constant, and the add path's project-url two steps up) are
+            // independent, and a mismatch between them -- a recreated or
+            // renumbered board -- fails loudly here instead of silently paging the
+            // wrong board and reporting every removal `absent` forever.
             const BOARD_QUERY = `
               query($cursor: String) {
-                node(id: "${PROJECT_ID}") {
-                  ... on ProjectV2 {
+                user(login: "owenrenn") {
+                  projectV2(number: 5) {
                     id
                     items(first: 100, after: $cursor, archivedStates: [ARCHIVED, NOT_ARCHIVED]) {
                       totalCount
@@ -139,7 +183,7 @@ jobs:
                           __typename
                           ... on Issue { number repository { name owner { login } } }
                         }
-                        fieldValues(first: 20) {
+                        fieldValues(first: 50) {
                           nodes {
                             ... on ProjectV2ItemFieldDateValue {
                               date
@@ -153,21 +197,46 @@ jobs:
                 }
               }`;
 
-            let cursor = null, nodes = [], declared = null, projectId = null;
+            let cursor = null, nodes = [], declared = null, page = 0;
             do {
               const r = await github.graphql(BOARD_QUERY, { cursor });
-              const items = r.node.items;
-              projectId = r.node.id;
+              const project = r.user?.projectV2;
+              // Null rather than an error is how a renamed owner or a deleted
+              // project arrives. Without this the failure surfaces as an opaque
+              // TypeError one line later.
+              if (!project) {
+                core.setFailed("project owenrenn/projects/5 did not resolve");
+                return;
+              }
+              if (page === 0) {
+                // LIVE now, where the old node(id:) form made this tautological:
+                // resolving by NUMBER and asserting the ID means the two
+                // hardcoded board references -- the add path's project-url and
+                // this constant -- must agree, or the run fails loudly instead
+                // of paging the wrong board and reporting `absent`. Checked on
+                // the first page only, before paging continues -- the id cannot
+                // change between pages of the same query.
+                if (project.id !== PROJECT_ID) {
+                  core.setFailed(`read project ${project.id}, expected ${PROJECT_ID}`);
+                  return;
+                }
+              }
+              const items = project.items;
               declared = items.totalCount;
               nodes = nodes.concat(items.nodes);
               cursor = items.pageInfo.hasNextPage ? items.pageInfo.endCursor : null;
+              page++;
+              if (page >= 20) {
+                // Cap, not a guess: 614 items at 100/page is 7. Hitting 20 means
+                // the cursor stopped advancing, on a workflow that fires on every
+                // label event across 20 repos -- left unbounded this loops until
+                // the 6-hour job timeout. A truncated read must report
+                // unreadable rather than conclude absence, same rule as the
+                // received-vs-declared guard below.
+                core.setFailed("board read exceeded 20 pages — cursor not advancing");
+                return;
+              }
             } while (cursor);
-
-            // Assert the board we READ is the project we would WRITE to.
-            if (projectId !== PROJECT_ID) {
-              core.setFailed(`read project ${projectId}, expected ${PROJECT_ID}`);
-              return;
-            }
 
             const r = resolveRemoval({
               boardNodes: nodes, received: nodes.length, declared,
