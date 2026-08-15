@@ -48,10 +48,9 @@ every tracked file and held; a 2026-08-15 sweep still found the operations repo 
 both `.github` repos' descriptions and in eleven of sixteen commit messages — two of them
 being the scrub commits themselves, which name it while describing why it should not be
 named. That is the trap in miniature: the pass was scoped to files, and a commit message
-is not a file. So the rules above
-apply to a commit subject and a PR title verbatim, and **when you rename what this repo
-is, check the description too** — it is the surface a visitor reads first and the one no
-diff will ever show you.
+is not a file. So the rules above apply to a commit subject and a PR title verbatim, and
+**when you rename what this repo is, check the description too** — it is the surface a
+visitor reads first and the one no diff will ever show you.
 
 Commit history is the one place the rule is applied going *forward* only: rewriting it
 means force-pushing `main`, which every fleet caller resolves `card-shark-sync.yml@main`
