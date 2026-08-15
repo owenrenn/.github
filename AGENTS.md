@@ -41,6 +41,22 @@ repositories here does better than that, and defeats it. So:
 - Issue references are bare `#N` and point at the private operations repo. A reader with
   access can follow them; a reader without learns nothing from the number.
 
+**The publish surface is not only the files.** The repo **description**, commit messages,
+branch names and PR titles are all served to an anonymous visitor, and a scrub of file
+contents cannot see any of them — which is exactly how they were missed. PR #3 cleaned
+every tracked file and held; a 2026-08-15 sweep still found the operations repo named in
+both `.github` repos' descriptions and in eleven of sixteen commit messages — two of them
+being the scrub commits themselves, which name it while describing why it should not be
+named. That is the trap in miniature: the pass was scoped to files, and a commit message
+is not a file. So the rules above apply to a commit subject and a PR title verbatim, and
+**when you rename what this repo is, check the description too** — it is the surface a
+visitor reads first and the one no diff will ever show you.
+
+Commit history is the one place the rule is applied going *forward* only: rewriting it
+means force-pushing `main`, which every fleet caller resolves `card-shark-sync.yml@main`
+against. Not worth it to scrub a name already disclosed elsewhere. Write the next subject
+correctly instead.
+
 **The one deliberate exception** is the project ID in `card-shark-sync.yml`. It is a
 handle, not a key — verified 2026-08-13: an unauthenticated GraphQL request carrying it
 returns `403`, and an authenticated one still requires authorization on the project
