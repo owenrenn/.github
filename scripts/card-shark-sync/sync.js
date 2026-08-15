@@ -73,6 +73,152 @@ function datesOf(boardNode) {
 }
 
 /**
+ * Read the whole board, paging until the cursor is exhausted.
+ *
+ * WHY this is a module rather than a loop inside the workflow's github-script
+ * step: it used to be that loop, and it shipped #490 -- a defect that
+ * survived design, implementation and review because nothing could
+ * execute it. tests.yml already argues the general form of this: the code runs
+ * from this repo, so the suite has to be able to reach it.
+ *
+ * TWO THINGS THE INLINE VERSION GOT WRONG, and they compound:
+ *
+ *   1. `declared` was reassigned on EVERY page while `nodes` accumulated across
+ *      all of them, so it ended up holding the last page's totalCount. A board
+ *      that changed size mid-read then disagreed with itself by construction.
+ *      It is pinned to page 0 here -- "what the board said it held when this
+ *      read began" is the only reading that stays comparable to a total
+ *      collected across the whole read. (The project-id guard below already
+ *      reasoned this way -- "checked on the first page only" -- and the same
+ *      reasoning simply was not carried across to the count.)
+ *
+ *   2. A received-vs-declared mismatch was terminal. It conflates two states
+ *      that need opposite handling: a TRUNCATED read (pages missing -- absence
+ *      is unknowable, must fail) and a CONCURRENTLY MUTATED one (the board was
+ *      written while we paged -- transient, resolves on a re-read). Only the
+ *      first is unrecoverable, so a mismatch is retried and reported unreadable
+ *      only if it persists.
+ *
+ * ⚠️ The retry does NOT weaken the guard, and must not be read as doing so. A
+ * read that never reconciles still reports `inconsistent`, because absence
+ * inferred from a partial board is the silent no-op the whole valve exists to
+ * prevent. What the retry removes is a FALSE positive, not the true one.
+ *
+ * WHY this race is ordinary rather than exotic: the valve fires on every label
+ * event across every fleet repo, and batch de-escalation -- a demotion pass, a
+ * parking sweep -- is a designed-for operation (#469 §4). Five
+ * simultaneous removals is what triggered #490 in the first place.
+ *
+ * ⚠️ A repo-agnostic concurrency group is NOT the alternative fix. Actions
+ * concurrency groups are scoped per repository, so runs in two different fleet
+ * repos cannot be serialized against each other by any group name. The existing
+ * per-issue group is still correct for what it covers (the labeled/unlabeled
+ * pair on ONE issue) and is deliberately left alone.
+ *
+ * `runQuery(cursor)` returns the raw GraphQL response; `sleep` and the bounds
+ * are injected so the suite can exercise the retry without waiting on it.
+ */
+async function readBoard({
+  runQuery,
+  projectId,
+  maxPages = 20,
+  maxAttempts = 3,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  backoffMs = 2000,
+  random = Math.random,
+}) {
+  let last = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let cursor = null;
+    let nodes = [];
+    let declared = null;
+    let page = 0;
+    let retry = null; // set when this attempt ended in something a re-read may fix
+
+    try {
+      do {
+        const res = await runQuery(cursor);
+        const project = res?.user?.projectV2;
+        if (!project) {
+          // Two different faults wearing one shape, and only the first is
+          // terminal. On page 0 the project genuinely does not resolve -- a
+          // renamed owner or a deleted board, which a re-read cannot fix. On a
+          // LATER page it vanished mid-read, which is transient and must not be
+          // reported as "the project did not resolve" -- that sends the reader
+          // to a cause that is not the one they have.
+          if (page === 0) return { status: "no-project", attempts: attempt };
+          retry = "project vanished mid-read";
+          break;
+        }
+        if (page === 0) {
+          // Resolved by NUMBER in the query, so this compares two INDEPENDENT
+          // hardcoded references to the board rather than a value against itself.
+          // Not retryable -- a wrong board stays wrong.
+          if (project.id !== projectId) {
+            return { status: "wrong-project", got: project.id, attempts: attempt };
+          }
+          declared = project.items?.totalCount;
+          // A missing totalCount is a broken RESPONSE SHAPE, not a race. Left to
+          // fall through it fails safe (nothing equals undefined, so `ok` is
+          // unreachable) but burns every retry first and then reports
+          // "received 0 of undefined" -- which reads as a race and is not one.
+          if (typeof declared !== "number") {
+            return { status: "malformed", attempts: attempt, detail: "items.totalCount was not a number" };
+          }
+        }
+
+        const items = project.items;
+        nodes = nodes.concat(items.nodes || []);
+        cursor = items.pageInfo?.hasNextPage ? items.pageInfo.endCursor : null;
+        page++;
+
+        // Gated on `cursor` deliberately: without it a read that legitimately
+        // COMPLETES on the cap page fails identically to a cursor that stopped
+        // advancing, and telling those apart is the entire job of this guard.
+        //
+        // Returns rather than setting `retry`: a stuck cursor loops the same way
+        // on a re-read, so retrying only spends two more full board reads to
+        // reach the same answer. Returning HERE also makes falling through to
+        // the retry structurally impossible rather than merely absent.
+        if (cursor && page >= maxPages) {
+          return { status: "truncated", attempts: attempt, received: nodes.length, declared };
+        }
+      } while (cursor);
+    } catch (err) {
+      // The retry existed for a count mismatch and did not cover a THROW, which
+      // is the same transient class and the more likely one: a 502 or a
+      // secondary rate limit on page 5 aborted the whole read, went red, and
+      // left the label removed with the board item still there. github-script
+      // does not retry GraphQL by default (`retries` defaults to 0), so nothing
+      // underneath was covering it either.
+      retry = `query failed: ${err && err.message ? err.message : err}`;
+    }
+
+    if (!retry) {
+      if (nodes.length === declared) {
+        return { status: "ok", nodes, received: nodes.length, declared, attempts: attempt };
+      }
+      retry = "count mismatch";
+    }
+
+    last = { received: nodes.length, declared, reason: retry };
+    if (attempt < maxAttempts) {
+      // JITTERED, and that is the point rather than a refinement. The trigger
+      // for these retries is CORRELATED -- a batch de-escalation fires many runs
+      // at once, they collide on the same board, and they all mismatch within a
+      // second of each other. A fixed delay marches every one of them back into
+      // the API in lockstep, re-reading the whole board (~7 pages) each time, at
+      // exactly the moment the board is busiest. Spreading them is what keeps
+      // the fix from amplifying the load it was written to survive.
+      await sleep(Math.round(backoffMs * attempt * (0.5 + random())));
+    }
+  }
+
+  return { status: "inconsistent", ...last, attempts: maxAttempts };
+}
+
+/**
  * Find the board item for an issue, FROM THE PROJECT SIDE.
  *
  * The obvious implementation -- read issue.projectItems and delete the match --
@@ -134,4 +280,4 @@ function preservationComment({ dates, itemId }) {
   ].join("\n");
 }
 
-module.exports = { isPmLabel, decideAction, datesOf, resolveRemoval, preservationComment };
+module.exports = { isPmLabel, decideAction, datesOf, readBoard, resolveRemoval, preservationComment };
