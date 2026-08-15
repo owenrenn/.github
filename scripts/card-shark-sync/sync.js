@@ -125,6 +125,7 @@ async function readBoard({
   maxAttempts = 3,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   backoffMs = 2000,
+  random = Math.random,
 }) {
   let last = null;
 
@@ -133,48 +134,85 @@ async function readBoard({
     let nodes = [];
     let declared = null;
     let page = 0;
-    let truncated = false;
+    let retry = null; // set when this attempt ended in something a re-read may fix
 
-    do {
-      const res = await runQuery(cursor);
-      const project = res?.user?.projectV2;
-      // Null rather than an error is how a renamed owner or a deleted project
-      // arrives. Retrying cannot help and would only delay the report.
-      if (!project) return { status: "no-project", attempts: attempt };
-      if (page === 0) {
-        // Resolved by NUMBER in the query, so this compares two INDEPENDENT
-        // hardcoded references to the board rather than a value against itself.
-        // Also not retryable -- a wrong board stays wrong.
-        if (project.id !== projectId) {
-          return { status: "wrong-project", got: project.id, attempts: attempt };
+    try {
+      do {
+        const res = await runQuery(cursor);
+        const project = res?.user?.projectV2;
+        if (!project) {
+          // Two different faults wearing one shape, and only the first is
+          // terminal. On page 0 the project genuinely does not resolve -- a
+          // renamed owner or a deleted board, which a re-read cannot fix. On a
+          // LATER page it vanished mid-read, which is transient and must not be
+          // reported as "the project did not resolve" -- that sends the reader
+          // to a cause that is not the one they have.
+          if (page === 0) return { status: "no-project", attempts: attempt };
+          retry = "project vanished mid-read";
+          break;
         }
-        declared = project.items.totalCount;
-      }
+        if (page === 0) {
+          // Resolved by NUMBER in the query, so this compares two INDEPENDENT
+          // hardcoded references to the board rather than a value against itself.
+          // Not retryable -- a wrong board stays wrong.
+          if (project.id !== projectId) {
+            return { status: "wrong-project", got: project.id, attempts: attempt };
+          }
+          declared = project.items?.totalCount;
+          // A missing totalCount is a broken RESPONSE SHAPE, not a race. Left to
+          // fall through it fails safe (nothing equals undefined, so `ok` is
+          // unreachable) but burns every retry first and then reports
+          // "received 0 of undefined" -- which reads as a race and is not one.
+          if (typeof declared !== "number") {
+            return { status: "malformed", attempts: attempt, detail: "items.totalCount was not a number" };
+          }
+        }
 
-      const items = project.items;
-      nodes = nodes.concat(items.nodes || []);
-      cursor = items.pageInfo?.hasNextPage ? items.pageInfo.endCursor : null;
-      page++;
+        const items = project.items;
+        nodes = nodes.concat(items.nodes || []);
+        cursor = items.pageInfo?.hasNextPage ? items.pageInfo.endCursor : null;
+        page++;
 
-      // Gated on `cursor` deliberately: without it a read that legitimately
-      // COMPLETES on the cap page fails identically to a cursor that stopped
-      // advancing, and telling those apart is the entire job of this guard.
-      if (cursor && page >= maxPages) {
-        truncated = true;
-        break;
-      }
-    } while (cursor);
-
-    // A stuck cursor is not transient -- a re-read loops the same way -- so this
-    // returns rather than falling through to the retry below.
-    if (truncated) return { status: "truncated", attempts: attempt, received: nodes.length, declared };
-
-    if (nodes.length === declared) {
-      return { status: "ok", nodes, received: nodes.length, declared, attempts: attempt };
+        // Gated on `cursor` deliberately: without it a read that legitimately
+        // COMPLETES on the cap page fails identically to a cursor that stopped
+        // advancing, and telling those apart is the entire job of this guard.
+        //
+        // Returns rather than setting `retry`: a stuck cursor loops the same way
+        // on a re-read, so retrying only spends two more full board reads to
+        // reach the same answer. Returning HERE also makes falling through to
+        // the retry structurally impossible rather than merely absent.
+        if (cursor && page >= maxPages) {
+          return { status: "truncated", attempts: attempt, received: nodes.length, declared };
+        }
+      } while (cursor);
+    } catch (err) {
+      // The retry existed for a count mismatch and did not cover a THROW, which
+      // is the same transient class and the more likely one: a 502 or a
+      // secondary rate limit on page 5 aborted the whole read, went red, and
+      // left the label removed with the board item still there. github-script
+      // does not retry GraphQL by default (`retries` defaults to 0), so nothing
+      // underneath was covering it either.
+      retry = `query failed: ${err && err.message ? err.message : err}`;
     }
 
-    last = { received: nodes.length, declared };
-    if (attempt < maxAttempts) await sleep(backoffMs);
+    if (!retry) {
+      if (nodes.length === declared) {
+        return { status: "ok", nodes, received: nodes.length, declared, attempts: attempt };
+      }
+      retry = "count mismatch";
+    }
+
+    last = { received: nodes.length, declared, reason: retry };
+    if (attempt < maxAttempts) {
+      // JITTERED, and that is the point rather than a refinement. The trigger
+      // for these retries is CORRELATED -- a batch de-escalation fires many runs
+      // at once, they collide on the same board, and they all mismatch within a
+      // second of each other. A fixed delay marches every one of them back into
+      // the API in lockstep, re-reading the whole board (~7 pages) each time, at
+      // exactly the moment the board is busiest. Spreading them is what keeps
+      // the fix from amplifying the load it was written to survive.
+      await sleep(Math.round(backoffMs * attempt * (0.5 + random())));
+    }
   }
 
   return { status: "inconsistent", ...last, attempts: maxAttempts };

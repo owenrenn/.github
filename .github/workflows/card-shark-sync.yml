@@ -234,28 +234,37 @@ jobs:
               maxAttempts: 3,
             });
 
-            if (board.status === "no-project") {
-              core.setFailed("project owenrenn/projects/5 did not resolve");
-              return;
-            }
-            if (board.status === "wrong-project") {
-              core.setFailed(`read project ${board.got}, expected ${PROJECT_ID}`);
-              return;
-            }
-            if (board.status === "truncated") {
-              core.setFailed("board read exceeded 20 pages — cursor not advancing");
-              return;
-            }
-            if (board.status === "inconsistent") {
-              // Loud on purpose, and only after the retries. A read that never
-              // reconciles cannot tell "not on the board" from "did not see the
-              // whole board", and the second must never be reported as the first.
-              // The wording says STALE rather than "short": #490's live failure
-              // received MORE than was declared, under a message calling it short.
-              core.setFailed(
-                `board read never settled: received ${board.received} of ${board.declared} ` +
-                `after ${board.attempts} attempts — refusing to conclude absence`,
-              );
+            // ⚠️ ALLOWLIST, NOT A BLOCKLIST, and the distinction is the whole
+            // safety property. Enumerating the failure statuses and letting
+            // everything else fall through looks equivalent and is not: an
+            // unenumerated status leaves board.nodes/received/declared all
+            // `undefined`, and resolveRemoval's guard is `received !== declared`
+            // -- which for `undefined !== undefined` is FALSE. The guard does not
+            // fire, find() on [] matches nothing, and the run logs "nothing to
+            // remove" and exits 0. A silent no-op on the malformed-SUCCESS path
+            // is the exact failure this valve exists to prevent, and an earlier
+            // draft of this block had it while carrying a comment asserting that
+            // resolveRemoval's contract covered the case. It does not.
+            //
+            // So: proceed ONLY on an explicit `ok`. Any new status added to
+            // readBoard fails closed here by default rather than open.
+            if (board.status !== "ok") {
+              const detail = {
+                "no-project": "project owenrenn/projects/5 did not resolve",
+                "wrong-project": `read project ${board.got}, expected ${PROJECT_ID}`,
+                "truncated": "board read exceeded 20 pages — cursor not advancing",
+                "malformed": `board response shape invalid — ${board.detail}`,
+                // Loud on purpose, and only after the retries. A read that never
+                // reconciles cannot tell "not on the board" from "did not see the
+                // whole board", and the second must never be reported as the
+                // first. The wording says STALE rather than "short": #490's live
+                // failure received MORE than declared, under a message calling
+                // it short.
+                "inconsistent":
+                  `board read never settled: received ${board.received} of ${board.declared} ` +
+                  `after ${board.attempts} attempts (${board.reason}) — refusing to conclude absence`,
+              }[board.status] || `board read returned an unhandled status: ${board.status}`;
+              core.setFailed(detail);
               return;
             }
             if (board.attempts > 1) {
@@ -272,8 +281,10 @@ jobs:
 
             if (r.status === "unreadable") {
               // Unreachable via readBoard, which returns `ok` only when the counts
-              // agree -- kept because resolveRemoval's contract still guarantees it
-              // and a future caller may not pre-check.
+              // agree. Kept for a future caller that does not pre-check -- but NOT
+              // relied on as the backstop for the allowlist above: it compares
+              // received against declared, and two `undefined`s compare equal, so
+              // it cannot catch the case the allowlist exists to catch.
               core.setFailed(`board read short: received ${r.received} of ${r.declared} — refusing to conclude absence`);
               return;
             }

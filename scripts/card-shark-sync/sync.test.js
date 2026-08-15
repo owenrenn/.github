@@ -374,9 +374,16 @@ test("the reusable workflow declares its contract: workflow_call + a required au
 function fakePager(attemptsPages, { projectId = "PVT_test" } = {}) {
   let attempt = -1;
   let page = 0;
+  let queries = 0;
   return {
-    calls: () => attempt + 1,
+    // Actual run() invocations, NOT attempts. The one consumer asserts that work
+    // is bounded, and "two attempts ran" is not that claim -- with a multi-page
+    // fixture the two diverge and the assertion would read true while measuring
+    // something else.
+    calls: () => queries,
+    attempts: () => attempt + 1,
     run: async () => {
+      queries++;
       // A fresh attempt starts whenever the previous one consumed all its pages.
       if (page === 0) attempt++;
       const pages = attemptsPages[Math.min(attempt, attemptsPages.length - 1)];
@@ -504,6 +511,11 @@ test("a cursor that stops advancing is truncated, not retried forever", async ()
   });
   const r = await readBoard({ runQuery, projectId: "PVT_test", maxPages: 5, sleep: async () => {} });
   assert.equal(r.status, "truncated");
+  // Pins the BYPASS, not just the status. Letting truncation fall into the retry
+  // loop would still yield status "truncated" (from the final attempt) with this
+  // assertion absent -- green, while spending two extra full board reads and the
+  // backoff on a cursor that is never going to advance.
+  assert.equal(r.attempts, 1);
 });
 
 test("the workflow reports a stale read as unreadable, never as a difference", () => {
@@ -521,4 +533,116 @@ test("the workflow no longer pages the board inline", () => {
   // while still passing -- so assert the call site instead.
   assert.match(WORKFLOW_CODE, /readBoard\(/);
   assert.ok(!/declared\s*=\s*items\.totalCount/.test(WORKFLOW_CODE));
+});
+
+// --- Findings from the review of the #490 fix -------------------------------
+
+test("a query that THROWS is retried, not aborted", async () => {
+  // The retry was built for a count mismatch and did not cover a throw -- the
+  // same transient class, and the likelier one. A 502 or a secondary rate limit
+  // on a later page aborted the entire read, went red, and left the label
+  // removed with the board item still present. github-script does not retry
+  // GraphQL by default, so nothing underneath covered it either.
+  let n = 0;
+  const runQuery = async () => {
+    if (++n === 1) throw new Error("502 Bad Gateway");
+    return { user: { projectV2: { id: "PVT_test", items: {
+      totalCount: 1, nodes: [item(1)], pageInfo: { hasNextPage: false },
+    }}}};
+  };
+  const r = await readBoard({ runQuery, projectId: "PVT_test", sleep: async () => {} });
+  assert.equal(r.status, "ok");
+  assert.equal(r.attempts, 2);
+});
+
+test("a query that throws on EVERY attempt still fails, and names the cause", async () => {
+  // The retry must not swallow a persistent failure into a confident answer.
+  const runQuery = async () => { throw new Error("401 Unauthorized"); };
+  const r = await readBoard({
+    runQuery, projectId: "PVT_test", maxAttempts: 2, sleep: async () => {},
+  });
+  assert.equal(r.status, "inconsistent");
+  assert.match(r.reason, /401 Unauthorized/);
+});
+
+test("a missing totalCount is a broken response, not a race", async () => {
+  // Falling through would fail SAFE (nothing equals undefined) but burn every
+  // retry and then report "received 0 of undefined" -- which reads as a race and
+  // is not one. Named as a shape fault, on the first attempt.
+  const runQuery = async () => ({
+    user: { projectV2: { id: "PVT_test", items: {
+      nodes: [item(1)], pageInfo: { hasNextPage: false },
+    }}},
+  });
+  const r = await readBoard({ runQuery, projectId: "PVT_test", sleep: async () => {} });
+  assert.equal(r.status, "malformed");
+  assert.equal(r.attempts, 1);
+});
+
+test("a project that vanishes MID-read is retried, not reported as unresolvable", async () => {
+  // `no-project` on page 0 means a renamed owner or a deleted board -- terminal.
+  // The same null on page 2 means it went away under us, which is transient. One
+  // shape, two faults; reporting the second as the first sends the reader to a
+  // cause they do not have.
+  let n = 0;
+  const runQuery = async (cursor) => {
+    n++;
+    if (n === 2) return { user: { projectV2: null } };       // page 2 of attempt 1
+    return { user: { projectV2: { id: "PVT_test", items: {
+      totalCount: 2,
+      nodes: [item(n)],
+      pageInfo: { hasNextPage: !cursor, endCursor: "c1" },
+    }}}};
+  };
+  const r = await readBoard({ runQuery, projectId: "PVT_test", sleep: async () => {} });
+  assert.equal(r.status, "ok");
+  assert.ok(r.attempts > 1);
+});
+
+test("a project missing on PAGE 0 is still terminal, with no retries spent", async () => {
+  const r = await readBoard({
+    runQuery: async () => ({ user: { projectV2: null } }),
+    projectId: "PVT_test", sleep: async () => {},
+  });
+  assert.equal(r.status, "no-project");
+  assert.equal(r.attempts, 1);
+});
+
+test("retry backoff is jittered, so correlated runs do not re-read in lockstep", async () => {
+  // NOT a refinement. The trigger is correlated by construction: a batch
+  // de-escalation fires many runs at once, they collide on one board, and they
+  // mismatch within a second of each other. A fixed delay marches all of them
+  // back into the API together, each re-reading the whole board. Two different
+  // random draws must produce two different delays.
+  const delays = [];
+  const runQuery = async () => ({
+    user: { projectV2: { id: "PVT_test", items: {
+      totalCount: 9, nodes: [], pageInfo: { hasNextPage: false },
+    }}},
+  });
+  await readBoard({
+    runQuery, projectId: "PVT_test", maxAttempts: 3,
+    sleep: async (ms) => { delays.push(ms); },
+    backoffMs: 1000, random: () => 0,
+  });
+  const lo = [...delays];
+  delays.length = 0;
+  await readBoard({
+    runQuery, projectId: "PVT_test", maxAttempts: 3,
+    sleep: async (ms) => { delays.push(ms); },
+    backoffMs: 1000, random: () => 1,
+  });
+  assert.notDeepEqual(lo, delays);
+  assert.ok(lo.every((d, i) => d < delays[i]));
+});
+
+test("the workflow proceeds ONLY on an explicit ok status", () => {
+  // ⚠️ The finding that mattered most in review. A blocklist of failure statuses
+  // lets an unenumerated one fall through with nodes/received/declared all
+  // undefined -- and resolveRemoval's guard is `received !== declared`, which for
+  // two undefineds is FALSE. The guard does not fire, the match finds nothing,
+  // and the run reports "nothing to remove" and exits 0. Verified by hand before
+  // the fix: resolveRemoval returned {status:"absent"}.
+  assert.match(WORKFLOW_CODE, /board\.status\s*!==\s*"ok"/);
+  assert.match(WORKFLOW_CODE, /unhandled status/);
 });
