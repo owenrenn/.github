@@ -73,6 +73,114 @@ function datesOf(boardNode) {
 }
 
 /**
+ * Read the whole board, paging until the cursor is exhausted.
+ *
+ * WHY this is a module rather than a loop inside the workflow's github-script
+ * step: it used to be that loop, and it shipped #490 -- a defect that
+ * survived design, implementation and review because nothing could
+ * execute it. tests.yml already argues the general form of this: the code runs
+ * from this repo, so the suite has to be able to reach it.
+ *
+ * TWO THINGS THE INLINE VERSION GOT WRONG, and they compound:
+ *
+ *   1. `declared` was reassigned on EVERY page while `nodes` accumulated across
+ *      all of them, so it ended up holding the last page's totalCount. A board
+ *      that changed size mid-read then disagreed with itself by construction.
+ *      It is pinned to page 0 here -- "what the board said it held when this
+ *      read began" is the only reading that stays comparable to a total
+ *      collected across the whole read. (The project-id guard below already
+ *      reasoned this way -- "checked on the first page only" -- and the same
+ *      reasoning simply was not carried across to the count.)
+ *
+ *   2. A received-vs-declared mismatch was terminal. It conflates two states
+ *      that need opposite handling: a TRUNCATED read (pages missing -- absence
+ *      is unknowable, must fail) and a CONCURRENTLY MUTATED one (the board was
+ *      written while we paged -- transient, resolves on a re-read). Only the
+ *      first is unrecoverable, so a mismatch is retried and reported unreadable
+ *      only if it persists.
+ *
+ * ⚠️ The retry does NOT weaken the guard, and must not be read as doing so. A
+ * read that never reconciles still reports `inconsistent`, because absence
+ * inferred from a partial board is the silent no-op the whole valve exists to
+ * prevent. What the retry removes is a FALSE positive, not the true one.
+ *
+ * WHY this race is ordinary rather than exotic: the valve fires on every label
+ * event across every fleet repo, and batch de-escalation -- a demotion pass, a
+ * parking sweep -- is a designed-for operation (#469 §4). Five
+ * simultaneous removals is what triggered #490 in the first place.
+ *
+ * ⚠️ A repo-agnostic concurrency group is NOT the alternative fix. Actions
+ * concurrency groups are scoped per repository, so runs in two different fleet
+ * repos cannot be serialized against each other by any group name. The existing
+ * per-issue group is still correct for what it covers (the labeled/unlabeled
+ * pair on ONE issue) and is deliberately left alone.
+ *
+ * `runQuery(cursor)` returns the raw GraphQL response; `sleep` and the bounds
+ * are injected so the suite can exercise the retry without waiting on it.
+ */
+async function readBoard({
+  runQuery,
+  projectId,
+  maxPages = 20,
+  maxAttempts = 3,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  backoffMs = 2000,
+}) {
+  let last = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let cursor = null;
+    let nodes = [];
+    let declared = null;
+    let page = 0;
+    let truncated = false;
+
+    do {
+      const res = await runQuery(cursor);
+      const project = res?.user?.projectV2;
+      // Null rather than an error is how a renamed owner or a deleted project
+      // arrives. Retrying cannot help and would only delay the report.
+      if (!project) return { status: "no-project", attempts: attempt };
+      if (page === 0) {
+        // Resolved by NUMBER in the query, so this compares two INDEPENDENT
+        // hardcoded references to the board rather than a value against itself.
+        // Also not retryable -- a wrong board stays wrong.
+        if (project.id !== projectId) {
+          return { status: "wrong-project", got: project.id, attempts: attempt };
+        }
+        declared = project.items.totalCount;
+      }
+
+      const items = project.items;
+      nodes = nodes.concat(items.nodes || []);
+      cursor = items.pageInfo?.hasNextPage ? items.pageInfo.endCursor : null;
+      page++;
+
+      // Gated on `cursor` deliberately: without it a read that legitimately
+      // COMPLETES on the cap page fails identically to a cursor that stopped
+      // advancing, and telling those apart is the entire job of this guard.
+      if (cursor && page >= maxPages) {
+        truncated = true;
+        break;
+      }
+    } while (cursor);
+
+    // A stuck cursor is not transient -- a re-read loops the same way -- so this
+    // returns rather than falling through to the retry below.
+    if (truncated) return { status: "truncated", attempts: attempt, received: nodes.length, declared };
+
+    if (nodes.length === declared) {
+      return { status: "ok", nodes, received: nodes.length, declared, attempts: attempt };
+    }
+
+    last = { received: nodes.length, declared };
+    if (attempt < maxAttempts) await sleep(backoffMs);
+  }
+
+  return { status: "inconsistent", ...last, attempts: maxAttempts };
+}
+
+/**
  * Find the board item for an issue, FROM THE PROJECT SIDE.
  *
  * The obvious implementation -- read issue.projectItems and delete the match --
@@ -134,4 +242,4 @@ function preservationComment({ dates, itemId }) {
   ].join("\n");
 }
 
-module.exports = { isPmLabel, decideAction, datesOf, resolveRemoval, preservationComment };
+module.exports = { isPmLabel, decideAction, datesOf, readBoard, resolveRemoval, preservationComment };

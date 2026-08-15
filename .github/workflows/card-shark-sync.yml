@@ -172,7 +172,7 @@ jobs:
         with:
           github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
           script: |
-            const { resolveRemoval, preservationComment } = require(`${process.env.GITHUB_WORKSPACE}/.card-shark-sync/scripts/card-shark-sync/sync.js`);
+            const { readBoard, resolveRemoval, preservationComment } = require(`${process.env.GITHUB_WORKSPACE}/.card-shark-sync/scripts/card-shark-sync/sync.js`);
             const PROJECT_ID = "PVT_kwHOABLEFc4BRJ30";
 
             // archivedStates is NOT optional. ProjectV2.items excludes archived
@@ -219,63 +219,61 @@ jobs:
                 }
               }`;
 
-            let cursor = null, nodes = [], declared = null, page = 0;
-            do {
-              const r = await github.graphql(BOARD_QUERY, { cursor });
-              const project = r.user?.projectV2;
-              // Null rather than an error is how a renamed owner or a deleted
-              // project arrives. Without this the failure surfaces as an opaque
-              // TypeError one line later.
-              if (!project) {
-                core.setFailed("project owenrenn/projects/5 did not resolve");
-                return;
-              }
-              if (page === 0) {
-                // LIVE now, where the old node(id:) form made this tautological:
-                // resolving by NUMBER and asserting the ID means the two
-                // hardcoded board references -- the add path's project-url and
-                // this constant -- must agree, or the run fails loudly instead
-                // of paging the wrong board and reporting `absent`. Checked on
-                // the first page only, before paging continues -- the id cannot
-                // change between pages of the same query.
-                if (project.id !== PROJECT_ID) {
-                  core.setFailed(`read project ${project.id}, expected ${PROJECT_ID}`);
-                  return;
-                }
-              }
-              const items = project.items;
-              declared = items.totalCount;
-              nodes = nodes.concat(items.nodes);
-              cursor = items.pageInfo.hasNextPage ? items.pageInfo.endCursor : null;
-              page++;
-              if (cursor && page >= 20) {
-                // Gated on `cursor` deliberately: without it, a read that
-                // legitimately COMPLETES on page 20 fails identically to a
-                // cursor that stopped advancing. Distinguishing those is the
-                // entire job of this guard, so conflating them here would be
-                // the same defect it exists to catch.
-                //
-                // Cap, not a guess: several hundred items at 100/page is a
-                // single-digit number of pages. Hitting 20 means the cursor
-                // stopped advancing, on a workflow that fires on every label
-                // event across the whole fleet -- left unbounded this loops until
-                // the 6-hour job timeout. A truncated read must report
-                // unreadable rather than conclude absence, same rule as the
-                // received-vs-declared guard below.
-                core.setFailed("board read exceeded 20 pages — cursor not advancing");
-                return;
-              }
-            } while (cursor);
+            // The paging loop, its page-0 guards and the retry live in sync.js so
+            // the suite can execute them. They were inline here, which is how
+            // #490 shipped: a defect nothing could reach.
+            //
+            // Cap, not a guess: several hundred items at 100/page is a
+            // single-digit number of pages. Hitting 20 means the cursor stopped
+            // advancing, on a workflow that fires on every label event across
+            // the whole fleet -- left unbounded this loops to the job timeout.
+            const board = await readBoard({
+              runQuery: (cursor) => github.graphql(BOARD_QUERY, { cursor }),
+              projectId: PROJECT_ID,
+              maxPages: 20,
+              maxAttempts: 3,
+            });
+
+            if (board.status === "no-project") {
+              core.setFailed("project owenrenn/projects/5 did not resolve");
+              return;
+            }
+            if (board.status === "wrong-project") {
+              core.setFailed(`read project ${board.got}, expected ${PROJECT_ID}`);
+              return;
+            }
+            if (board.status === "truncated") {
+              core.setFailed("board read exceeded 20 pages — cursor not advancing");
+              return;
+            }
+            if (board.status === "inconsistent") {
+              // Loud on purpose, and only after the retries. A read that never
+              // reconciles cannot tell "not on the board" from "did not see the
+              // whole board", and the second must never be reported as the first.
+              // The wording says STALE rather than "short": #490's live failure
+              // received MORE than was declared, under a message calling it short.
+              core.setFailed(
+                `board read never settled: received ${board.received} of ${board.declared} ` +
+                `after ${board.attempts} attempts — refusing to conclude absence`,
+              );
+              return;
+            }
+            if (board.attempts > 1) {
+              // Worth a line in the log: a run that needed a retry is evidence of
+              // concurrent board writes, which is the signal that a batch
+              // operation is in flight rather than anything being wrong.
+              core.info(`board read settled on attempt ${board.attempts} (concurrent board writes)`);
+            }
 
             const r = resolveRemoval({
-              boardNodes: nodes, received: nodes.length, declared,
+              boardNodes: board.nodes, received: board.received, declared: board.declared,
               owner: context.repo.owner, repo: context.repo.repo, number: context.issue.number,
             });
 
             if (r.status === "unreadable") {
-              // Loud on purpose. A short read cannot tell "not on the board" from
-              // "did not see the whole board", and the second must never be
-              // reported as the first.
+              // Unreachable via readBoard, which returns `ok` only when the counts
+              // agree -- kept because resolveRemoval's contract still guarantees it
+              // and a future caller may not pre-check.
               core.setFailed(`board read short: received ${r.received} of ${r.declared} — refusing to conclude absence`);
               return;
             }
