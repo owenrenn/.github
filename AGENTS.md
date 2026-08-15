@@ -45,7 +45,10 @@ repositories here does better than that, and defeats it. So:
 branch names and PR titles are all served to an anonymous visitor, and a scrub of file
 contents cannot see any of them — which is exactly how they were missed. PR #3 cleaned
 every tracked file and held; a 2026-08-15 sweep still found the operations repo named in
-both `.github` repos' descriptions and in six pre-#3 commit subjects. So the rules above
+both `.github` repos' descriptions and in eleven of sixteen commit messages — two of them
+being the scrub commits themselves, which name it while describing why it should not be
+named. That is the trap in miniature: the pass was scoped to files, and a commit message
+is not a file. So the rules above
 apply to a commit subject and a PR title verbatim, and **when you rename what this repo
 is, check the description too** — it is the surface a visitor reads first and the one no
 diff will ever show you.
