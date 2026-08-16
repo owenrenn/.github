@@ -1,0 +1,19 @@
+# Secrets live in .env* files and never in git (security-baseline #251).
+.env
+.env.*
+
+# Per-machine Claude Code session state — worktrees, plans, transcripts.
+# Never tracked; it is machine-local and meaningless to anyone else.
+.claude/
+
+# Per-machine override escape hatch.
+CLAUDE.local.md
+
+# NOTE: CLAUDE.md itself is TRACKED and must stay so — it is the shim that
+# @-imports AGENTS.md. Ignoring it would silently stop Claude Code loading the
+# repo's instructions at all, which is why owen-ops's conformance scan asserts
+# this file does NOT list it.
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
