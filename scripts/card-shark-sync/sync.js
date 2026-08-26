@@ -44,21 +44,50 @@ function decideAction({ eventAction, audience, eventLabel, currentLabels }) {
     };
   }
 
+  // BOTH label paths decide from `pmRemaining` -- the issue's CURRENT labels --
+  // and never from `eventLabel`. #563.
+  //
+  // WHY, and it is not a style preference: label ops on one issue are serialized
+  // by a concurrency group (see the workflow), and `cancel-in-progress: false`
+  // does NOT mean every queued run executes. GitHub keeps only the NEWEST pending
+  // run in a group and cancels the intermediate ones. Creating an issue with
+  // several labels fires several `labeled` events inside a few seconds, so the
+  // run woken by the pm:* label is routinely one of the cancelled intermediates.
+  //
+  // Gating on `eventLabel` therefore makes the outcome depend on WHICH event won
+  // a race -- and the survivor is usually woken by an unrelated domain or
+  // priority label, decides "not a pm:* label", and the escalation is silently
+  // lost. Measured live: an issue created with four labels including pm:awareness
+  // produced five runs (two survived, three cancelled) and never reached the
+  // board.
+  //
+  // Deciding from state makes the race irrelevant: whichever run survives reads
+  // the same labels and reaches the same, correct decision. The event's only
+  // remaining job is to say which DIRECTION is worth checking, which is a cheap
+  // optimisation rather than an input to correctness.
+  //
+  // ⚠️ Same shape as the removal path's project-side resolution below: resolve
+  // from durable state, never from what the event happened to carry.
   if (eventAction === "labeled") {
-    if (!isPmLabel(eventLabel)) return noop(`${eventLabel} is not a pm:* label`);
+    if (pmRemaining.length === 0) return noop(`no pm:* label present (woken by ${eventLabel})`);
     return {
       kind: "add",
       applyProductLabel: isAgentZone,
-      reason: `${eventLabel} applied`,
+      reason: `carries ${pmRemaining.join(", ")}`,
     };
   }
 
   if (eventAction === "unlabeled") {
-    if (!isPmLabel(eventLabel)) return noop(`${eventLabel} is not a pm:* label`);
     if (pmRemaining.length > 0) {
       return noop(`still carries ${pmRemaining.join(", ")}`);
     }
-    return { kind: "remove", applyProductLabel: false, reason: `last pm:* label (${eventLabel}) removed` };
+    // Reached for a non-pm label removal too, on an issue that carries no pm:*.
+    // That is the point: if a pm:* removal's run was the cancelled intermediate,
+    // this is the only event left that can still retire the board item. The cost
+    // is a board read that usually resolves `absent` and does nothing -- measured
+    // at roughly three extra reads per week in the busiest repo, against a fix
+    // for an item that would otherwise be stranded on the board indefinitely.
+    return { kind: "remove", applyProductLabel: false, reason: `no pm:* label remains (woken by ${eventLabel})` };
   }
 
   return noop(`unhandled event action ${eventAction}`);
