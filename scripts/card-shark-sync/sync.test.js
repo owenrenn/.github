@@ -112,6 +112,66 @@ test("removing a non-pm label never removes the item", () => {
   assert.equal(d.kind, "noop");
 });
 
+// ---------------------------------------------------------------------------
+// #563 -- eventLabel/currentLabels DIVERGENCE.
+//
+// Every decideAction test above this block sets `currentLabels` consistent with
+// `eventLabel`, so none of them could tell a state-based implementation from an
+// event-based one: they passed identically before and after the fix. That is why
+// the defect shipped, and it is the reason these cases are written as an explicit
+// divergence rather than folded into the cases above.
+// ---------------------------------------------------------------------------
+
+test("#563 add: a run woken by a NON-pm label still adds when the issue carries pm:*", () => {
+  // The live failure: an issue created with four labels. The run woken by
+  // pm:awareness was cancelled as an intermediate; the survivor was woken by an
+  // unrelated domain label and decided noop, so the board never heard.
+  const d = decideAction({
+    eventAction: "labeled",
+    audience: "pm-surface",
+    eventLabel: "type:follow-up",
+    currentLabels: ["type:follow-up", "P2", "pm:awareness"],
+  });
+  assert.equal(d.kind, "add");
+});
+
+test("#563 remove: a run woken by a NON-pm label still removes when no pm:* remains", () => {
+  // The mirror, which strands an item on the board rather than losing an
+  // escalation: pm:* and an unrelated label removed together, and the run woken
+  // by the unrelated one is the survivor.
+  const d = decideAction({
+    eventAction: "unlabeled",
+    audience: "agent-zone",
+    eventLabel: "type:bug",
+    currentLabels: ["P2"],
+  });
+  assert.equal(d.kind, "remove");
+});
+
+test("#563 the decision does not depend on eventLabel at all", () => {
+  // The property, not another instance of it. Hold the state fixed, vary only
+  // which event woke the run -- including the no-label-payload case -- and every
+  // decision must be identical. A future edit that reintroduces an eventLabel
+  // gate fails here even if it happens to satisfy the two cases above.
+  const state = ["pm:action", "type:bug", "P1"];
+  const kinds = new Set(
+    ["pm:action", "type:bug", "P1", undefined].map(
+      (eventLabel) =>
+        decideAction({ eventAction: "labeled", audience: "agent-zone", eventLabel, currentLabels: state }).kind,
+    ),
+  );
+  assert.deepEqual([...kinds], ["add"], "eventLabel changed the decision");
+
+  const bare = ["type:bug"];
+  const removals = new Set(
+    ["pm:action", "type:bug", undefined].map(
+      (eventLabel) =>
+        decideAction({ eventAction: "unlabeled", audience: "agent-zone", eventLabel, currentLabels: bare }).kind,
+    ),
+  );
+  assert.deepEqual([...removals], ["remove"], "eventLabel changed the decision");
+});
+
 test("an unknown audience throws rather than silently choosing a branch", () => {
   // WHY loud: a typo'd `audience:` input in one stub would otherwise pick the
   // agent-zone path in a pm-surface repo and go unnoticed for months.
@@ -124,10 +184,14 @@ test("an unknown audience throws rather than silently choosing a branch", () => 
 test("an agent-zone issue opened ALREADY carrying pm:* is still a noop", () => {
   // Looks like a silent loss and is not: GitHub fires issues.labeled for labels
   // applied at creation, so the `labeled` path always follows and delivers it.
-  // Measured rather than assumed -- a real agent-zone repo's issue was created
-  // 02:39:09Z, took pm:action at 02:39:11Z, and escalate-to-card-shark.yml ran
-  // at 02:39:13Z with conclusion `success`, with the daily reconciler's next run
-  // ~11h away and therefore unable to be what delivered it.
+  //
+  // ⚠️ That rationale was TRUE BY LUCK until #563 and is now true by design, so
+  // do not read the measurement below as having established it. What was measured
+  // was a single-label creation, where exactly one `labeled` run exists and
+  // therefore cannot be the one the concurrency group cancels. Add a second label
+  // and the delivering run became a coin flip -- which is precisely how #563
+  // escaped. The labeled path now decides from the issue's current labels, so
+  // whichever run survives the queue delivers this. See decideAction.
   const d = decideAction({
     eventAction: "opened",
     audience: "agent-zone",
