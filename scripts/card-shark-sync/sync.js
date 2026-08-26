@@ -146,6 +146,20 @@ function datesOf(boardNode) {
  *
  * `runQuery(cursor)` returns the raw GraphQL response; `sleep` and the bounds
  * are injected so the suite can exercise the retry without waiting on it.
+ *
+ * ⚠️ THERE IS A SECOND IMPLEMENTATION OF THIS READ, and it is not in this repo.
+ * The operations repo's escalation reconciler pages the same board and applies
+ * the same received-vs-declared rule (its `guardBoardRead`, cited again in
+ * resolveRemoval below). It is a deliberate port, not shared code -- see that
+ * repo's #494 for why, and for the divergences that are intentional.
+ *
+ * WHY THIS POINTER IS HERE, on the paging function rather than only further
+ * down: the two copies have drifted apart twice (#490 fixed the defect here,
+ * #491 found it still live in the port), and both times the cause was simply
+ * not knowing the other copy existed while fixing this one. Both defects were
+ * in the paging and its guard -- this function -- so this docblock is where the
+ * next person needs to be told. Fixing anything below WITHOUT checking the port
+ * is how #491 happened.
  */
 async function readBoard({
   runQuery,
