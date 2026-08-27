@@ -36,6 +36,22 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # Omitted, this job inherits GitHub's 360-minute default. It fires on every
+    # issues event across the whole fleet, which makes it the highest-frequency
+    # job there is -- and overage BILLS rather than stopping at a wall, so an
+    # unbounded stall here spends money quietly instead of failing loudly.
+    #
+    # 10 minutes is ~25x the observed max (p50 9s, p90 19s, max 24s over 100
+    # runs) and matches the bound every other job in the fleet carries. It is a
+    # ceiling on a stall, not a budget -- the paging loop's own maxPages cap is
+    # what bounds the expected path.
+    #
+    # WHY the bound is HERE and not in each caller: a job that invokes a
+    # reusable workflow with `uses:` cannot set timeout-minutes -- GitHub
+    # permits only name/uses/with/secrets/needs/if/permissions on such a job and
+    # rejects the workflow outright otherwise (verified with actionlint 1.7.7,
+    # not assumed). So every stub in the fleet is bounded by this one line.
+    timeout-minutes: 10
     # Every write in this job goes through the PAT below, not GITHUB_TOKEN --
     # this is the one permission a caller of a REUSABLE workflow cannot see, so
     # it stays minimal here rather than inheriting whatever the caller granted.

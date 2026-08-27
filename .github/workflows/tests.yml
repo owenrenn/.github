@@ -8,12 +8,22 @@
 name: tests
 
 on:
-  push: { paths: &test_paths ["scripts/**", ".github/workflows/tests.yml", ".github/workflows/card-shark-sync.yml"] }
+  # `.github/workflows/**`, not the two workflow files by name. The bounds check
+  # below walks EVERY workflow in this directory, so a filter naming only the
+  # files that exist today means workflow number three lands without the check
+  # that covers it ever running -- a detector reporting clean over what it was
+  # never triggered to look at (#557, #587).
+  push: { paths: &test_paths ["scripts/**", ".github/workflows/**"] }
   pull_request: { paths: *test_paths }
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Bounded for the same reason the reusable workflow next door is: omitted,
+    # a job inherits GitHub's 360-minute default, and a stall bills for every
+    # one of those minutes rather than stopping at a wall. This suite runs in
+    # seconds; 10 is the fleet's standard ceiling-on-a-stall. (#587)
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,9 +31,57 @@ jobs:
           node-version: "24"
       - name: Run card-shark-sync module tests
         run: node --test scripts/card-shark-sync/*.test.js
-      - name: Validate workflow YAML
-        # The node suite asserts against the file's TEXT (regexes over raw
-        # content); nothing in it parses the file as YAML. A broken indent
-        # passes all 27+ text assertions and is a fleet-wide outage the next
-        # time any of the 20 stub repos calls this workflow.
-        run: python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/card-shark-sync.yml'))"
+      - name: Every workflow parses, and every job is bounded
+        # Two assertions over one walk, both of which the node suite structurally
+        # cannot make:
+        #
+        #   1. It PARSES the YAML. The node suite asserts against the file's
+        #      TEXT (regexes over raw content); nothing in it parses the file as
+        #      YAML. A broken indent passes all 27+ text assertions and is a
+        #      fleet-wide outage the next time any stub repo calls this workflow.
+        #   2. It asserts every job carries timeout-minutes. The operations
+        #      repo's workflow guard makes this assertion over its OWN
+        #      .github/workflows and cannot reach this repo -- yet this is
+        #      exactly where the fleet's bound has to live, because a job calling
+        #      a reusable workflow cannot carry the key itself. Left unwatched,
+        #      that bound is one revert from gone, in the one repo no fleet
+        #      scanner covers (#473).
+        #
+        # Structural, not a text regex: `timeout-minutes` appearing somewhere in
+        # the file proves nothing about which job carries it, and the whole
+        # point is that the bound sits on the job the fleet actually calls.
+        run: |
+          python3 - <<'PY'
+          import glob, sys, yaml
+
+          checked = exempt = 0
+          problems = []
+          for f in sorted(glob.glob(".github/workflows/*.yml")):
+              doc = yaml.safe_load(open(f)) or {}
+              for name, job in (doc.get("jobs") or {}).items():
+                  if not isinstance(job, dict):
+                      continue
+                  # A reusable-workflow CALLER cannot carry the key -- see the
+                  # comment on the sync job. Counted rather than passed over in
+                  # silence: a skip nobody can see is how a detector goes green
+                  # over a real gap.
+                  if "uses" in job:
+                      exempt += 1
+                      continue
+                  checked += 1
+                  if "timeout-minutes" not in job:
+                      problems.append(
+                          f"{f}:{name} sets no timeout-minutes -- it inherits "
+                          "GitHub's 360-minute default (#587)"
+                      )
+
+          # A glob that matched nothing, or a rename that moved the workflows,
+          # would otherwise report success having examined zero jobs.
+          if checked == 0:
+              problems.append("no jobs discovered -- the bounds check looked at nothing")
+
+          print(f"== bounds: {checked} jobs checked, {exempt} reusable-workflow callers exempt ==")
+          for p in problems:
+              print(p, file=sys.stderr)
+          sys.exit(1 if problems else 0)
+          PY

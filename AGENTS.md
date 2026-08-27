@@ -10,6 +10,7 @@ the fleet's **reusable workflows**.
 | `SECURITY.md` | Default security policy inherited by every `owenrenn/*` repo (#251). |
 | `.github/workflows/card-shark-sync.yml` | **Reusable**. Keeps Card Shark membership in sync with `pm:*` labels across the fleet. |
 | `scripts/card-shark-sync/` | Pure decision logic for the above, plus its `node --test` suite. |
+| `.github/workflows/tests.yml` | This repo's CI: the `node --test` suite, plus the structural check that every workflow here parses and every job carries `timeout-minutes` (#587). |
 
 ## The constraint that shapes everything here
 
@@ -75,5 +76,11 @@ stub comment for why.
 - ⚠️ **No fleet scanner watches this repo** — it is not in the operations repo's fleet
   manifest. Tracked as #473.
 - Run `node --test scripts/card-shark-sync/*.test.js` before pushing.
+- ⚠️ **A bound set here is the fleet's only bound.** A caller job that invokes a
+  reusable workflow with `uses:` cannot carry `timeout-minutes` — GitHub permits only
+  `name`/`uses`/`with`/`secrets`/`needs`/`if`/`permissions` on it — so every stub in the
+  fleet inherits its ceiling from the job in `card-shark-sync.yml`. The operations repo's
+  own workflow guard walks its own directory and **cannot see this one**, which is why the
+  assertion lives in `tests.yml` here instead (#587). Don't move it back.
 - Bare `#N` issue references in this repo point to the private operations repo — an
   authenticated reader with access to that repo can resolve them to find full canon.
