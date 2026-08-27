@@ -73,8 +73,13 @@ stub comment for why.
 - Branch `feat/issue-NNN-*` / `fix/issue-NNN-*`; PR to `main`; never commit to `main`.
 - Issues are filed in **the operations repo**, not here — this repo is not on the Card
   Shark roster.
-- ⚠️ **No fleet scanner watches this repo** — it is not in the operations repo's fleet
-  manifest. Tracked as #473.
+- ⚠️ **No fleet scanner watches this repo.** ⚠️ **Not because it is absent from the
+  operations repo's fleet manifest — it is listed there.** The manifest is *declared*; what
+  scanners walk is *derived* from it, and the derivation drops the user- and org-level
+  community-health repos as infrastructure before anything else is read. So the manifest row
+  exists and is inert, including the audience it declares: none of the audience semantics
+  described above ever run against this repo. Adding or editing that row changes nothing —
+  the filter is a layer below it. Tracked as #473.
 - Run `node --test scripts/card-shark-sync/*.test.js` before pushing.
 - ⚠️ **A bound set here is the fleet's only bound.** A caller job that invokes a
   reusable workflow with `uses:` cannot carry `timeout-minutes` — GitHub permits only
