@@ -71,7 +71,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Check out the sync logic
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: owenrenn/.github
           # Callers are told to reference this reusable workflow as `@main`, not
