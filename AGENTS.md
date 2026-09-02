@@ -10,7 +10,43 @@ the fleet's **reusable workflows**.
 | `SECURITY.md` | Default security policy inherited by every `owenrenn/*` repo (#251). |
 | `.github/workflows/card-shark-sync.yml` | **Reusable**. Keeps Card Shark membership in sync with `pm:*` labels across the fleet. |
 | `scripts/card-shark-sync/` | Pure decision logic for the above, plus its `node --test` suite. |
+| `.github/workflows/autoclose-guard.yml` | **Reusable**. Warns when a PR's stated closing set and GitHub's computed one disagree — in either direction. Advisory; never blocks. |
+| `scripts/autoclose-guard/` | Pure decision logic for the above, plus its `node --test` suite. |
 | `.github/workflows/tests.yml` | This repo's CI: the `node --test` suite, plus the structural check that every workflow here parses and every job carries `timeout-minutes` (#587). |
+
+## Calling the auto-close guard
+
+Drop this in a consuming repo as `.github/workflows/autoclose-guard.yml`:
+
+```yaml
+name: auto-close guard
+on:
+  pull_request:
+    # `edited` catches a body change that adds a closing keyword — that is most
+    # of this guard's value, not a multiplier to trim.
+    types: [opened, edited, reopened, ready_for_review]
+
+# ⚠️ REQUIRED, and the easiest thing to leave out. A called workflow cannot
+# exceed the CALLING workflow's token permissions, and these repos default that
+# token to READ-ONLY. Omit this block and the guard parses, runs, and dies at the
+# comment write — green in every structural check, silent in production.
+permissions:
+  pull-requests: write
+  issues: read
+  contents: read
+
+jobs:
+  guard:
+    uses: owenrenn/.github/.github/workflows/autoclose-guard.yml@main
+```
+
+Nothing else is needed — no vendored script, no secret. The guard uses the
+caller's own `GITHUB_TOKEN`.
+
+⚠️ **Verify it live rather than trusting the merge.** A workflow can parse, pass
+every structural check, merge green and never run correctly. The PR that adds the
+stub is itself a `pull_request` event, so it exercises the guard on arrival —
+check that run before assuming the wiring holds.
 
 ## The constraint that shapes everything here
 

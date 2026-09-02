@@ -1,0 +1,341 @@
+# Reusable auto-close guard. Callers add a short stub; the decision logic and its
+# test suite live here, once.
+#
+# WHY: GitHub auto-closes an issue on merge when a PR *registers* it as a closing
+# reference — via a body keyword (`Closes/Fixes/Resolves #N`) OR via the
+# Development sidebar. A prose disclaimer in the body ("does not close #N") does
+# NOT override that registration. Four long-lived trackers were orphaned this way
+# before the guard existed; the costliest sat closed and unnoticed for six weeks.
+#
+# The predicate leads with the *contradiction* (body says "reference", GitHub says
+# "close"), which catches the case regardless of label, and keeps a project-type
+# label plus a `no-autoclose` marker as second signals. A label-only predicate
+# misses a watch ticket wearing some other type label — that is how the fourth
+# orphaning happened.
+#
+# It also reports the INVERSE direction, the failure that gets missed because
+# nothing red ever appears. GitHub needs a closing keyword before EACH number:
+# `Closes #11, #12` registers **#11 alone** and reads #12 as a bare mention. An
+# earlier version of this guard was GREEN on exactly that, because every check it
+# ran was over `closingIssuesReferences` — the set GitHub computed — and the
+# dropped number was never in it. An omission reads as an all-clear. So we compare
+# the author's stated closing set against GitHub's computed one, both directions.
+#
+# Deliberately NOT "warn on every closing reference": most PRs legitimately close
+# something, so that predicate fires nearly always and the warning becomes
+# ignorable — which is how the orphaning recurs.
+#
+# Advisory only — it surfaces, it never blocks. Self-heals: correct the reference
+# and the warning comment clears itself.
+#
+# ⚠️ CALLER CONTRACT: the stub MUST declare its own `permissions:` block. A called
+# workflow cannot exceed the CALLING workflow's token permissions, and the repos
+# calling this default that token to READ-ONLY — without it this guard parses,
+# runs, and dies at the comment write. The stub is in AGENTS.md.
+#
+# Decision logic lives in `scripts/autoclose-guard/predicate.js` IN THIS REPO so it
+# can be unit-tested (run by `tests.yml`). This file is I/O only.
+
+name: auto-close guard
+
+on:
+  # ⚠️ The caller's stub owns the `types:` list. Closing references derive from
+  # the PR body (keywords) and the Development-sidebar link, so a stub needs
+  # `edited` for body changes plus `opened`/`reopened`/`ready_for_review` for the
+  # lifecycle entry points. AGENTS.md carries the canonical stub.
+  workflow_call:
+
+# WHY: serialize per-PR so a burst of events (open + edit) can't race past
+# the marker check and post duplicate warnings — same failure the
+# a sibling gate in this fleet hit. cancel-in-progress: false lets the
+# in-flight write finish; the newest event still runs last.
+concurrency:
+  group: autoclose-guard-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pull-requests: write   # upsert/delete the advisory comment
+      issues: read           # read tracker labels + stated-close issue states
+      contents: read         # checkout, for the predicate module
+    steps:
+      # WHY checkout: the predicate module is read from disk. Without it the
+      # `require` below throws and the step fails — the intended fail-closed
+      # behaviour. A guard that silently skips itself is worse than no guard,
+      # because it still reads as "checked" in the PR timeline.
+      #
+      # ⚠️ `repository:` IS LOAD-BEARING. With no `repository:` this checks out
+      # the CALLER, which does not carry the predicate — the guard would then
+      # crash on every run in every consuming repo. A reusable workflow does not
+      # bring its own repo's files.
+      - name: Check out the guard logic
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: owenrenn/.github
+          ref: main
+          path: .autoclose-guard
+
+      # WHY a SHA and not `@v9`: on 2026-08-17 this step failed once with
+      # `Resource not accessible by integration` and was green again 52 minutes
+      # later with no commit here — a floating major can change under us with
+      # nothing in this repo to diff against. Pinning makes the action's
+      # version a fact of this file.
+      #
+      # ⚠️ Kept pinned on the way into this repo, where the neighbouring
+      # reusable workflow still floats on tags. That is a deliberate divergence,
+      # not an oversight: the incident above is the reason, and a guard whose
+      # action can change under it is a guard you cannot reason about. Nothing
+      # here asserts the pin yet — no structural test in this repo covers it.
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) return;
+
+            const { evaluate, closingIntentNumbers, explainReason } =
+              require(`${process.env.GITHUB_WORKSPACE}/.autoclose-guard/scripts/autoclose-guard/predicate.js`);
+
+            const MARKER = "<!-- autoclose-guard -->";
+            // Separate marker so the advisory self-heal can't delete a crash
+            // notice, and a crash can't masquerade as an advisory finding.
+            const ERROR_MARKER = "<!-- autoclose-guard:error -->";
+            const { owner, repo } = context.repo;
+
+            const listMarkerComments = async (marker) => {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: pr.number, per_page: 100,
+              });
+              // WHY Bot + body guard: only manage our own bot comments; a human
+              // comment quoting the marker must never be deletable by us.
+              return comments.filter(
+                c => c.user?.type === "Bot" && c.body && c.body.includes(marker),
+              );
+            };
+
+            const dropComment = async (id, what) => {
+              // WHY: janitorial deletes are best-effort — a failed delete must
+              // not abort the guard's actual contract. Warn, continue.
+              try {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: id });
+              } catch (e) {
+                core.warning(`Could not delete ${what} comment ${id}: ${e.message}`);
+              }
+            };
+
+            const main = async () => {
+              // WHY GraphQL: `closingIssuesReferences` is GitHub's computed set
+              // of issues this PR will close on merge — it already folds in both
+              // body keywords and sidebar links, so we read the source of truth
+              // rather than re-parsing the body for closing intent (which would
+              // miss sidebar-only links, exactly how #190 and #337 slipped).
+              const data = await github.graphql(`
+                query($owner:String!, $repo:String!, $pr:Int!) {
+                  repository(owner:$owner, name:$repo) {
+                    pullRequest(number:$pr) {
+                      closingIssuesReferences(first: 25) {
+                        nodes {
+                          number
+                          title
+                          state
+                          labels(first: 20) { nodes { name } }
+                        }
+                      }
+                    }
+                  }
+                }`,
+                { owner, repo, pr: pr.number }
+              );
+
+              const closingRefs = (data.repository.pullRequest.closingIssuesReferences.nodes || [])
+                .map(n => ({
+                  number: n.number,
+                  title: n.title,
+                  state: n.state,
+                  labels: (n.labels?.nodes || []).map(l => l.name),
+                }));
+
+              // Resolve the issues the BODY claims to close but GitHub did not
+              // register, so the predicate can tell "still open, so orphaned"
+              // from "already closed, so harmless". Capped at 25 to match the
+              // bound above; a body naming more than 25 issues is pathological.
+              const registered = new Set(closingRefs.map(r => r.number));
+              const unresolved = [...closingIntentNumbers(pr.body || "")]
+                .filter(n => !registered.has(n))
+                .slice(0, 25);
+
+              let issueStates = {};
+              let statesUnreadable = false;
+              if (unresolved.length > 0) {
+                const aliases = unresolved
+                  .map((n, i) => `i${i}: issue(number: ${n}) { number title state }`)
+                  .join("\n                      ");
+                try {
+                  const res = await github.graphql(`
+                    query($owner:String!, $repo:String!) {
+                      repository(owner:$owner, name:$repo) {
+                      ${aliases}
+                      }
+                    }`,
+                    { owner, repo }
+                  );
+                  // A number that names no issue comes back null (or errors
+                  // with partial data on a GraphqlResponseError) — either way
+                  // it simply never enters the map, and the predicate makes no
+                  // claim about it.
+                  for (const node of Object.values(res?.repository || {})) {
+                    if (node) issueStates[node.number] = { state: node.state, title: node.title };
+                  }
+                } catch (e) {
+                  for (const node of Object.values(e?.data?.repository || {})) {
+                    if (node) issueStates[node.number] = { state: node.state, title: node.title };
+                  }
+                  // WHY this is tracked rather than swallowed: an empty
+                  // `issueStates` makes the inverse check report nothing, which
+                  // is indistinguishable from "nothing to report". That is the
+                  // omission-reads-as-all-clear failure this direction exists
+                  // to close, so an unreadable state goes INTO the comment.
+                  statesUnreadable = Object.keys(issueStates).length === 0;
+                  core.warning(`Could not resolve stated-close issue states: ${e.message}`);
+                }
+              }
+
+              const { flagged, unregistered } = evaluate({
+                closingRefs, body: pr.body || "", issueStates,
+              });
+
+              // Gather existing marker comments (self-heal dupes, like the
+              // label gate — keep the first as canonical, delete the rest).
+              const markerComments = await listMarkerComments(MARKER);
+              const existing = markerComments[0] || null;
+              for (const dupe of markerComments.slice(1)) {
+                await dropComment(dupe.id, "duplicate marker");
+              }
+              // A run that got this far did not crash; clear any stale notice.
+              for (const stale of await listMarkerComments(ERROR_MARKER)) {
+                await dropComment(stale.id, "stale crash-notice");
+              }
+
+              // WHY self-heal: when the reference is corrected, both sets go
+              // empty — remove the stale warning so the PR doesn't carry a
+              // false alarm. This is what makes the guard low-friction.
+              if (flagged.length === 0 && unregistered.length === 0 && !statesUnreadable) {
+                if (existing) await dropComment(existing.id, "resolved guard");
+                core.info("No at-risk issues, and every stated close is registered. OK.");
+                return;
+              }
+
+              const sections = [
+                MARKER,
+                "⚠️ **This PR's closing references do not match what merging will actually do.**",
+              ];
+
+              if (flagged.length > 0) {
+                sections.push(
+                  "",
+                  "Merging will **close** the following open issue(s), which probably should survive it:",
+                  "",
+                  flagged
+                    .map(r => [
+                      `- **#${r.number}** — ${r.title}`,
+                      ...r.reasons.map(reason => `  - ${explainReason(reason)}`),
+                    ].join("\n"))
+                    .join("\n"),
+                  "",
+                  "If this is the **final** PR completing that work, ignore this. Otherwise:",
+                  "",
+                  "1. In the PR body, change `Closes` / `Fixes` / `Resolves #N` → `Refs #N`.",
+                  "2. **Unlink the issue from the PR's Development sidebar.** Step 1 alone is not enough — a sidebar link closes the issue with no keyword at all, which is how one of the four historical orphanings happened.",
+                );
+              }
+
+              if (unregistered.length > 0) {
+                sections.push(
+                  "",
+                  "Merging will **not** close the following open issue(s), even though the body says it does:",
+                  "",
+                  unregistered.map(r => `- **#${r.number}** — ${r.title}`).join("\n"),
+                  "",
+                  "GitHub needs a closing keyword before **each** number — `Closes #1, #2` registers `#1` only. Write `Closes #1, closes #2` (or one keyword per line), then re-check the Development sidebar.",
+                );
+              }
+
+              if (statesUnreadable) {
+                sections.push(
+                  "",
+                  "⚠️ The guard could **not read** the state of the issue(s) this body names but GitHub did not register, so it cannot say whether any are orphaned. Check by hand — this is not an all-clear.",
+                );
+              }
+
+              sections.push(
+                "",
+                "_Why:_ a registered closing reference auto-closes the issue even when the body says it doesn't, and an unregistered one silently leaves work open — `Closes #11, #12` registers **#11 alone**.",
+                "",
+                "_(Advisory only — this check never blocks the merge.)_",
+              );
+
+              const body = sections.join("\n");
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner, repo, comment_id: existing.id, body,
+                });
+                core.info(`Updated guard warning on PR #${pr.number}.`);
+              } else {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: pr.number, body,
+                });
+                core.info(`Posted guard warning on PR #${pr.number}.`);
+              }
+            };
+
+            // WHY surface a crash in the PR timeline: a red check in a repo
+            // where nothing can gate a merge trains the eye to
+            // scroll past it, and "the guard crashed" then looks identical to
+            // "the guard ran and found something". A comment says which.
+            //
+            // ⚠️ This CANNOT cover the other way this guard goes missing: when
+            // Actions will not start the job at all (exhausted minutes, a failed
+            // payment, a spending limit), no step runs, so nothing here can
+            // speak. That gap belongs to a billing alarm, not to this file.
+            try {
+              await main();
+            } catch (e) {
+              const body = [
+                ERROR_MARKER,
+                "🛑 **The auto-close guard crashed — this PR was NOT checked.**",
+                "",
+                "```",
+                String(e.message || e),
+                "```",
+                "",
+                "Check by hand before merging; an unchecked PR is not a clean one:",
+                "",
+                "```bash",
+                `gh api graphql -f query='{ repository(owner:"${owner}", name:"${repo}") { pullRequest(number:${pr.number}) { closingIssuesReferences(first:25){ nodes { number title state } } } } }'`,
+                "```",
+                "",
+                "Compare that list against every `Closes`/`Fixes`/`Resolves` in the body — they are supposed to agree.",
+              ].join("\n");
+
+              try {
+                const stale = await listMarkerComments(ERROR_MARKER);
+                if (stale[0]) {
+                  await github.rest.issues.updateComment({
+                    owner, repo, comment_id: stale[0].id, body,
+                  });
+                } else {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: pr.number, body,
+                  });
+                }
+              } catch (postErr) {
+                // The crash may BE the comment API (that is what failed on
+                // seen at least once), so this path may itself fail.
+                core.warning(`Could not post the crash notice: ${postErr.message}`);
+              }
+
+              core.setFailed(`auto-close guard crashed: ${e.message || e}`);
+            }
