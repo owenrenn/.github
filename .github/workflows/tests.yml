@@ -31,6 +31,8 @@ jobs:
           node-version: "24"
       - name: Run card-shark-sync module tests
         run: node --test scripts/card-shark-sync/*.test.js
+      - name: Run autoclose-guard module tests
+        run: node --test scripts/autoclose-guard/*.test.js
       - name: Every workflow parses, and every job is bounded
         # Two assertions over one walk, both of which the node suite structurally
         # cannot make:
