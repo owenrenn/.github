@@ -1,0 +1,213 @@
+# Publish a release payload and its manifest to S3-compatible object storage, then
+# prove the result by fetching it back from the URL a CLIENT reads.
+#
+# WHY this exists: a self-updating client's healthy idle state is SILENCE. "nothing
+# new for you", "your address 404s" and "wrong host" are one observable, so a feed
+# that was never published looks exactly like a feed with no new version — for as
+# long as nobody asks. One product in this fleet shipped a completely dead updater
+# through eight releases that way. Every assertion below exists to convert one of
+# those silences into a red run.
+#
+# WHY a composite action and not a reusable workflow, which is this repo's usual
+# shape: the files to publish live in the CALLING JOB's workspace. A reusable
+# workflow runs as its own job on its own runner and would need the whole payload
+# — often >100 MB — round-tripped through workflow artifacts to see them, against a
+# free-tier artifact quota that is easy to exhaust. A composite action runs inside
+# the caller's job and reads the workspace directly.
+#
+# ⚠️ CONTENT RULE (see AGENTS.md): this repo is public, so this file carries NO
+# bucket, domain, product or organization name. Every one of those is a required
+# input supplied by the caller. Do not add a "convenient" default — a default here
+# publishes an inventory of private surfaces to anonymous readers.
+
+name: Publish update feed
+description: >-
+  Upload release payloads and an optional manifest to S3-compatible object
+  storage, then verify the feed from the public URL a client actually reads.
+
+inputs:
+  bucket:
+    description: Object-storage bucket name. Must match the credential's scope exactly.
+    required: true
+  prefix:
+    description: >-
+      Key prefix within the bucket, without leading or trailing slashes. Must
+      correspond to base-url — the verification step is what proves they agree.
+    required: true
+  base-url:
+    description: >-
+      Public HTTPS URL, without a trailing slash, that resolves to bucket/prefix.
+      This is the address the client reads; it is what gets verified.
+    required: true
+  source-dir:
+    description: Directory holding the built feed files.
+    required: true
+  payload-glob:
+    description: >-
+      Filename pattern for immutable payload files inside source-dir (for example
+      a package or installer). At least one must match or the action fails.
+    required: true
+  manifest:
+    description: >-
+      Filename of the mutable manifest that names the payload, if the target
+      ecosystem has one. Uploaded LAST and served no-cache. Leave empty for a
+      plain file drop with no manifest.
+    required: false
+    default: ""
+  endpoint-url:
+    description: S3-compatible API endpoint of the storage provider.
+    required: true
+  access-key-id:
+    description: Access key ID. Pass a secret; never a literal.
+    required: true
+  secret-access-key:
+    description: Secret access key. Pass a secret; never a literal.
+    required: true
+  region:
+    description: Region to send. Providers that ignore regions generally accept "auto".
+    required: false
+    default: "auto"
+  payload-content-type:
+    description: Content-Type for payload objects.
+    required: false
+    default: application/octet-stream
+  manifest-content-type:
+    description: Content-Type for the manifest object.
+    required: false
+    default: text/plain
+
+runs:
+  using: composite
+  steps:
+    - name: Publish and verify update feed
+      shell: bash
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.secret-access-key }}
+        AWS_DEFAULT_REGION: ${{ inputs.region }}
+        # WHY: recent AWS CLI v2 sends x-amz-checksum-* on every PUT by default.
+        # Several S3-compatible stores reject those and answer with an opaque
+        # integrity error that reads as corruption rather than as an unsupported
+        # header. Restricting checksums to when they are required is the portable
+        # setting.
+        AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+        AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        IN_BUCKET: ${{ inputs.bucket }}
+        IN_PREFIX: ${{ inputs.prefix }}
+        IN_BASE_URL: ${{ inputs.base-url }}
+        IN_SOURCE_DIR: ${{ inputs.source-dir }}
+        IN_PAYLOAD_GLOB: ${{ inputs.payload-glob }}
+        IN_MANIFEST: ${{ inputs.manifest }}
+        IN_ENDPOINT: ${{ inputs.endpoint-url }}
+        IN_PAYLOAD_CT: ${{ inputs.payload-content-type }}
+        IN_MANIFEST_CT: ${{ inputs.manifest-content-type }}
+      run: |
+        set -euo pipefail
+
+        # ── 1. Refuse to run half-configured ────────────────────────────────
+        # WHY there is no skip-when-unset branch: a release that shipped while
+        # quietly not publishing its feed is the exact failure this action was
+        # written to end. A missing credential must redden the run, not soften it.
+        for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY IN_BUCKET IN_PREFIX IN_BASE_URL IN_SOURCE_DIR IN_PAYLOAD_GLOB IN_ENDPOINT; do
+          if [ -z "${!v:-}" ]; then
+            echo "FATAL: required value '$v' is empty."
+            echo "The feed cannot be published, so this release would reach nobody."
+            exit 1
+          fi
+        done
+
+        case "$IN_BASE_URL" in
+          https://*) ;;
+          # WHY assert here rather than let it fail later: most updater clients
+          # require HTTPS and refuse at startup, which surfaces on a USER's
+          # machine rather than in CI. Catch it while a human is watching.
+          *) echo "FATAL: base-url must be https:// (got '$IN_BASE_URL')"; exit 1 ;;
+        esac
+
+        [ -d "$IN_SOURCE_DIR" ] || { echo "FATAL: source-dir '$IN_SOURCE_DIR' does not exist"; exit 1; }
+
+        # ── 2. Locate what we are publishing ────────────────────────────────
+        # WHY `|| true` on the pipeline: under `set -o pipefail`, head closing the
+        # pipe early kills find with SIGPIPE and aborts the script. The emptiness
+        # checks below are what actually catch a missing file.
+        PAYLOADS=$(find "$IN_SOURCE_DIR" -maxdepth 1 -type f -name "$IN_PAYLOAD_GLOB" | sort || true)
+        if [ -z "$PAYLOADS" ]; then
+          echo "FATAL: no file matching '$IN_PAYLOAD_GLOB' in '$IN_SOURCE_DIR'."
+          echo "Contents:"; ls -la "$IN_SOURCE_DIR" || true
+          exit 1
+        fi
+
+        MANIFEST_PATH=""
+        if [ -n "$IN_MANIFEST" ]; then
+          MANIFEST_PATH="$IN_SOURCE_DIR/$IN_MANIFEST"
+          # A manifest NAMED but ABSENT is a build-shape change, not an optional
+          # file. Failing here beats publishing payloads no manifest points at.
+          [ -f "$MANIFEST_PATH" ] || { echo "FATAL: manifest '$IN_MANIFEST' named but not present in '$IN_SOURCE_DIR'"; exit 1; }
+        fi
+
+        DEST="s3://${IN_BUCKET}/${IN_PREFIX}"
+        echo "== publishing to ${DEST}/ =="
+
+        # ── 3. Payloads FIRST, manifest LAST ────────────────────────────────
+        # WHY the order is load-bearing: the manifest is what a client reads to
+        # discover a version. If it lands first, a client polling inside that
+        # window asks for a payload that does not exist yet and errors. Uploading
+        # payloads first makes the window harmless — the manifest simply does not
+        # mention them yet.
+        #
+        # Immutable caching is safe for payloads because their filenames carry a
+        # version; an edited payload under a reused name is a different bug.
+        while IFS= read -r f; do
+          [ -n "$f" ] || continue
+          echo "-- payload: $(basename "$f") ($(wc -c < "$f") bytes)"
+          aws s3 cp "$f" "${DEST}/$(basename "$f")" \
+            --endpoint-url "$IN_ENDPOINT" \
+            --content-type "$IN_PAYLOAD_CT" \
+            --cache-control "public, max-age=31536000, immutable"
+        done <<< "$PAYLOADS"
+
+        if [ -n "$MANIFEST_PATH" ]; then
+          # WHY no-cache: the manifest is rewritten every release under the SAME
+          # key. A cached copy means installed clients keep reading the previous
+          # one and never learn a new version exists — the same silent staleness
+          # this action exists to prevent, relocated into the CDN.
+          echo "-- manifest: $IN_MANIFEST"
+          aws s3 cp "$MANIFEST_PATH" "${DEST}/${IN_MANIFEST}" \
+            --endpoint-url "$IN_ENDPOINT" \
+            --content-type "$IN_MANIFEST_CT" \
+            --cache-control "no-cache, max-age=0, must-revalidate"
+        fi
+
+        # ── 4. Verify from the CONSUMER's address ───────────────────────────
+        # WHY this is the only step that proves anything: a successful upload
+        # proves bytes left the runner. It says nothing about whether the custom
+        # domain is bound, whether the bucket policy serves reads, or whether
+        # prefix and base-url agree. Those three are written in separate places
+        # that nothing compares, and their disagreement is a 404 — which most
+        # update clients treat as "nothing new", i.e. as success.
+        echo "== verifying live feed at ${IN_BASE_URL} =="
+
+        if [ -n "$MANIFEST_PATH" ]; then
+          curl -fsSL "${IN_BASE_URL}/${IN_MANIFEST}" -o /tmp/manifest.live
+          echo "-- served manifest --"; cat /tmp/manifest.live; echo
+          # \r stripped both sides: manifests generated on Windows runners carry
+          # CRLF that the store returns verbatim, and that is not a difference.
+          if ! diff <(tr -d '\r' < "$MANIFEST_PATH") <(tr -d '\r' < /tmp/manifest.live) > /dev/null; then
+            echo "FATAL: the manifest served at ${IN_BASE_URL} does not match the one just built."
+            diff <(tr -d '\r' < "$MANIFEST_PATH") <(tr -d '\r' < /tmp/manifest.live) || true
+            exit 1
+          fi
+        fi
+
+        # WHY probe each payload too: a correct manifest naming an absent payload
+        # still fails, and it fails on the USER's machine at download time. HEAD
+        # keeps this cheap regardless of payload size.
+        while IFS= read -r f; do
+          [ -n "$f" ] || continue
+          b=$(basename "$f")
+          CODE=$(curl -fsS -o /dev/null -w '%{http_code}' -I "${IN_BASE_URL}/${b}" || echo "000")
+          [ "$CODE" = "200" ] || { echo "FATAL: payload '$b' is not served at ${IN_BASE_URL} (HTTP $CODE)"; exit 1; }
+          echo "-- verified: $b -> HTTP 200"
+        done <<< "$PAYLOADS"
+
+        echo "OK: update feed live at ${IN_BASE_URL}"
