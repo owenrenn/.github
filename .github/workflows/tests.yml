@@ -13,7 +13,10 @@ on:
   # files that exist today means workflow number three lands without the check
   # that covers it ever running -- a detector reporting clean over what it was
   # never triggered to look at (#557, #587).
-  push: { paths: &test_paths ["scripts/**", ".github/workflows/**"] }
+  # `actions/**` included for the same reason the workflow glob is a glob and not
+  # a file list: a composite action edited without triggering the suite that checks
+  # it is a detector that never runs over the thing it was added to cover.
+  push: { paths: &test_paths ["scripts/**", ".github/workflows/**", "actions/**"] }
   pull_request: { paths: *test_paths }
 
 jobs:
@@ -83,6 +86,53 @@ jobs:
               problems.append("no jobs discovered -- the bounds check looked at nothing")
 
           print(f"== bounds: {checked} jobs checked, {exempt} reusable-workflow callers exempt ==")
+          for p in problems:
+              print(p, file=sys.stderr)
+          sys.exit(1 if problems else 0)
+          PY
+      - name: Every composite action parses, and every run step names its shell
+        # WHY a separate assertion: a composite action's `run` step with no
+        # `shell:` is accepted by every YAML parser and by `actions/checkout`,
+        # and fails only when a CALLER invokes it -- in the caller's repo, on the
+        # caller's release. The blast radius of the mistake is entirely outside
+        # the repo that made it, which is the worst place for a defect to surface
+        # and the reason this is worth a structural check rather than review.
+        #
+        # Also asserts the walk found something: an empty glob would otherwise
+        # report success having examined nothing, the failure mode this repo's
+        # other checks are explicitly shaped to avoid.
+        run: |
+          python3 - <<'PY'
+          import glob, sys, yaml
+
+          checked = 0
+          problems = []
+          for f in sorted(glob.glob("actions/*/action.yml")):
+              doc = yaml.safe_load(open(f)) or {}
+              runs = doc.get("runs") or {}
+              if runs.get("using") != "composite":
+                  continue
+              for i, step in enumerate(runs.get("steps") or []):
+                  if not isinstance(step, dict) or "run" not in step:
+                      continue
+                  checked += 1
+                  if not step.get("shell"):
+                      problems.append(
+                          f"{f}: step {i} ({step.get('name', 'unnamed')!r}) has `run` "
+                          "but no `shell` -- composite actions require it, and this "
+                          "fails in the CALLER's workflow, not here"
+                      )
+              # An input declared required with a default is a contradiction the
+              # runner resolves silently in favour of the default, which is how a
+              # caller omits something load-bearing and never learns.
+              for name, spec in (doc.get("inputs") or {}).items():
+                  if isinstance(spec, dict) and spec.get("required") and "default" in spec:
+                      problems.append(f"{f}: input {name!r} is required AND has a default")
+
+          if checked == 0:
+              problems.append("no composite run steps discovered -- this check looked at nothing")
+
+          print(f"== composite actions: {checked} run steps checked ==")
           for p in problems:
               print(p, file=sys.stderr)
           sys.exit(1 if problems else 0)
