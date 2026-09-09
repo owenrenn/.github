@@ -8,12 +8,39 @@ the fleet's **reusable workflows**.
 | Path | Purpose |
 |---|---|
 | `SECURITY.md` | Default security policy inherited by every `owenrenn/*` repo (#251). |
-| `.github/workflows/card-shark-sync.yml` | **Reusable**. Keeps Card Shark membership in sync with `pm:*` labels across the fleet. |
-| `scripts/card-shark-sync/` | Pure decision logic for the above, plus its `node --test` suite. |
+| `.github/workflows/card-shark-sync.yml` | **Reusable**. Keeps Card Shark membership in sync with `pm:*` labels across the fleet, **and mirrors Track / Priority / Engagement at the same moment** (#849). |
+| `scripts/card-shark-sync/` | Pure decision logic for the above (`sync.js` = membership, `fields.js` = field derivation), plus their `node --test` suites. |
 | `.github/workflows/autoclose-guard.yml` | **Reusable**. Warns when a PR's stated closing set and GitHub's computed one disagree — in either direction. Advisory; never blocks. |
 | `scripts/autoclose-guard/` | Pure decision logic for the above, plus its `node --test` suite. |
 | `actions/publish-update-feed/` | **Composite action.** Uploads release payloads + an optional manifest to S3-compatible object storage, then verifies the feed from the public URL a client reads. |
 | `.github/workflows/tests.yml` | This repo's CI: the `node --test` suite, plus the structural check that every workflow here parses and every job carries `timeout-minutes` (#587). |
+
+## Calling the Card Shark sync
+
+The stub lives in the operations repo's template; only its **interface** is documented here.
+
+| Input | Required | Default | Meaning |
+|---|---|---|---|
+| `audience` | yes | — | `pm-surface` (every issue auto-flows) or `agent-zone` (escalation only) |
+| `track` | no | `Personal` | The board Track for items from this repo — `Work` or `Personal` |
+
+⚠️ **`track` is an input rather than a lookup, and that is a content-policy
+consequence, not a preference.** Track follows from which repo an item came from, and
+the work-track repositories are private — GitHub returns `404` for those to an anonymous
+caller and will not confirm they exist, so a work-repo list in this public repo would
+answer a question the platform declines to answer (see § The content rule). The generic
+rule lives here; the private datum stays in the private caller's own workflow file.
+
+⚠️ **An unrecognised value is DROPPED, not written.** This repo cannot see the board's
+option list, so writing an arbitrary string would fail at the API with "no such option" —
+which reads nothing like the real cause, a typo in a caller's workflow input.
+
+⚠️ **The field mirror covers relabelling, not just creation, and needs no extra trigger.**
+`decideAction` returns `add` for any `labeled` event on an issue that *currently* carries a
+`pm:*` label, so applying a lane label to an item already on the board routes through the
+same path — and the add mutation returns the existing item id rather than erroring. That
+property is load-bearing; see the `#563` reasoning in `sync.js` for why deciding from
+current state rather than the event's label is what makes it hold.
 
 ## Calling the auto-close guard
 
