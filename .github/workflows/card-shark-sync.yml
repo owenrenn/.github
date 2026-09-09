@@ -26,6 +26,21 @@ on:
         description: "pm-surface or agent-zone — selects add-trigger semantics"
         required: true
         type: string
+      track:
+        # WHY A CALLER INPUT AND NOT A LOOKUP HERE: the board's Track is derived
+        # from which repo an item came from, and the work-track repositories are
+        # PRIVATE. GitHub returns 404 for those to an anonymous caller and will
+        # not confirm they exist, so a work-repo list in this PUBLIC repo would
+        # answer a question the platform declines to answer (AGENTS.md § The
+        # content rule). The generic rule lives here; the private datum stays in
+        # the private caller's own workflow file.
+        #
+        # Defaulting to Personal means exactly one caller in the fleet carries an
+        # override, rather than twenty stubs restating a value they all share.
+        description: "Board Track for items from this repo — Work or Personal"
+        required: false
+        default: "Personal"
+        type: string
     secrets:
       # Declared so a caller that passes secrets explicitly (rather than
       # `secrets: inherit`) fails at the CALL boundary if it forgets this one,
@@ -116,6 +131,9 @@ jobs:
             });
             core.info(`decision=${decision.kind} — ${decision.reason}`);
             core.setOutput("kind", decision.kind);
+            // Published so the field-mirror step below does not re-read the issue.
+            // Same read, same moment, one API call instead of two.
+            core.setOutput("labels", JSON.stringify(currentLabels));
             core.setOutput("backfill", decision.backfillLabel || "");
             core.setOutput("product", decision.applyProductLabel ? "yes" : "");
 
@@ -141,6 +159,7 @@ jobs:
             });
 
       - name: Add to Card Shark
+        id: add
         if: steps.decide.outputs.kind == 'add'
         uses: actions/github-script@v9
         with:
@@ -168,6 +187,128 @@ jobs:
               { projectId: PROJECT_ID, contentId: context.payload.issue.node_id },
             );
             core.info(`on Card Shark as ${r.addProjectV2ItemById.item.id}`);
+            core.setOutput("itemId", r.addProjectV2ItemById.item.id);
+
+      - name: Mirror Track, Priority and Engagement
+        # WHY HERE AND NOT ONLY IN THE FOUR-HOURLY SWEEP: the sweep was the only
+        # writer of these fields, so a newly-filed or relabelled issue sat with
+        # the wrong ones for up to four hours. Measured 2026-09-09: the board's
+        # non-delegable-queue view under-reported by 18%, and one of the items it
+        # was hiding was the ticket its owner had just called the top blocker.
+        #
+        # ⚠️ THIS COVERS RELABELLING, not just creation, and it does so without a
+        # new trigger: `decideAction` returns `add` for ANY labeled event on an
+        # issue that CURRENTLY carries a pm:* label -- so applying `lane:decide`
+        # to an item already on the board routes through this same path, and
+        # addProjectV2ItemById returns the existing item id rather than erroring.
+        # That property is load-bearing here; see #563 for why deciding from
+        # current state rather than the event's label is what makes it work.
+        #
+        # ⚠️ The sweep REMAINS the reconciler and is not replaced. It is still the
+        # only thing that heals a value set before a manual override, a label
+        # changed while this run was a cancelled intermediate, and any item this
+        # path lost. Sync-sets-fields is an ADDITION to the reconciler.
+        if: steps.decide.outputs.kind == 'add' && steps.add.outputs.itemId != ''
+        uses: actions/github-script@v9
+        env:
+          TRACK: ${{ inputs.track }}
+          LABELS: ${{ steps.decide.outputs.labels }}
+          ITEM_ID: ${{ steps.add.outputs.itemId }}
+        with:
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          script: |
+            const { computeUpdates } = require(`${process.env.GITHUB_WORKSPACE}/.card-shark-sync/scripts/card-shark-sync/fields.js`);
+
+            // ONE read: the item's current single-select values AND the project's
+            // field/option ids. The ticket that asked for this claimed it needed
+            // no extra API call; that was wrong -- nothing here previously
+            // resolved an option id. It does cost ZERO extra BILLED MINUTES,
+            // which is the claim that actually mattered: Actions bills per JOB
+            // with a one-minute minimum, so calls inside an existing job are free.
+            const q = await github.graphql(
+              `query($itemId: ID!) {
+                 node(id: $itemId) {
+                   ... on ProjectV2Item {
+                     fieldValues(first: 30) {
+                       nodes {
+                         ... on ProjectV2ItemFieldSingleSelectValue {
+                           name
+                           field { ... on ProjectV2SingleSelectField { name } }
+                         }
+                       }
+                     }
+                     project {
+                       id
+                       fields(first: 50) {
+                         nodes {
+                           ... on ProjectV2SingleSelectField { id name options { id name } }
+                         }
+                       }
+                     }
+                   }
+                 }
+               }`,
+              { itemId: process.env.ITEM_ID },
+            );
+
+            const item = q.node;
+            if (!item || !item.project) {
+              // Refuse rather than conclude. An unreadable item and an item with
+              // no fields set look identical from here, and writing defaults over
+              // the second would overwrite a human's judgement.
+              core.warning("could not read the board item — fields left untouched this run; the four-hourly reconciler still covers them");
+              return;
+            }
+
+            const valueOf = (fieldName) =>
+              (item.fieldValues.nodes || []).find(
+                (v) => v && v.field && v.field.name === fieldName,
+              )?.name || null;
+
+            const updates = computeUpdates({
+              track: process.env.TRACK,
+              labels: JSON.parse(process.env.LABELS || "[]"),
+              current: {
+                track: valueOf("Track"),
+                priority: valueOf("Priority"),
+                engagement: valueOf("Engagement"),
+              },
+            });
+
+            if (!updates.length) {
+              core.info("fields already correct — nothing to write");
+              return;
+            }
+
+            const fields = (item.project.fields.nodes || []).filter((f) => f && f.id);
+            for (const u of updates) {
+              const field = fields.find((f) => f.name === u.fieldName);
+              const option = field && (field.options || []).find((o) => o.name === u.optionName);
+              if (!field || !option) {
+                // ⚠️ WARN, DO NOT FAIL. A missing field or option is board
+                // configuration drift, not a sync malfunction, and failing here
+                // would make a workflow that every issue event runs habitually
+                // red -- which is how real failures stop being read. It is never
+                // silent: the reconciler sees the same gap on its next pass.
+                core.warning(`no board option "${u.optionName}" for field "${u.fieldName}" — skipped`);
+                continue;
+              }
+              await github.graphql(
+                `mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                   updateProjectV2ItemFieldValue(input: {
+                     projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
+                     value: { singleSelectOptionId: $optionId }
+                   }) { projectV2Item { id } }
+                 }`,
+                {
+                  projectId: item.project.id,
+                  itemId: process.env.ITEM_ID,
+                  fieldId: field.id,
+                  optionId: option.id,
+                },
+              );
+              core.info(`${u.fieldName} = ${u.optionName}`);
+            }
 
       - name: Apply product:<repo> label
         if: steps.decide.outputs.product != ''
