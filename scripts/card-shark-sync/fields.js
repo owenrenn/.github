@@ -164,7 +164,14 @@ function computeUpdates(item) {
  * through.
  */
 function frozenEngagement(item) {
-  const { labels = [], current = {} } = item || {};
+  const { contentType, labels = [], current = {} } = item || {};
+  // ⚠️ Draft cards are excluded, and this guard is NOT symmetry with
+  // computeUpdates -- it is load-bearing on its own. A draft has no labels by
+  // construction, so every draft carrying an Engagement value would be reported
+  // as frozen forever: a permanent finding nobody can clear, which is how a
+  // report stops being read. Found by integration, not by review: the consuming
+  // reconciler's suite asserts it and this module did not implement it.
+  if (contentType === "DraftIssue") return null;
   if (!current.engagement) return null;
   if (engagementName(labels)) return null; // a label derives it: not frozen
 

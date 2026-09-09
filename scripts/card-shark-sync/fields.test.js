@@ -178,3 +178,20 @@ test("an empty Engagement is not frozen", () => {
   assert.strictEqual(frozenEngagement({ labels: [], current: {} }), null);
   assert.strictEqual(frozenEngagement(undefined), null);
 });
+
+test("a draft card is never reported as frozen", () => {
+  // ⚠️ Not symmetry with computeUpdates. A draft has no labels by construction,
+  // so without this guard EVERY draft carrying an Engagement value is a
+  // permanent finding nobody can clear -- and a report with a permanent entry
+  // stops being read. The consuming reconciler has asserted this since before
+  // this module existed; the module shipped without it.
+  assert.strictEqual(
+    frozenEngagement({ contentType: "DraftIssue", labels: [], current: { engagement: "Do" } }),
+    null,
+  );
+  // A real item in the same state IS frozen — the guard must not over-reach.
+  assert.deepStrictEqual(
+    frozenEngagement({ contentType: "Issue", labels: [], current: { engagement: "Do" } }),
+    { engagement: "Do" },
+  );
+});
