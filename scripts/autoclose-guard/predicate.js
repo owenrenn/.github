@@ -275,10 +275,46 @@ function explainReason(reason) {
   }
 }
 
+/**
+ * Numbers where the body and GitHub's registered set disagree in a way that may
+ * be LAG rather than a real mismatch (#916).
+ *
+ * `closingIssuesReferences` is eventually consistent: read within seconds of a
+ * body write, it can still return the set as it was BEFORE the write. On
+ * `opened` that is an empty set — the guard reported OK over a PR whose close
+ * registered moments later, and a PR opened in its final form is only ever
+ * checked on `opened`.
+ *
+ * Two lag shapes, both cheap to wait out:
+ *   - stated as closing, not registered yet: a write GitHub hasn't applied;
+ *   - registered, and the body now references it with `Refs`/negated wording:
+ *     an edit that dropped a closing keyword, not applied yet.
+ * A registered number the body never mentions (a sidebar-only link) is NOT
+ * lag-shaped and never triggers a retry.
+ *
+ * The workflow re-reads while this is non-empty, then evaluates the LATEST read
+ * regardless. So a genuine mismatch — a comma list that registered one number,
+ * or a real contradiction — costs the retry budget in seconds, never a missed
+ * report, and the waiting stays inside the 1-minute billing floor.
+ *
+ * @param {string} body raw PR body
+ * @param {Array<{number:number}>} [closingRefs] GitHub's registered set, as read
+ * @returns {number[]} ascending
+ */
+function unsettled(body, closingRefs = []) {
+  const { reference, closing } = intentNumbers(body);
+  const registered = new Set(closingRefs.map(r => r.number));
+  const out = new Set();
+  for (const n of closing) if (!registered.has(n)) out.add(n);
+  for (const n of registered) if (reference.has(n)) out.add(n);
+  return [...out].sort((a, b) => a - b);
+}
+
 module.exports = {
   evaluate,
   referenceIntentNumbers,
   closingIntentNumbers,
   explainReason,
+  unsettled,
   PROTECTED_LABELS,
 };

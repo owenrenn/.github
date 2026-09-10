@@ -74,7 +74,12 @@ caller's own `GITHUB_TOKEN`.
 ⚠️ **Verify it live rather than trusting the merge.** A workflow can parse, pass
 every structural check, merge green and never run correctly. The PR that adds the
 stub is itself a `pull_request` event, so it exercises the guard on arrival —
-check that run before assuming the wiring holds.
+check that run before assuming the wiring holds. ⚠️ That arrival run is an
+`opened` event, and **before #916 it could read OK over a real problem**:
+`closingIssuesReferences` lags a body write, and on `opened` it read empty. The
+guard now waits and re-reads (up to 4 × 5s) until the registered set settles, so an
+arrival run that says OK can be believed. It can also take ~20s longer than you'd
+expect when the body really does disagree.
 
 ## Calling the update-feed publisher
 

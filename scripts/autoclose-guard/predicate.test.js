@@ -5,6 +5,7 @@ const {
   referenceIntentNumbers,
   closingIntentNumbers,
   explainReason,
+  unsettled,
 } = require("./predicate.js");
 
 // Bodies below are lifted from the real PRs that caused (or narrowly avoided)
@@ -301,4 +302,41 @@ test("an already-CLOSED issue closed by prose is not flagged", () => {
 test("stated closing intent is unchanged by position — only the flag is new", () => {
   // The unregistered direction still sees a mid-sentence close as stated.
   assert.deepEqual([...closingIntentNumbers("both filed rather than fixed: #41")], [41]);
+});
+
+// ── settle before judging: the registered set lags a body write (#916) ──────
+//
+// On `opened`, `closingIssuesReferences` read EMPTY for a PR whose close
+// registered moments later, and the guard reported OK. `unsettled` names the
+// lag-shaped disagreements the workflow waits out before evaluating.
+
+test("unsettled: a stated close not yet registered is lag-shaped", () => {
+  assert.deepEqual(unsettled("Closes #5", []), [5]);
+});
+
+test("unsettled: a settled honest close is not", () => {
+  assert.deepEqual(unsettled("Closes #5", [open(5)]), []);
+});
+
+test("unsettled: a registered number the body now only references is lag-shaped", () => {
+  // An edit swapped a closing keyword for `Refs`; GitHub hasn't dropped it yet.
+  assert.deepEqual(unsettled("Refs #5", [open(5)]), [5]);
+});
+
+test("unsettled: a sidebar-only link the body never mentions never triggers a retry", () => {
+  assert.deepEqual(unsettled("Unrelated summary.", [open(8)]), []);
+});
+
+test("unsettled: the observed opened-race shape — a prose close, empty registered set", () => {
+  const body = "Refs #40\n\nThe last PR of that step closes #40.";
+  assert.deepEqual(unsettled(body, []), [40]);
+});
+
+test("unsettled, pinned cost: a GENUINE mismatch waits the full budget, then reports", () => {
+  // `Closes #1, #2` registers #1 alone — #2 never registers, so it stays
+  // unsettled on every read. The guard waits out its retries and THEN reports
+  // #2 as unregistered. A real contradiction (Refs + a registered close) behaves
+  // the same. Pinned so the ~20s wait is a known cost, never a surprise.
+  assert.deepEqual(unsettled("Closes #1, #2", [open(1)]), [2]);
+  assert.deepEqual(unsettled("Refs #3", [open(3)]), [3]);
 });
