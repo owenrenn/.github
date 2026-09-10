@@ -12,6 +12,7 @@ the fleet's **reusable workflows**.
 | `scripts/card-shark-sync/` | Pure decision logic for the above (`sync.js` = membership, `fields.js` = field derivation), plus their `node --test` suites. |
 | `.github/workflows/autoclose-guard.yml` | **Reusable**. Warns when a PR's stated closing set and GitHub's computed one disagree — in either direction — or when a close was registered only by a keyword **mid-sentence** rather than a line-leading `Closes #N` (#911). Advisory; never blocks. |
 | `scripts/autoclose-guard/` | Pure decision logic for the above, plus its `node --test` suite. |
+| `.github/workflows/guard-own-prs.yml` | **This repo's own caller** of the guard above (#911). It uses `uses: ./…`, so a PR that changes the guard's workflow runs its own version on itself. Until it existed, the repo where guard changes land was the one fleet repo the guard never checked. |
 | `actions/publish-update-feed/` | **Composite action.** Uploads release payloads + an optional manifest to S3-compatible object storage, then verifies the feed from the public URL a client reads. |
 | `.github/workflows/tests.yml` | This repo's CI: the `node --test` suite, plus the structural check that every workflow here parses and every job carries `timeout-minutes` (#587). |
 

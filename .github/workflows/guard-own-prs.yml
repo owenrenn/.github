@@ -1,0 +1,29 @@
+name: auto-close guard (this repo's own PRs)
+
+# This repo HOSTS the reusable auto-close guard — `autoclose-guard.yml` is a
+# `workflow_call` body — but until #911 nothing ran it on this repo's own PRs.
+# The one repo where guard changes land was the one repo the guard never saw.
+#
+# `uses: ./.github/...` resolves the called workflow AS OF THE PR'S COMMIT, so a
+# PR that changes the guard's workflow runs its own version on itself. (The
+# predicate module is still read from `main` — see the body's checkout step,
+# `repository:` + `ref: main`.)
+#
+# ⚠️ The `permissions:` block is required for the same reason as every fleet
+# stub: a called workflow cannot exceed the calling workflow's token. This job
+# carries no `timeout-minutes` because a `uses:` job cannot; its bound is the
+# called job's, and `tests.yml` counts it as an exempt reusable-workflow caller.
+on:
+  pull_request:
+    # `edited` catches a body change that adds a closing keyword — most of the
+    # guard's value, not a multiplier to trim.
+    types: [opened, edited, reopened, ready_for_review]
+
+permissions:
+  pull-requests: write
+  issues: read
+  contents: read
+
+jobs:
+  guard:
+    uses: ./.github/workflows/autoclose-guard.yml
