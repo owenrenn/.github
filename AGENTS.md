@@ -10,7 +10,7 @@ the fleet's **reusable workflows**.
 | `SECURITY.md` | Default security policy inherited by every `owenrenn/*` repo (#251). |
 | `.github/workflows/card-shark-sync.yml` | **Reusable**. Keeps Card Shark membership in sync with `pm:*` labels across the fleet, **and mirrors Track / Priority / Engagement at the same moment** (#849). |
 | `scripts/card-shark-sync/` | Pure decision logic for the above (`sync.js` = membership, `fields.js` = field derivation), plus their `node --test` suites. |
-| `.github/workflows/autoclose-guard.yml` | **Reusable**. Warns when a PR's stated closing set and GitHub's computed one disagree — in either direction. Advisory; never blocks. |
+| `.github/workflows/autoclose-guard.yml` | **Reusable**. Warns when a PR's stated closing set and GitHub's computed one disagree — in either direction — or when a close was registered only by a keyword **mid-sentence** rather than a line-leading `Closes #N` (#911). Advisory; never blocks. |
 | `scripts/autoclose-guard/` | Pure decision logic for the above, plus its `node --test` suite. |
 | `actions/publish-update-feed/` | **Composite action.** Uploads release payloads + an optional manifest to S3-compatible object storage, then verifies the feed from the public URL a client reads. |
 | `.github/workflows/tests.yml` | This repo's CI: the `node --test` suite, plus the structural check that every workflow here parses and every job carries `timeout-minutes` (#587). |

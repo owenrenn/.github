@@ -20,6 +20,18 @@
 // being a multi-wave / watch-state tracker, not carrying one particular label.
 // So we detect the *contradiction* directly — the PR says "reference" but
 // GitHub says "close" — and keep label predicates as a second signal.
+//
+// A third signal, `prose-keyword`, came from a later miss: the guard reported
+// OK over the exact mistake it exists for. A PR body explained that an issue
+// had been filed rather than addressed, and the past-tense closing verb with a
+// colon sat directly before the number, mid-sentence. GitHub registered it as a
+// close. The walk attributed that number to a closing keyword, so it counted as
+// STATED intent; stated and registered agreed; neither direction fired. The fix
+// is positional: only a keyword that LEADS its line counts as intentional (the
+// template form, `Closes #N` on a line of its own). A registered close whose
+// every keyword sits mid-sentence is flagged. This failure has recurred many
+// times, each by an author who knew the rule — which is why it is enforced here
+// rather than written down somewhere else.
 
 /**
  * Labels that mark an issue as never-auto-closable regardless of PR wording.
@@ -84,15 +96,20 @@ function normalize(body) {
  * keyword decides which set a `#N` lands in — and splitting the walk in two
  * would let the two directions drift apart.
  *
+ * `closingLeading` is the subset of `closing` stated by at least one keyword
+ * that LEADS its line. A number in `closing` but not `closingLeading` was only
+ * ever closed by prose.
+ *
  * @param {string} body raw PR body
- * @returns {{reference: Set<number>, closing: Set<number>}}
+ * @returns {{reference: Set<number>, closing: Set<number>, closingLeading: Set<number>}}
  */
 function intentNumbers(body) {
   const text = normalize(body);
   const reference = new Set();
   const closing = new Set();
+  const closingLeading = new Set();
 
-  let governor = null; // { isReference: boolean }
+  let governor = null; // { isReference: boolean, leading: boolean }
   let governorEnd = -1; // index just past the last attributed token
 
   for (const m of text.matchAll(TOKEN_RE)) {
@@ -101,8 +118,15 @@ function intentNumbers(body) {
     if (word) {
       const preceding = text.slice(Math.max(0, m.index - 24), m.index);
       const isClosing = CLOSING_WORDS.has(word.toLowerCase());
+      // Line-leading = nothing but whitespace between the line start and the
+      // keyword. Measured AFTER normalize(), so `**Closes** #N` still leads. A
+      // list marker or blockquote does NOT lead — a deliberate policy choice: the
+      // template form is the only intentional one. `\r\n` bodies are fine: the
+      // slice starts after the `\n`.
+      const lineStart = text.lastIndexOf("\n", m.index - 1) + 1;
       governor = {
         isReference: !isClosing || NEGATION_RE.test(preceding),
+        leading: /^\s*$/.test(text.slice(lineStart, m.index)),
       };
       governorEnd = m.index + raw.length;
       continue;
@@ -115,7 +139,13 @@ function intentNumbers(body) {
     // numbering is never mistaken for one of ours and looked up locally.
     const gap = text.slice(governorEnd, m.index);
     if (governor && governorEnd >= 0 && LIST_GAP_RE.test(gap)) {
-      (governor.isReference ? reference : closing).add(Number(num));
+      const n = Number(num);
+      if (governor.isReference) {
+        reference.add(n);
+      } else {
+        closing.add(n);
+        if (governor.leading) closingLeading.add(n);
+      }
       governorEnd = m.index + raw.length; // chain onward through `#a, #b, #c`
     } else {
       governor = null;
@@ -123,7 +153,7 @@ function intentNumbers(body) {
     }
   }
 
-  return { reference, closing };
+  return { reference, closing, closingLeading };
 }
 
 /**
@@ -181,7 +211,7 @@ function closingIntentNumbers(body) {
  * }}
  */
 function evaluate({ closingRefs = [], body = "", issueStates = {} } = {}) {
-  const { reference: refIntent, closing: closeIntent } = intentNumbers(body);
+  const { reference: refIntent, closing: closeIntent, closingLeading } = intentNumbers(body);
 
   const flagged = [];
   for (const ref of closingRefs) {
@@ -194,6 +224,12 @@ function evaluate({ closingRefs = [], body = "", issueStates = {} } = {}) {
     // Ordered most-diagnostic first: the contradiction names the actual bug,
     // so it should lead the warning when both signals fire.
     if (refIntent.has(ref.number)) reasons.push("contradiction");
+    // Registered, and every keyword that states it sits mid-sentence. A
+    // sidebar-only link has no keyword at all, so it is NOT this case — it stays
+    // governed by the label signals below, exactly as before.
+    if (closeIntent.has(ref.number) && !closingLeading.has(ref.number)) {
+      reasons.push("prose-keyword");
+    }
     for (const label of PROTECTED_LABELS) {
       if (labels.includes(label)) reasons.push(label);
     }
@@ -228,6 +264,8 @@ function explainReason(reason) {
   switch (reason) {
     case "contradiction":
       return "the PR body references it with `Refs`/negated wording, but it is registered as a **closing** reference — prose does not override the registration";
+    case "prose-keyword":
+      return "it is registered as a **closing** reference only because a closing keyword sits right before its number **mid-sentence** — often in prose saying the issue was *not* addressed. If you mean to close it, put `Closes #N` on a line of its own; if not, break the keyword/number pair";
     case "type:project":
       return "it is an open `type:project` multi-wave tracker";
     case "no-autoclose":
