@@ -156,7 +156,7 @@ test("mixed PR: flags the Refs-but-registered issue, ignores the honest Closes",
 test("explainReason expands every reason the predicate can emit", () => {
   // Guards against a new reason being added to the predicate without matching
   // prose — which would leak a bare slug like "contradiction" into the comment.
-  for (const reason of ["contradiction", "type:project", "no-autoclose"]) {
+  for (const reason of ["contradiction", "prose-keyword", "type:project", "no-autoclose"]) {
     const prose = explainReason(reason);
     assert.notEqual(prose, reason, `${reason} has no prose expansion`);
     assert.ok(prose.length > 20, `${reason} expansion is too terse: ${prose}`);
@@ -241,4 +241,64 @@ test("both directions can fire on one PR and are reported separately", () => {
   });
   assert.deepEqual(flagged.map(f => f.number), [313]);
   assert.deepEqual(unregistered.map(u => u.number), [78, 426]);
+});
+
+// ── prose keywords: registered by a keyword mid-sentence ────────────────────
+//
+// An observed PR body explained that an issue had been filed rather than
+// addressed, with the past-tense closing verb and a colon right before the
+// number. GitHub registered it as a close and the guard reported OK: the walk
+// attributed the number to a closing keyword, so it counted as STATED intent,
+// and stated and registered agreed. Only a keyword that leads its line is
+// intentional now. The fixtures are synthetic; the sentence SHAPE is the
+// observed one.
+
+const open = (number, title = "t") => ({ number, title, state: "OPEN", labels: ["type:follow-up"] });
+
+test("a mid-sentence closing keyword that registered is flagged prose-keyword", () => {
+  const body =
+    "Closes #40\n\n" +
+    "Verification found two problems outside this diff, both filed rather than fixed: " +
+    "#41 (a local run can never pass one suite) and #42.";
+  const { flagged } = evaluate({ closingRefs: [open(40), open(41)], body, issueStates: {} });
+  assert.deepEqual(flagged.map(f => f.number), [41], "only the prose-closed issue is flagged");
+  assert.deepEqual(flagged[0].reasons, ["prose-keyword"]);
+});
+
+test("a line-leading Closes is intentional — bold, indented, or after CRLF", () => {
+  for (const body of ["Closes #5", "  **Closes** #5", "Summary\r\nCloses #5", "Refs #4\n\tFixes #5"]) {
+    assert.deepEqual(evaluate({ closingRefs: [open(5)], body }).flagged, [], JSON.stringify(body));
+  }
+});
+
+test("a number stated line-leading AND mid-sentence is intentional", () => {
+  const body = "Closes #5\n\nThe second commit also fixes #5 for the parity job.";
+  assert.deepEqual(evaluate({ closingRefs: [open(5)], body }).flagged, []);
+});
+
+test("policy, pinned: the second keyword of a one-line pair is flagged", () => {
+  // It still closes; the warning costs a glance. Pinned so relaxing it is a
+  // deliberate change rather than drift.
+  const { flagged } = evaluate({ closingRefs: [open(1), open(2)], body: "Closes #1, closes #2" });
+  assert.deepEqual(flagged.map(f => [f.number, f.reasons]), [[2, ["prose-keyword"]]]);
+});
+
+test("policy, pinned: a list-item keyword does not lead its line", () => {
+  const { flagged } = evaluate({ closingRefs: [open(7)], body: "Summary\n- Closes #7" });
+  assert.deepEqual(flagged.map(f => [f.number, f.reasons]), [[7, ["prose-keyword"]]]);
+});
+
+test("a sidebar-only link (no keyword at all) is NOT prose-keyword", () => {
+  // Governed by the label signals, exactly as before this signal existed.
+  assert.deepEqual(evaluate({ closingRefs: [open(8)], body: "Unrelated summary." }).flagged, []);
+});
+
+test("an already-CLOSED issue closed by prose is not flagged", () => {
+  const ref = { number: 9, title: "done", state: "CLOSED", labels: [] };
+  assert.deepEqual(evaluate({ closingRefs: [ref], body: "this also fixes #9 in passing" }).flagged, []);
+});
+
+test("stated closing intent is unchanged by position — only the flag is new", () => {
+  // The unregistered direction still sees a mid-sentence close as stated.
+  assert.deepEqual([...closingIntentNumbers("both filed rather than fixed: #41")], [41]);
 });

@@ -21,6 +21,14 @@
 # dropped number was never in it. An omission reads as an all-clear. So we compare
 # the author's stated closing set against GitHub's computed one, both directions.
 #
+# And a THIRD signal, `prose-keyword`: a registered close whose every stating
+# keyword sits MID-SENTENCE rather than leading its line. Honest prose about what
+# a PR did *not* do is the densest source of accidental closes — "filed rather
+# than", then the colon form of a closing verb, then a number — and the
+# stated-vs-registered comparison cannot see it, because the parser reads that
+# keyword as intent and both sets agree. Only the template form, `Closes #N` on a
+# line of its own, counts as intentional (#911).
+#
 # Deliberately NOT "warn on every closing reference": most PRs legitimately close
 # something, so that predicate fires nearly always and the warning becomes
 # ignorable — which is how the orphaning recurs.
