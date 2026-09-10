@@ -29,6 +29,14 @@
 # keyword as intent and both sets agree. Only the template form, `Closes #N` on a
 # line of its own, counts as intentional (#911).
 #
+# ⚠️ It SETTLES before judging (#916). `closingIssuesReferences` is eventually
+# consistent, and on `opened` it can still read EMPTY: the guard once reported OK
+# over a PR whose close registered moments later, and a PR opened in its final
+# form is only ever checked on `opened`. So while the body and the registered set
+# disagree in a lag-shaped way (`unsettled` in the predicate), it waits and
+# re-reads — up to 4 × 5s, inside the 1-minute billing floor — then evaluates the
+# latest read regardless.
+#
 # Deliberately NOT "warn on every closing reference": most PRs legitimately close
 # something, so that predicate fires nearly always and the warning becomes
 # ignorable — which is how the orphaning recurs.
@@ -103,7 +111,7 @@ jobs:
             const pr = context.payload.pull_request;
             if (!pr) return;
 
-            const { evaluate, closingIntentNumbers, explainReason } =
+            const { evaluate, closingIntentNumbers, explainReason, unsettled } =
               require(`${process.env.GITHUB_WORKSPACE}/.autoclose-guard/scripts/autoclose-guard/predicate.js`);
 
             const MARKER = "<!-- autoclose-guard -->";
@@ -139,31 +147,49 @@ jobs:
               // body keywords and sidebar links, so we read the source of truth
               // rather than re-parsing the body for closing intent (which would
               // miss sidebar-only links, exactly how #190 and #337 slipped).
-              const data = await github.graphql(`
-                query($owner:String!, $repo:String!, $pr:Int!) {
-                  repository(owner:$owner, name:$repo) {
-                    pullRequest(number:$pr) {
-                      closingIssuesReferences(first: 25) {
-                        nodes {
-                          number
-                          title
-                          state
-                          labels(first: 20) { nodes { name } }
+              const readClosingRefs = async () => {
+                const data = await github.graphql(`
+                  query($owner:String!, $repo:String!, $pr:Int!) {
+                    repository(owner:$owner, name:$repo) {
+                      pullRequest(number:$pr) {
+                        closingIssuesReferences(first: 25) {
+                          nodes {
+                            number
+                            title
+                            state
+                            labels(first: 20) { nodes { name } }
+                          }
                         }
                       }
                     }
-                  }
-                }`,
-                { owner, repo, pr: pr.number }
-              );
+                  }`,
+                  { owner, repo, pr: pr.number }
+                );
+                return (data.repository.pullRequest.closingIssuesReferences.nodes || [])
+                  .map(n => ({
+                    number: n.number,
+                    title: n.title,
+                    state: n.state,
+                    labels: (n.labels?.nodes || []).map(l => l.name),
+                  }));
+              };
 
-              const closingRefs = (data.repository.pullRequest.closingIssuesReferences.nodes || [])
-                .map(n => ({
-                  number: n.number,
-                  title: n.title,
-                  state: n.state,
-                  labels: (n.labels?.nodes || []).map(l => l.name),
-                }));
+              // ⚠️ SETTLE BEFORE JUDGING (#916). The registered set lags a body
+              // write, and on `opened` it read EMPTY for a PR whose close
+              // registered moments later — the guard said OK, and a PR opened in
+              // its final form gets no later run. So while body and registered
+              // set disagree in a lag-shaped way (see `unsettled`), wait and
+              // re-read; then evaluate the LATEST read regardless, so a genuine
+              // mismatch still reports — just seconds later.
+              const RETRIES = 4, WAIT_MS = 5000;
+              let closingRefs = await readClosingRefs();
+              for (let attempt = 1; attempt <= RETRIES; attempt++) {
+                const pending = unsettled(pr.body || "", closingRefs);
+                if (pending.length === 0) break;
+                core.info(`registered set not settled for #${pending.join(", #")}; re-reading in ${WAIT_MS / 1000}s (attempt ${attempt}/${RETRIES})`);
+                await new Promise(r => setTimeout(r, WAIT_MS));
+                closingRefs = await readClosingRefs();
+              }
 
               // Resolve the issues the BODY claims to close but GitHub did not
               // register, so the predicate can tell "still open, so orphaned"
