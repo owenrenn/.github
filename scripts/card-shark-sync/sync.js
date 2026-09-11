@@ -8,6 +8,8 @@
 // rule must be duplicated rather than derived, it is duplicated in the WIDER
 // direction and the divergence is named in a comment.
 
+const { PRIORITY_LABELS } = require("./fields.js");
+
 const PM_PREFIX = "pm:";
 const AUDIENCES = ["pm-surface", "agent-zone"];
 
@@ -298,6 +300,49 @@ function resolveRemoval({ boardNodes, received, declared, owner, repo, number })
 }
 
 /**
+ * Does this issues event need the sync job at all? The specification of the
+ * job-level `if:` in card-shark-sync.yml (#917).
+ *
+ * The job bills a minute per run and fires on every label operation across the
+ * fleet. Reading decideAction above and computeUpdates in fields.js, only these
+ * events can change anything:
+ *
+ *   - `opened` on pm-surface. On agent-zone it is always a noop (decideAction).
+ *   - a pm:* label added or removed -- board membership.
+ *   - a lane:* or P0-P3 label ADDED. On an issue carrying pm:* that routes
+ *     through the add path, which re-mirrors Engagement and Priority -- what
+ *     keeps the board's queues live between four-hourly sweeps. Removing one
+ *     never clears a field: computeUpdates writes only values that are present.
+ *
+ * Everything else -- `type:`, area and domain labels, `product:` (including
+ * this workflow's OWN product write, which is made with the PAT and so fires
+ * another run) -- re-adds an item idempotently and re-mirrors fields that did
+ * not move. What skipping them gives up is an incidental retry of an earlier
+ * run that failed; the daily reconcile (membership) and the autofill sweep
+ * (fields) are the reconcilers for that, as they already are for a cancelled
+ * intermediate run (#563).
+ *
+ * `eventLabel` is the label that WOKE the run. It decides whether to LOOK,
+ * never what to conclude: every run that starts still decides from a fresh
+ * label read, which is the property #563 restored.
+ *
+ * ⚠️ The workflow's `if:` is the enforcement and this is its specification.
+ * sync.test.js evaluates the shipped expression against this function over an
+ * event matrix, so changing one without the other fails the suite. GitHub
+ * compares strings case-insensitively and this does not, so the expression is
+ * the WIDER of the two -- the safe direction to diverge in.
+ */
+function shouldSync({ eventAction, audience, eventLabel }) {
+  if (eventAction === "opened") return audience === "pm-surface";
+  if (eventAction !== "labeled" && eventAction !== "unlabeled") return false;
+  if (isPmLabel(eventLabel)) return true;
+  if (eventAction !== "labeled" || typeof eventLabel !== "string") return false;
+  // lane: by PREFIX, the same rule engagementName uses -- an unknown lane is
+  // still honoured there, so it must still wake the run here.
+  return eventLabel.startsWith("lane:") || PRIORITY_LABELS.includes(eventLabel);
+}
+
+/**
  * The comment posted immediately BEFORE deleting an item that carries dates.
  *
  * Engagement, Track and Priority all derive from labels and the autofill sweep
@@ -323,4 +368,4 @@ function preservationComment({ dates, itemId }) {
   ].join("\n");
 }
 
-module.exports = { isPmLabel, decideAction, datesOf, readBoard, resolveRemoval, preservationComment };
+module.exports = { isPmLabel, decideAction, shouldSync, datesOf, readBoard, resolveRemoval, preservationComment };

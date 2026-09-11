@@ -710,3 +710,206 @@ test("the workflow proceeds ONLY on an explicit ok status", () => {
   assert.match(WORKFLOW_CODE, /board\.status\s*!==\s*"ok"/);
   assert.match(WORKFLOW_CODE, /unhandled status/);
 });
+
+// ---------------------------------------------------------------------------
+// shouldSync -- the job-level gate (#917)
+// ---------------------------------------------------------------------------
+
+const { shouldSync } = require("./sync.js");
+const { computeUpdates, priorityName, engagementName } = require("./fields.js");
+
+const gate = (eventAction, eventLabel, audience = "agent-zone") =>
+  shouldSync({ eventAction, audience, eventLabel });
+
+test("the gate runs every event that can change the board", () => {
+  assert.equal(gate("opened", undefined, "pm-surface"), true);
+  assert.equal(gate("labeled", "pm:awareness"), true);
+  assert.equal(gate("unlabeled", "pm:action"), true); // the exit valve
+  assert.equal(gate("labeled", "pm:future-tier"), true); // prefix, like isPmLabel
+  assert.equal(gate("labeled", "lane:decide"), true); // Engagement re-mirror
+  assert.equal(gate("labeled", "lane:some-new-lane"), true); // prefix, like engagementName
+  for (const p of ["P0", "P1", "P2", "P3"]) assert.equal(gate("labeled", p), true); // Priority re-mirror
+});
+
+test("the gate skips every event that provably changes nothing", () => {
+  // decideAction: an agent-zone issue reaches the board only by escalation, and
+  // a pm:* label applied at creation arrives as its own `labeled` event.
+  assert.equal(gate("opened", undefined, "agent-zone"), false);
+  for (const l of ["type:bug", "product:example-repo", "area:core", "devops:"]) {
+    assert.equal(gate("labeled", l), false, `labeled ${l}`);
+    assert.equal(gate("unlabeled", l), false, `unlabeled ${l}`);
+  }
+  // Removing a lane or priority never clears a field -- computeUpdates writes
+  // only values that are present -- and it cannot change pm:* membership.
+  assert.equal(gate("unlabeled", "lane:decide"), false);
+  assert.equal(gate("unlabeled", "P2"), false);
+  // An action no stub subscribes to.
+  assert.equal(gate("edited", "pm:awareness"), false);
+});
+
+test("a label the gate skips cannot change any field the sync writes", () => {
+  // The claim the whole gate rests on, asserted against fields.js itself rather
+  // than restated: starting from an item already in step with its labels, adding
+  // any skipped label yields NO field update.
+  const bases = [
+    ["pm:awareness"],
+    ["pm:action", "P2"],
+    ["pm:action", "lane:decide", "P1"],
+    ["pm:awareness", "lane:kick-off"],
+  ];
+  const skipped = ["type:bug", "product:example-repo", "area:core", "devops:"];
+  const inStep = (labels) => ({
+    track: "Personal",
+    priority: priorityName(labels),
+    engagement: engagementName(labels),
+  });
+  let checked = 0;
+  for (const base of bases) {
+    for (const l of skipped) {
+      const updates = computeUpdates({
+        track: "Personal", contentType: "Issue", labels: [...base, l], current: inStep(base),
+      });
+      assert.deepEqual(updates, [], `${l} added to [${base}]`);
+      checked++;
+    }
+  }
+  assert.equal(checked, bases.length * skipped.length);
+
+  // Non-vacuity: from the same starting point, a label the gate KEEPS does
+  // change a field. Without this, a computeUpdates that returned [] for
+  // everything would pass the loop above.
+  const base = ["pm:action", "P2"];
+  const kept = (l) => computeUpdates({
+    track: "Personal", contentType: "Issue", labels: [...base, l], current: inStep(base),
+  });
+  assert.notDeepEqual(kept("P1"), []);
+  assert.notDeepEqual(kept("lane:decide"), []);
+});
+
+/**
+ * A deliberately tiny evaluator for the ONE grammar the gate uses: `||`, `&&`,
+ * `==`, parentheses, single-quoted strings, startsWith(), contains(),
+ * fromJSON(), and the context paths handed in. Anything else throws, so an
+ * edit that reaches outside this grammar fails loudly instead of being
+ * evaluated wrongly. String comparison is case-insensitive and null reads as
+ * '', as GitHub's expression engine does.
+ *
+ * WHY evaluate rather than match text: a regex over the expression proves the
+ * clauses are PRESENT, not that they combine to the right answer -- swap one
+ * `||` for `&&` and every text assertion still passes.
+ */
+function evalGate(expr, ctx) {
+  const src = expr.trim();
+  const tokens = [];
+  const re = /\s*(\|\||&&|==|[(),]|'[^']*'|[A-Za-z_][\w.]*)/y;
+  while (re.lastIndex < src.length) {
+    const at = re.lastIndex;
+    const m = re.exec(src);
+    if (!m) throw new Error(`unexpected input at ${at}: ${src.slice(at, at + 20)}`);
+    tokens.push(m[1]);
+  }
+  let i = 0;
+  const peek = () => tokens[i];
+  const take = (want) => {
+    const t = tokens[i++];
+    if (t === undefined) throw new Error("unexpected end of expression");
+    if (want !== undefined && t !== want) throw new Error(`expected ${want}, got ${t}`);
+    return t;
+  };
+  const str = (v) => (v == null ? "" : String(v)).toLowerCase();
+  const FUNCS = {
+    startsWith: (a, b) => str(a).startsWith(str(b)),
+    contains: (a, b) => (Array.isArray(a) ? a.some((x) => str(x) === str(b)) : str(a).includes(str(b))),
+    fromJSON: (s) => JSON.parse(s),
+  };
+  function primary() {
+    const t = take();
+    if (t === "(") { const v = or(); take(")"); return v; }
+    if (t.startsWith("'")) return t.slice(1, -1);
+    if (peek() === "(") {
+      if (!Object.hasOwn(FUNCS, t)) throw new Error(`unknown function ${t}`);
+      take("(");
+      const args = [or()];
+      while (peek() === ",") { take(","); args.push(or()); }
+      take(")");
+      return FUNCS[t](...args);
+    }
+    if (!Object.hasOwn(ctx, t)) throw new Error(`unknown context path ${t}`);
+    return ctx[t];
+  }
+  function eq() {
+    const v = primary();
+    if (peek() !== "==") return v;
+    take("==");
+    return str(v) === str(primary());
+  }
+  function and() {
+    let v = eq();
+    while (peek() === "&&") { take("&&"); const r = eq(); v = Boolean(v) && Boolean(r); }
+    return v;
+  }
+  function or() {
+    let v = and();
+    while (peek() === "||") { take("||"); const r = and(); v = Boolean(v) || Boolean(r); }
+    return v;
+  }
+  const v = or();
+  if (i !== tokens.length) throw new Error(`trailing tokens: ${tokens.slice(i).join(" ")}`);
+  return Boolean(v);
+}
+
+// The shipped expression, folded exactly as YAML folds `>-`: same-indent lines
+// joined by single spaces. Read from RAW text (not WORKFLOW_CODE) because the
+// comment block above it is part of what locates it.
+const GATE = (() => {
+  const m = WORKFLOW.match(/^ {2}sync:\n(?: {4}#.*\n)* {4}if: >-\n((?: {6}\S.*\n)+)/m);
+  if (!m) return null;
+  return { lines: m[1].split("\n").filter(Boolean) };
+})();
+
+test("the sync job opens with its `if: >-` gate, folded onto one logical line", () => {
+  assert.ok(GATE, "the sync job must open with the `if: >-` gate");
+  // A MORE-indented line inside `>-` keeps its newline instead of folding --
+  // legal YAML, and a different expression than the one this suite evaluates.
+  assert.ok(GATE.lines.every((l) => /^ {6}\S/.test(l)), "every gate line at the same indent");
+});
+
+test("the workflow's if: expression agrees with shouldSync on every event", () => {
+  const expr = GATE.lines.map((l) => l.trim()).join(" ");
+  const actions = ["opened", "labeled", "unlabeled", "edited"];
+  const labels = [
+    undefined, "pm:awareness", "pm:action", "pm:future-tier",
+    "lane:decide", "lane:kick-off", "lane:some-new-lane",
+    "P0", "P1", "P2", "P3", "P4",
+    "type:bug", "product:example-repo", "area:core", "devops:",
+  ];
+  const audiences = ["pm-surface", "agent-zone"];
+  let n = 0;
+  let runs = 0;
+  for (const a of actions) {
+    for (const l of labels) {
+      for (const aud of audiences) {
+        const want = shouldSync({ eventAction: a, audience: aud, eventLabel: l });
+        const got = evalGate(expr, {
+          "github.event.action": a,
+          "github.event.label.name": l ?? null,
+          "inputs.audience": aud,
+        });
+        assert.equal(got, want, `${a} / ${l} / ${aud}`);
+        n++;
+        if (want) runs++;
+      }
+    }
+  }
+  assert.equal(n, actions.length * labels.length * audiences.length);
+  // Both outcomes exercised -- a gate that always ran (or never ran) would
+  // agree with a shouldSync that did the same.
+  assert.ok(runs > 0 && runs < n, `runs=${runs} of ${n}`);
+});
+
+test("the gate evaluator refuses anything outside its grammar", () => {
+  const ctx = { "github.event.action": "labeled" };
+  assert.throws(() => evalGate("github.event.sender.login == 'x'", ctx), /unknown context path/);
+  assert.throws(() => evalGate("endsWith(github.event.action, 'x')", ctx), /unknown function/);
+  assert.throws(() => evalGate("github.event.action != 'x'", ctx), /unexpected input|trailing/);
+});
