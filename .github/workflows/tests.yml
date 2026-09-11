@@ -16,8 +16,12 @@ on:
   # `actions/**` included for the same reason the workflow glob is a glob and not
   # a file list: a composite action edited without triggering the suite that checks
   # it is a detector that never runs over the thing it was added to cover.
-  push: { paths: &test_paths ["scripts/**", ".github/workflows/**", "actions/**"] }
-  pull_request: { paths: *test_paths }
+  #
+  # PR only, no push re-run: the PR is the gate (#918). A PR run already tests the
+  # change merged onto main, so re-running on push re-tested what had passed. The
+  # list lived on the `push:` line as a YAML anchor; with that line gone it sits
+  # here directly, as the one copy.
+  pull_request: { paths: ["scripts/**", ".github/workflows/**", "actions/**"] }
 
 jobs:
   test:
