@@ -50,6 +50,31 @@ on:
 
 jobs:
   sync:
+    # SKIP THE EVENTS THAT PROVABLY CHANGE NOTHING (#917). This job bills a
+    # minute per run and fires on every label operation across the fleet, and
+    # most of those operations cannot change the board: a `type:` or `product:`
+    # label re-adds an item idempotently and re-mirrors fields that did not
+    # move, and an agent-zone `opened` is always a noop. The rule, and the
+    # reasoning for each clause, live in `shouldSync()` in
+    # scripts/card-shark-sync/sync.js; sync.test.js EVALUATES this expression
+    # over an event matrix and fails if the two disagree.
+    #
+    # ⚠️ #563 IS WHY THIS PLACEMENT HAD TO BE VERIFIED, NOT ASSUMED. The
+    # concurrency group below keeps only the newest pending run per issue. If a
+    # job skipped here still took a place in that group, a skipped `type:` run
+    # could cancel a pending `pm:awareness` run and then do nothing -- the lost
+    # escalation #563 fixed, with no surviving run left to decide from state.
+    # The gate relies on a skipped job never entering the group; that was
+    # verified live on an agent-zone caller after merge (details on the PR that
+    # introduced this gate).
+    #
+    # One logical line via `>-` folding: every line sits at the same indent, so
+    # YAML joins them with spaces rather than preserving newlines inside the
+    # expression.
+    if: >-
+      (github.event.action == 'opened' && inputs.audience == 'pm-surface') ||
+      ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && startsWith(github.event.label.name, 'pm:')) ||
+      (github.event.action == 'labeled' && (startsWith(github.event.label.name, 'lane:') || contains(fromJSON('["P0","P1","P2","P3"]'), github.event.label.name)))
     runs-on: ubuntu-latest
     # Omitted, this job inherits GitHub's 360-minute default. It fires on every
     # issues event across the whole fleet, which makes it the highest-frequency
