@@ -25,7 +25,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Bounded for the same reason the reusable workflow next door is: omitted,
     # a job inherits GitHub's 360-minute default, and a stall bills for every
     # one of those minutes rather than stopping at a wall. This suite runs in
