@@ -32,8 +32,18 @@
 // Consumed by sync.js (membership time, all fleet repos) and by the operations
 // repo's four-hourly reconciler, which imports this file from its checkout.
 
+// The Plan vocabulary is VENDORED from owen-ops, not written here (owen-ops#1120). owen-ops
+// `.github/labels.json` owns the lane/priority names, meanings AND order. This repo commits the generated
+// copy at `.github/plan-vocabulary.json`, and owen-ops's Sunday conformance scan flags it the moment it
+// goes stale. To change a lane or priority, or their order, change labels.json and regenerate:
+//   node <owen-ops checkout>/scripts/plan-vocabulary/export.js > .github/plan-vocabulary.json
+// A missing or malformed copy fails the require at import, loudly: every caller checks this repo out WHOLE
+// (card-shark-sync.yml and owen-ops's reconciler both use `path: .card-shark-sync`, no sparse checkout),
+// so its absence is a broken contract, never a state to degrade through.
+const VOCAB = require("../../.github/plan-vocabulary.json");
+
 // P0-P3 in priority order, highest first. Option names map 1:1.
-const PRIORITY_LABELS = ["P0", "P1", "P2", "P3"];
+const PRIORITY_LABELS = VOCAB.priorities.map((p) => p.label);
 
 // Tiebreak order when an item carries two lane labels (a mislabel). Ordered
 // MOST-COSTLY-TO-THE-HUMAN FIRST: over-reporting what a person owes is the safe
@@ -43,7 +53,7 @@ const PRIORITY_LABELS = ["P0", "P1", "P2", "P3"];
 // lane absent from it still resolves; it simply loses a tie to a lane present
 // here. Deleting the list would change which of two labels wins, not whether a
 // single label works.
-const LANE_PRECEDENCE = ["do", "session", "decide", "kick-off"];
+const LANE_PRECEDENCE = VOCAB.lanes.map((l) => l.key);
 
 const TRACKS = ["Work", "Personal"];
 
