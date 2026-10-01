@@ -405,6 +405,23 @@ test("the workflow pages the board rather than reading one page", () => {
   assert.match(WORKFLOW_CODE, /endCursor/);
 });
 
+// The `runner` input: a caller with a self-hosted runner of its own may route this job to it. Every other
+// caller passes nothing and must keep landing on a hosted runner, so the default is the contract.
+for (const file of ["card-shark-sync.yml", "autoclose-guard.yml"]) {
+  test(`${file}: \`runner\` is optional, defaults to a hosted runner, and is the ONLY thing runs-on reads`, () => {
+    // Comment LINES are dropped whole (not blanked), so the input's own keys follow its name directly.
+    const code = fs.readFileSync(path.join(__dirname, "../../.github/workflows", file), "utf8")
+      .split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+    const input = /\n {6}runner:\n((?: {8}.*\n)+)/.exec(code);
+    assert.ok(input, "no `runner` input declared under workflow_call.inputs");
+    assert.match(input[1], /required:\s*false/, "a required input would break every existing caller at once");
+    assert.match(input[1], /default:\s*"ubuntu-latest"/, "a caller that passes nothing must stay on a hosted runner");
+    assert.match(input[1], /type:\s*string/);
+    const runsOn = [...code.matchAll(/^\s*runs-on:\s*(.+?)\s*$/gm)].map((m) => m[1]);
+    assert.deepEqual(runsOn, ["${{ inputs.runner }}"], "every job reads the input, and nothing hardcodes a runner");
+  });
+}
+
 test("the reusable workflow declares its contract: workflow_call + a required audience input", () => {
   // NOT a trigger assertion. `on: issues: types: [opened, labeled, unlabeled]`
   // lives in the per-repo STUB -- a reusable workflow declares only
