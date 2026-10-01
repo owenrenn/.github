@@ -1,15 +1,37 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
 const {
-  evaluate,
   referenceIntentNumbers,
   closingIntentNumbers,
   explainReason,
   unsettled,
+  verdict,
+  renderComment,
+  MARKER,
 } = require("./predicate.js");
+const { readFileSync } = require("node:fs");
+const { join } = require("node:path");
 
 // Bodies below are lifted from the real PRs that caused (or narrowly avoided)
 // an orphaning, so the suite pins actual history rather than invented shapes.
+
+const HERE = "example-org/example-repo";
+
+// The historical tests below were written against `evaluate`, the advisory-era
+// decision (#942 replaced it with `verdict`, which the workflow fails on). This
+// adapter keeps those real bodies running through the LIVE decision instead of
+// deleting the history with the function: `flagged` is everything `verdict`
+// says merging would wrongly close, `unregistered` everything declared that did
+// not register. Where the rule changed on purpose, the test says so.
+const evaluate = ({ closingRefs = [], body = "", issueStates = {} } = {}) => {
+  const v = verdict({ closingRefs, body, issueStates, repoSlug: HERE });
+  const number = (key) => Number(key.slice(key.lastIndexOf("#") + 1));
+  return {
+    flagged: [...v.accidental, ...v.protected].map(r => ({ number: number(r.key), title: r.title, reasons: r.reasons })),
+    unregistered: v.unregistered.map(u => ({ number: u.number, title: u.title })),
+    fail: v.fail,
+  };
+};
 
 const openFollowUp = (number, title = "watch ticket") => ({
   number, title, state: "OPEN", labels: ["type:follow-up", "P2"],
@@ -87,13 +109,16 @@ test("negation alone is enough — no explicit Refs needed", () => {
   assert.deepEqual(flagged.map(f => f.number), [310]);
 });
 
-test("type:project trackers stay covered (no regression from the old predicate)", () => {
-  const { flagged } = evaluate({
-    closingRefs: [{ number: 212, title: "PM operating model", state: "OPEN", labels: ["type:project"] }],
-    body: "Layer 2 of the umbrella.\n\nCloses #212",
-  });
-  assert.equal(flagged.length, 1);
-  assert.deepEqual(flagged[0].reasons, ["type:project"]);
+test("type:project trackers stay covered when the close is NOT declared; a declared close is the final PR", () => {
+  // CHANGED ON PURPOSE by #942. The label was a guess at intent while intent could not be read: this body
+  // used to be flagged for carrying a `Closes` line at all. Intent is declared now, and a tracker's final PR
+  // is exactly a declared close, so this passes. The tracker is still protected where it matters: registered
+  // WITHOUT a declaration (a wave PR with a sidebar link), it fails, and the label is named.
+  const tracker = { number: 212, title: "PM operating model", state: "OPEN", labels: ["type:project"] };
+  assert.deepEqual(evaluate({ closingRefs: [tracker], body: "Layer 2 of the umbrella.\n\nCloses #212" }).flagged, []);
+  const wave = evaluate({ closingRefs: [tracker], body: "Layer 2 of the umbrella.\n\nRefs #212" });
+  assert.deepEqual(wave.flagged[0].reasons, ["contradiction", "type:project"]);
+  assert.equal(wave.fail, true);
 });
 
 test("no-autoclose marks a watch ticket even when the PR says Closes honestly", () => {
@@ -157,7 +182,7 @@ test("mixed PR: flags the Refs-but-registered issue, ignores the honest Closes",
 test("explainReason expands every reason the predicate can emit", () => {
   // Guards against a new reason being added to the predicate without matching
   // prose — which would leak a bare slug like "contradiction" into the comment.
-  for (const reason of ["contradiction", "prose-keyword", "type:project", "no-autoclose"]) {
+  for (const reason of ["contradiction", "prose-keyword", "undeclared", "type:project", "no-autoclose"]) {
     const prose = explainReason(reason);
     assert.notEqual(prose, reason, `${reason} has no prose expansion`);
     assert.ok(prose.length > 20, `${reason} expansion is too terse: ${prose}`);
@@ -214,14 +239,15 @@ test("an unregistered number that is already CLOSED is not reported", () => {
   assert.deepEqual(unregistered, []);
 });
 
-test("an unregistered number with no resolvable state is not reported", () => {
-  // A typo'd or nonexistent number orphans nothing; we make no claim we
-  // cannot back with a state read. Absent `issueStates` is the same case.
-  assert.deepEqual(evaluate({ closingRefs: [], body: "Closes #99999" }).unregistered, []);
-  assert.deepEqual(
-    evaluate({ closingRefs: [], body: "Closes #99999", issueStates: {} }).unregistered,
-    [],
-  );
+test("an unregistered number with no resolvable state IS reported: a typo is a close that will not fire", () => {
+  // CHANGED ON PURPOSE by #942. This used to stay silent, on the reasoning that a nonexistent number orphans
+  // nothing. But the author wrote a `Closes` line and meant to close SOMETHING, and nothing will close. A
+  // failed state read lands here too, and an unreadable answer must not look like a clean one.
+  for (const input of [{ closingRefs: [], body: "Closes #99999" }, { closingRefs: [], body: "Closes #99999", issueStates: {} }]) {
+    const out = evaluate(input);
+    assert.deepEqual(out.unregistered.map(u => u.number), [99999]);
+    assert.equal(out.fail, true);
+  }
 });
 
 test("an honest single `Closes` that registered correctly reports nothing", () => {
@@ -289,9 +315,10 @@ test("policy, pinned: a list-item keyword does not lead its line", () => {
   assert.deepEqual(flagged.map(f => [f.number, f.reasons]), [[7, ["prose-keyword"]]]);
 });
 
-test("a sidebar-only link (no keyword at all) is NOT prose-keyword", () => {
-  // Governed by the label signals, exactly as before this signal existed.
-  assert.deepEqual(evaluate({ closingRefs: [open(8)], body: "Unrelated summary." }).flagged, []);
+test("a sidebar-only link (no keyword at all) is NOT prose-keyword, and is no longer silent", () => {
+  // CHANGED ON PURPOSE by #942. It used to pass unless a label caught it, which is how two of the four
+  // historical orphanings got through. Nothing in the body declares it, so it fails as `undeclared`.
+  assert.deepEqual(evaluate({ closingRefs: [open(8)], body: "Unrelated summary." }).flagged.map(f => f.reasons), [["undeclared"]]);
 });
 
 test("an already-CLOSED issue closed by prose is not flagged", () => {
@@ -339,4 +366,170 @@ test("unsettled, pinned cost: a GENUINE mismatch waits the full budget, then rep
   // the same. Pinned so the ~20s wait is a known cost, never a surprise.
   assert.deepEqual(unsettled("Closes #1, #2", [open(1)]), [2]);
   assert.deepEqual(unsettled("Refs #3", [open(3)]), [3]);
+});
+
+// ── the verdict: declared vs registered, and a RED check (#942) ───────────────
+//
+// The guard used to find the problem and exit `pass`, so the finding sat in a
+// comment while the check row read green. It happened ten times, four of them to
+// authors writing the rule down. The fix is surface placement: one exact
+// comparison, and a non-zero exit when it fails.
+//
+// DECLARED is the template form and nothing else: a closing keyword on a line of
+// its own. REGISTERED is GitHub's `closingIssuesReferences`. Write nothing and
+// the PR declares that it closes nothing.
+
+const reg = (number, extra = {}) => ({ repo: HERE, number, title: `issue ${number}`, state: "OPEN", labels: [], ...extra });
+const judge = (body, closingRefs = [], more = {}) => verdict({ body, closingRefs, repoSlug: HERE, issueStates: {}, ...more });
+const OPEN = (n) => ({ [n]: { state: "OPEN", title: `issue ${n}` } });
+
+test("verdict, the table: nothing declared and nothing registered passes with zero ceremony", () => {
+  const v = judge("Tidies the build.\n\nRefs #12");
+  assert.equal(v.fail, false);
+  assert.deepEqual([v.accidental, v.protected, v.unregistered, v.unverifiable], [[], [], [], []]);
+  assert.equal(renderComment(v), null, "nothing to say, so no comment");
+});
+
+test("verdict, the table: registered with NOTHING declared fails: the accidental close", () => {
+  // A Development-sidebar link carries no keyword at all, so no grep of the body can see it.
+  const v = judge("Tidies the build.", [reg(938)]);
+  assert.equal(v.fail, true);
+  assert.deepEqual(v.accidental.map(a => [a.key, a.reasons]), [[`${HERE}#938`, ["undeclared"]]]);
+});
+
+test("verdict, the table: declared and NOT registered fails: the close that will not fire", () => {
+  const v = judge("Closes #938", [], { issueStates: OPEN(938) });
+  assert.equal(v.fail, true);
+  assert.deepEqual(v.unregistered.map(u => u.key), [`${HERE}#938`]);
+});
+
+test("verdict, the table: declared and registered alike passes", () => {
+  assert.equal(judge("Closes #938", [reg(938)]).fail, false);
+});
+
+test("verdict, the table: registered MORE than declared fails, naming only the extra", () => {
+  const v = judge("Closes #938", [reg(938), reg(941)]);
+  assert.equal(v.fail, true);
+  assert.deepEqual(v.accidental.map(a => a.key), [`${HERE}#941`]);
+});
+
+test("verdict: every prose vector fails without modelling GitHub's parser", () => {
+  // Negated wording under a heading: the exact body that started #942.
+  const negated = judge("## This PR does not close #5\n\nMore work follows.", [reg(5)]);
+  assert.equal(negated.fail, true);
+  assert.deepEqual(negated.accidental[0].reasons, ["contradiction"]);
+  // A keyword mid-sentence, in prose about what was NOT done.
+  const prose = judge("Filed rather than fixed: #6 stays open.", [reg(6)]);
+  assert.equal(prose.fail, true);
+  assert.deepEqual(prose.accidental[0].reasons, ["prose-keyword"]);
+  // A comma list: the body means two, GitHub registers one.
+  const list = judge("Closes #11, #12", [reg(11)], { issueStates: OPEN(12) });
+  assert.equal(list.fail, true);
+  assert.deepEqual(list.unregistered.map(u => u.key), [`${HERE}#12`]);
+  assert.deepEqual(list.accidental, []);
+  // The second keyword of a one-line pair does not lead its line, so it is not a declaration.
+  const pair = judge("Closes #1 and closes #2", [reg(1), reg(2)]);
+  assert.deepEqual(pair.accidental.map(a => [a.key, a.reasons]), [[`${HERE}#2`, ["prose-keyword"]]]);
+});
+
+test("verdict: a FULLY QUALIFIED declaration is a declaration, in ref form and in URL form", () => {
+  // The guard used to drop `owner/repo#N` from its intent sets entirely. Under an exact comparison that
+  // would read as "declared nothing" and turn the form the fleet's own rule requires across repos red.
+  assert.equal(judge(`Closes ${HERE}#7`, [reg(7)]).fail, false);
+  assert.equal(judge(`Closes https://github.com/${HERE}/issues/7`, [reg(7)]).fail, false);
+  assert.equal(judge("Closes Example-Org/Example-Repo#7", [reg(7)]).fail, false, "repository names compare case-insensitively");
+  assert.equal(judge("Closes example-org/my_repo#7", [reg(7, { repo: "example-org/my_repo" })]).fail, false,
+    "an underscore inside a name is not emphasis and must survive the markdown strip");
+});
+
+test("verdict: the comparison is by REPOSITORY and number, so a shared number cannot hide a mismatch", () => {
+  const v = judge("Closes #7", [reg(7, { repo: "example-org/other-repo" })], { issueStates: OPEN(7) });
+  assert.equal(v.fail, true);
+  assert.deepEqual(v.accidental.map(a => a.key), ["example-org/other-repo#7"]);
+  assert.deepEqual(v.unregistered.map(u => u.key), [`${HERE}#7`]);
+});
+
+test("verdict: another repository's issue that is declared and NOT visible is unverifiable, and says so without failing", () => {
+  // The check runs with its caller's token, which cannot read another private repository. A declared
+  // cross-repo close that is absent from the registered set may be registered and invisible. Calling that
+  // red on every such PR would teach the eye to scroll past the row; calling it clean would be a lie.
+  const v = judge("Closes example-org/other-repo#40");
+  assert.equal(v.fail, false);
+  assert.deepEqual(v.unverifiable, ["example-org/other-repo#40"]);
+  const text = renderComment(v);
+  assert.match(text, /example-org\/other-repo#40/);
+  assert.match(text, /cannot (see|read)/);
+  // Visible and registered, it is simply a match.
+  const seen = judge("Closes example-org/other-repo#40", [reg(40, { repo: "example-org/other-repo" })]);
+  assert.deepEqual([seen.fail, seen.unverifiable], [false, []]);
+});
+
+test("verdict: registered references the token cannot see are covered only by declarations that could be them", () => {
+  const covered = judge("Closes example-org/other-repo#40", [], { invisibleRegistered: 1 });
+  assert.equal(covered.fail, false);
+  const extra = judge("Tidies the build.", [], { invisibleRegistered: 1 });
+  assert.equal(extra.fail, true, "something will close on merge that the body never declared and this check cannot name");
+  assert.equal(extra.unseen, 1);
+  assert.match(renderComment(extra), /cannot (see|read)/);
+});
+
+test("verdict: an issue that is already CLOSED is not a finding in either direction", () => {
+  assert.equal(judge("Tidies the build.", [reg(9, { state: "CLOSED" })]).fail, false);
+  assert.equal(judge("Closes #9", [], { issueStates: { 9: { state: "CLOSED", title: "done" } } }).fail, false);
+});
+
+test("verdict: a declared number that names NO readable issue fails: a typo is a close that will not fire", () => {
+  const v = judge("Closes #99999");
+  assert.equal(v.fail, true);
+  assert.deepEqual(v.unregistered.map(u => [u.key, u.known]), [[`${HERE}#99999`, false]]);
+  assert.match(renderComment(v), /could not (read|find)/);
+});
+
+test("verdict: `no-autoclose` fails even when declared; a declared close of a project tracker passes", () => {
+  // `no-autoclose` says "never by merge", so a declaration contradicts the issue's own marker. A project
+  // tracker's FINAL PR is the legitimate declared close, and the label was only ever a guess at intent.
+  const watch = judge("Closes #20", [reg(20, { labels: ["no-autoclose"] })]);
+  assert.equal(watch.fail, true);
+  assert.deepEqual(watch.protected.map(p => p.key), [`${HERE}#20`]);
+  assert.equal(judge("Closes #21", [reg(21, { labels: ["type:project"] })]).fail, false);
+  // Undeclared, the tracker is an accidental close like any other, and the label is named as a reason.
+  assert.deepEqual(judge("Wave 2 of 5.", [reg(21, { labels: ["type:project"] })]).accidental[0].reasons, ["undeclared", "type:project"]);
+});
+
+test("renderComment: an unregistered close reads as LAG first, and says what to do after merge", () => {
+  // GitHub's registration can run behind for hours. On a well-formed PR the row is red during that
+  // stretch, so the words must not say the body is wrong.
+  const text = renderComment(judge("Closes #938", [], { issueStates: OPEN(938) }));
+  assert.match(text, /unregistered so far/i);
+  assert.match(text, /re-check, then close by hand after merge/i);
+  assert.equal(/your PR body is wrong/i.test(text), false);
+  assert.ok(text.startsWith(MARKER));
+});
+
+test("renderComment: it says the check is RED and not required, and no longer calls itself advisory", () => {
+  const text = renderComment(judge("Tidies the build.", [reg(938)]));
+  assert.match(text, /never blocks the merge/);
+  assert.match(text, /not a required check/);
+  assert.equal(/Advisory only/i.test(text), false);
+  assert.match(text, /#938/);
+  assert.match(text, /on a line of its own/);
+});
+
+test("the workflow EXITS NON-ZERO on a failing verdict, after the comment is written", () => {
+  // The acceptance for #942: an undeclared registered close is a RED row in the checks list, asserted here
+  // and not by watching one PR. A workflow cannot be executed in a test, so this pins the wiring as text.
+  const yml = readFileSync(join(__dirname, "../../.github/workflows/autoclose-guard.yml"), "utf8");
+  const main = yml.slice(yml.indexOf("const main = async () => {"), yml.indexOf("// WHY surface a crash in the PR timeline"));
+  assert.match(main, /const judge = \(issueStates\) => verdict\(\{/);
+  assert.match(main, /const v = judge\(issueStates\);/);
+  assert.match(main, /invisibleRegistered: read\.invisible/, "unreadable registered refs are counted, never dropped");
+  assert.match(main, /const body = renderComment\(v\);/);
+  const failAt = main.indexOf("core.setFailed(");
+  assert.ok(failAt > 0, "the non-crash path fails the job");
+  assert.match(main.slice(failAt - 80, failAt), /if \(v\.fail\)/);
+  for (const write of ["updateComment(", "createComment("]) {
+    assert.ok(main.indexOf(write) > 0 && main.indexOf(write) < failAt, `${write} happens before the job is failed`);
+  }
+  assert.match(main, /repository \{ nameWithOwner \}/, "registered references carry their repository");
+  assert.equal(/Advisory only/.test(yml), false);
 });

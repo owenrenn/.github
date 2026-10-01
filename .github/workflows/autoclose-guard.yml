@@ -41,8 +41,16 @@
 # something, so that predicate fires nearly always and the warning becomes
 # ignorable — which is how the orphaning recurs.
 #
-# Advisory only — it surfaces, it never blocks. Self-heals: correct the reference
-# and the warning comment clears itself.
+# ⚠️ It FAILS when declared and registered disagree (#942). It used to be
+# advisory: it found the problem, wrote a comment, and exited `pass`, so the
+# check row read green beside a finding nobody opened. That happened ten times.
+# The finding now lives on the status surface. DECLARED is a closing keyword on a
+# line of its own and nothing else; write nothing and the PR declares it closes
+# nothing (`verdict` in the predicate has the full rule and what it cannot see).
+#
+# ⚠️ Red, and NOT a required check. Callers must keep it out of their required
+# set: a merge is never blocked by it. Self-heals: correct the reference and both
+# the comment and the red row clear themselves on the next `edited` event.
 #
 # ⚠️ CALLER CONTRACT: the stub MUST declare its own `permissions:` block. A called
 # workflow cannot exceed the CALLING workflow's token permissions, and the repos
@@ -91,7 +99,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     permissions:
-      pull-requests: write   # upsert/delete the advisory comment
+      pull-requests: write   # upsert/delete the guard's comment
       issues: read           # read tracker labels + stated-close issue states
       contents: read         # checkout, for the predicate module
     steps:
@@ -128,12 +136,11 @@ jobs:
             const pr = context.payload.pull_request;
             if (!pr) return;
 
-            const { evaluate, closingIntentNumbers, explainReason, unsettled } =
+            const { verdict, renderComment, unsettled, MARKER } =
               require(`${process.env.GITHUB_WORKSPACE}/.autoclose-guard/scripts/autoclose-guard/predicate.js`);
 
-            const MARKER = "<!-- autoclose-guard -->";
-            // Separate marker so the advisory self-heal can't delete a crash
-            // notice, and a crash can't masquerade as an advisory finding.
+            // Separate marker so the self-heal can't delete a crash notice, and
+            // a crash can't masquerade as a finding.
             const ERROR_MARKER = "<!-- autoclose-guard:error -->";
             const { owner, repo } = context.repo;
 
@@ -159,70 +166,101 @@ jobs:
             };
 
             const main = async () => {
+              const here = `${owner}/${repo}`;
+
               // WHY GraphQL: `closingIssuesReferences` is GitHub's computed set
               // of issues this PR will close on merge — it already folds in both
               // body keywords and sidebar links, so we read the source of truth
               // rather than re-parsing the body for closing intent (which would
               // miss sidebar-only links, exactly how #190 and #337 slipped).
-              const readClosingRefs = async () => {
-                const data = await github.graphql(`
-                  query($owner:String!, $repo:String!, $pr:Int!) {
-                    repository(owner:$owner, name:$repo) {
-                      pullRequest(number:$pr) {
-                        closingIssuesReferences(first: 25) {
-                          nodes {
-                            number
-                            title
-                            state
-                            labels(first: 20) { nodes { name } }
-                          }
+              //
+              // Each node carries its REPOSITORY (#942): the verdict compares by
+              // repository and number, so a cross-repository close is matched to
+              // its own declaration and never to a local issue that happens to
+              // share its number.
+              const QUERY = `
+                query($owner:String!, $repo:String!, $pr:Int!) {
+                  repository(owner:$owner, name:$repo) {
+                    pullRequest(number:$pr) {
+                      closingIssuesReferences(first: 25) {
+                        nodes {
+                          number
+                          title
+                          state
+                          repository { nameWithOwner }
+                          labels(first: 20) { nodes { name } }
                         }
                       }
                     }
-                  }`,
-                  { owner, repo, pr: pr.number }
-                );
-                return (data.repository.pullRequest.closingIssuesReferences.nodes || [])
-                  .map(n => ({
+                  }
+                }`;
+              const readClosingRefs = async () => {
+                let data;
+                try {
+                  data = await github.graphql(QUERY, { owner, repo, pr: pr.number });
+                } catch (e) {
+                  // ⚠️ An issue in a repository this token cannot read comes back as
+                  // a `null` node WITH an error, and the client throws on any error.
+                  // The partial data is still the answer for everything it CAN
+                  // read, so use it. No partial data at all is a real failure.
+                  if (!e?.data?.repository?.pullRequest) throw e;
+                  core.warning(`closingIssuesReferences returned partial data: ${e.message}`);
+                  data = e.data;
+                }
+                const nodes = data.repository.pullRequest.closingIssuesReferences.nodes || [];
+                return {
+                  refs: nodes.filter(Boolean).map(n => ({
+                    repo: n.repository?.nameWithOwner || here,
                     number: n.number,
                     title: n.title,
                     state: n.state,
                     labels: (n.labels?.nodes || []).map(l => l.name),
-                  }));
+                  })),
+                  // Registered, and unreadable with this token. Counted, never dropped:
+                  // the verdict decides whether the body's declarations account for them.
+                  invisible: nodes.filter(n => !n).length,
+                };
               };
+              const isHere = r => r.repo.toLowerCase() === here.toLowerCase();
 
               // ⚠️ SETTLE BEFORE JUDGING (#916). The registered set lags a body
               // write, and on `opened` it read EMPTY for a PR whose close
               // registered moments later — the guard said OK, and a PR opened in
               // its final form gets no later run. So while body and registered
               // set disagree in a lag-shaped way (see `unsettled`), wait and
-              // re-read; then evaluate the LATEST read regardless, so a genuine
+              // re-read; then judge the LATEST read regardless, so a genuine
               // mismatch still reports — just seconds later.
               const RETRIES = 4, WAIT_MS = 5000;
-              let closingRefs = await readClosingRefs();
+              let read = await readClosingRefs();
               for (let attempt = 1; attempt <= RETRIES; attempt++) {
-                const pending = unsettled(pr.body || "", closingRefs);
+                const pending = unsettled(pr.body || "", read.refs.filter(isHere));
                 if (pending.length === 0) break;
                 core.info(`registered set not settled for #${pending.join(", #")}; re-reading in ${WAIT_MS / 1000}s (attempt ${attempt}/${RETRIES})`);
                 await new Promise(r => setTimeout(r, WAIT_MS));
-                closingRefs = await readClosingRefs();
+                read = await readClosingRefs();
               }
 
-              // Resolve the issues the BODY claims to close but GitHub did not
-              // register, so the predicate can tell "still open, so orphaned"
-              // from "already closed, so harmless". Capped at 25 to match the
-              // bound above; a body naming more than 25 issues is pathological.
-              const registered = new Set(closingRefs.map(r => r.number));
-              const unresolved = [...closingIntentNumbers(pr.body || "")]
-                .filter(n => !registered.has(n))
-                .slice(0, 25);
+              const judge = (issueStates) => verdict({
+                closingRefs: read.refs, invisibleRegistered: read.invisible,
+                body: pr.body || "", repoSlug: here, issueStates,
+              });
 
-              let issueStates = {};
-              let statesUnreadable = false;
+              // Resolve the issues the body DECLARES it closes here that GitHub
+              // did not register, so the verdict can tell "still open" from
+              // "already closed, so harmless". Asked of a first pass with no
+              // states, so the list is the predicate's and not a second parse.
+              // Capped at 25 to match the bound above.
+              const unresolved = judge({}).unregistered.map(u => u.number).slice(0, 25);
+              const issueStates = {};
               if (unresolved.length > 0) {
                 const aliases = unresolved
                   .map((n, i) => `i${i}: issue(number: ${n}) { number title state }`)
                   .join("\n                      ");
+                const keep = (bag) => {
+                  for (const node of Object.values(bag || {})) {
+                    if (node) issueStates[node.number] = { state: node.state, title: node.title };
+                  }
+                };
                 try {
                   const res = await github.graphql(`
                     query($owner:String!, $repo:String!) {
@@ -232,30 +270,23 @@ jobs:
                     }`,
                     { owner, repo }
                   );
-                  // A number that names no issue comes back null (or errors
-                  // with partial data on a GraphqlResponseError) — either way
-                  // it simply never enters the map, and the predicate makes no
-                  // claim about it.
-                  for (const node of Object.values(res?.repository || {})) {
-                    if (node) issueStates[node.number] = { state: node.state, title: node.title };
-                  }
+                  keep(res?.repository);
                 } catch (e) {
-                  for (const node of Object.values(e?.data?.repository || {})) {
-                    if (node) issueStates[node.number] = { state: node.state, title: node.title };
-                  }
-                  // WHY this is tracked rather than swallowed: an empty
-                  // `issueStates` makes the inverse check report nothing, which
-                  // is indistinguishable from "nothing to report". That is the
-                  // omission-reads-as-all-clear failure this direction exists
-                  // to close, so an unreadable state goes INTO the comment.
-                  statesUnreadable = Object.keys(issueStates).length === 0;
-                  core.warning(`Could not resolve stated-close issue states: ${e.message}`);
+                  // A number that names no issue errors with partial data. What
+                  // was read is kept. What was NOT read stays out of the map,
+                  // and the verdict treats a declared close it could not read as
+                  // a failure: an omission must never read as an all-clear.
+                  keep(e?.data?.repository);
+                  core.warning(`Could not resolve every declared-close issue state: ${e.message}`);
                 }
               }
 
-              const { flagged, unregistered } = evaluate({
-                closingRefs, body: pr.body || "", issueStates,
-              });
+              const v = judge(issueStates);
+              // The two sets, in the run log on every run. When a verdict looks
+              // wrong, this is the first thing anyone needs and the one thing the
+              // comment does not carry in full.
+              core.info(`registered: ${read.refs.map(r => `${r.repo}#${r.number}(${r.state})`).join(", ") || "none"}${read.invisible ? ` + ${read.invisible} unreadable` : ""}`);
+              core.info(`verdict: ${JSON.stringify({ fail: v.fail, accidental: v.accidental.map(a => a.key), protected: v.protected.map(p => p.key), unregistered: v.unregistered.map(u => u.key), unverifiable: v.unverifiable, unseen: v.unseen })}`);
 
               // Gather existing marker comments (self-heal dupes, like the
               // label gate — keep the first as canonical, delete the rest).
@@ -269,76 +300,44 @@ jobs:
                 await dropComment(stale.id, "stale crash-notice");
               }
 
-              // WHY self-heal: when the reference is corrected, both sets go
-              // empty — remove the stale warning so the PR doesn't carry a
-              // false alarm. This is what makes the guard low-friction.
-              if (flagged.length === 0 && unregistered.length === 0 && !statesUnreadable) {
+              const body = renderComment(v);
+
+              // WHY self-heal: when declared and registered agree again, remove
+              // the stale comment so the PR doesn't carry a false alarm.
+              if (body === null) {
                 if (existing) await dropComment(existing.id, "resolved guard");
-                core.info("No at-risk issues, and every stated close is registered. OK.");
+                core.info("Declared and registered agree. OK.");
                 return;
               }
-
-              const sections = [
-                MARKER,
-                "⚠️ **This PR's closing references do not match what merging will actually do.**",
-              ];
-
-              if (flagged.length > 0) {
-                sections.push(
-                  "",
-                  "Merging will **close** the following open issue(s), which probably should survive it:",
-                  "",
-                  flagged
-                    .map(r => [
-                      `- **#${r.number}** — ${r.title}`,
-                      ...r.reasons.map(reason => `  - ${explainReason(reason)}`),
-                    ].join("\n"))
-                    .join("\n"),
-                  "",
-                  "If this is the **final** PR completing that work, ignore this. Otherwise:",
-                  "",
-                  "1. In the PR body, change `Closes` / `Fixes` / `Resolves #N` → `Refs #N`.",
-                  "2. **Unlink the issue from the PR's Development sidebar.** Step 1 alone is not enough — a sidebar link closes the issue with no keyword at all, which is how one of the four historical orphanings happened.",
-                );
-              }
-
-              if (unregistered.length > 0) {
-                sections.push(
-                  "",
-                  "Merging will **not** close the following open issue(s), even though the body says it does:",
-                  "",
-                  unregistered.map(r => `- **#${r.number}** — ${r.title}`).join("\n"),
-                  "",
-                  "GitHub needs a closing keyword before **each** number — `Closes #1, #2` registers `#1` only. Write `Closes #1, closes #2` (or one keyword per line), then re-check the Development sidebar.",
-                );
-              }
-
-              if (statesUnreadable) {
-                sections.push(
-                  "",
-                  "⚠️ The guard could **not read** the state of the issue(s) this body names but GitHub did not register, so it cannot say whether any are orphaned. Check by hand — this is not an all-clear.",
-                );
-              }
-
-              sections.push(
-                "",
-                "_Why:_ a registered closing reference auto-closes the issue even when the body says it doesn't, and an unregistered one silently leaves work open — `Closes #11, #12` registers **#11 alone**.",
-                "",
-                "_(Advisory only — this check never blocks the merge.)_",
-              );
-
-              const body = sections.join("\n");
 
               if (existing) {
                 await github.rest.issues.updateComment({
                   owner, repo, comment_id: existing.id, body,
                 });
-                core.info(`Updated guard warning on PR #${pr.number}.`);
+                core.info(`Updated guard comment on PR #${pr.number}.`);
               } else {
                 await github.rest.issues.createComment({
                   owner, repo, issue_number: pr.number, body,
                 });
-                core.info(`Posted guard warning on PR #${pr.number}.`);
+                core.info(`Posted guard comment on PR #${pr.number}.`);
+              }
+
+              // ⚠️ THE POINT OF #942. The comment above was always written, and
+              // always correct, and the check row stayed green beside it. The row
+              // is the surface people act on, so the finding goes there: a
+              // failing verdict fails the job. AFTER the comment, so the red row
+              // always has its explanation. Not a required check, so it never
+              // blocks a merge.
+              if (v.fail) {
+                core.setFailed(`declared closes do not match what merging will do: ${[
+                  v.accidental.length && `${v.accidental.length} will close undeclared`,
+                  v.protected.length && `${v.protected.length} carry no-autoclose`,
+                  v.unregistered.length && `${v.unregistered.length} unregistered so far`,
+                  v.unseen && `${v.unseen} unreadable and undeclared`,
+                ].filter(Boolean).join(", ")}. See the comment on this PR.`);
+              } else {
+                // Only an unverifiable cross-repository close: said, not failed.
+                core.warning(`declared cross-repository close(s) this token cannot verify: ${v.unverifiable.join(", ")}`);
               }
             };
 
