@@ -533,3 +533,14 @@ test("the workflow EXITS NON-ZERO on a failing verdict, after the comment is wri
   assert.match(main, /repository \{ nameWithOwner \}/, "registered references carry their repository");
   assert.equal(/Advisory only/.test(yml), false);
 });
+
+test("this repo's own PRs run the BRANCH's decision logic, and every other caller gets main's", () => {
+  // The workflow file and the predicate are fetched two ways. `uses: ./…` gave this repo's PRs the branch's
+  // workflow, while the checkout fetched the predicate from `main`: the PR that added `verdict` crashed on
+  // itself, and a PR changing both files could not be checked before merge.
+  const guard = readFileSync(join(__dirname, "../../.github/workflows/autoclose-guard.yml"), "utf8");
+  assert.match(guard, /logic_ref:[\s\S]*?default: "main"/, "callers that pass nothing read main");
+  assert.match(guard, /repository: owenrenn\/\.github\n\s+ref: \$\{\{ inputs\.logic_ref \}\}/);
+  const own = readFileSync(join(__dirname, "../../.github/workflows/guard-own-prs.yml"), "utf8");
+  assert.match(own, /uses: \.\/\.github\/workflows\/autoclose-guard\.yml\n\s+with:\n(?:\s+#.*\n)*\s+logic_ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/);
+});

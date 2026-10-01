@@ -27,3 +27,7 @@ permissions:
 jobs:
   guard:
     uses: ./.github/workflows/autoclose-guard.yml
+    with:
+      # The decision logic from THIS PR's head, to match the workflow file `uses: ./…` already takes from
+      # it. Without this the branch's workflow ran main's predicate (why: `logic_ref` in the guard).
+      logic_ref: ${{ github.event.pull_request.head.sha }}

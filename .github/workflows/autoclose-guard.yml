@@ -85,6 +85,25 @@ on:
         required: false
         default: "ubuntu-latest"
         type: string
+      logic_ref:
+        # WHICH COMMIT the decision logic is read from. Every caller but one omits
+        # it and gets `main`, the same ref their stub resolves this file at.
+        #
+        # WHY it exists: this workflow file and the predicate it loads are two
+        # files fetched two ways. A caller's `uses:` pins the FILE; the checkout
+        # below fetched the predicate from `main` regardless. So this repo's own
+        # PRs ran the branch's workflow against main's predicate: a PR that
+        # changed both could not be checked before merge, and the one that added
+        # `verdict` crashed on itself with "verdict is not a function". This
+        # repo's own caller passes the PR's head commit, so both halves come
+        # from the branch.
+        #
+        # ⚠️ Not for other callers. Pinning the logic to anything but `main` while
+        # the stub resolves this file at `@main` recreates the same skew.
+        description: "Commit of this repo to read the decision logic from. Only this repo's own caller sets it."
+        required: false
+        default: "main"
+        type: string
 
 # WHY: serialize per-PR so a burst of events (open + edit) can't race past
 # the marker check and post duplicate warnings — same failure the
@@ -116,7 +135,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: owenrenn/.github
-          ref: main
+          ref: ${{ inputs.logic_ref }}
           path: .autoclose-guard
 
       # WHY a SHA and not `@v9`: on 2026-08-17 this step failed once with
