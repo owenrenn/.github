@@ -41,6 +41,22 @@ on:
         required: false
         default: "Personal"
         type: string
+      runner:
+        # WHY A CALLER INPUT: the runner a job lands on is the CALLER's to choose,
+        # because a self-hosted runner belongs to one repository (or one org) and
+        # this body cannot know whether its caller has one. A caller that does
+        # passes its own runner label, normally through its own fallback
+        # expression so one variable returns it to hosted runners. Everyone else
+        # passes nothing and runs hosted, exactly as before this input existed.
+        #
+        # WHY NOT a `vars` read in here: the routing has to be visible in the
+        # CALLER's workflow file. That is where a caller's own tests can see which
+        # of its workflows may reach a runner in its house, and a choice made in
+        # this file would be one they cannot read.
+        description: "Runner label for this job. Omit for a GitHub-hosted runner."
+        required: false
+        default: "ubuntu-latest"
+        type: string
     secrets:
       # Declared so a caller that passes secrets explicitly (rather than
       # `secrets: inherit`) fails at the CALL boundary if it forgets this one,
@@ -75,7 +91,7 @@ jobs:
       (github.event.action == 'opened' && inputs.audience == 'pm-surface') ||
       ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && startsWith(github.event.label.name, 'pm:')) ||
       (github.event.action == 'labeled' && (startsWith(github.event.label.name, 'lane:') || contains(fromJSON('["P0","P1","P2","P3"]'), github.event.label.name)))
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     # Omitted, this job inherits GitHub's 360-minute default. It fires on every
     # issues event across the whole fleet, which makes it the highest-frequency
     # job there is -- and overage BILLS rather than stopping at a wall, so an

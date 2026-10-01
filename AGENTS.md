@@ -24,6 +24,14 @@ The stub lives in the operations repo's template; only its **interface** is docu
 |---|---|---|---|
 | `audience` | yes | — | `pm-surface` (every issue auto-flows) or `agent-zone` (escalation only) |
 | `track` | no | `Personal` | The board Track for items from this repo — `Work` or `Personal` |
+| `runner` | no | `ubuntu-latest` | The runner label the job lands on. Omit it for a GitHub-hosted runner |
+
+⚠️ **`runner` is for a caller with a self-hosted runner of its own, and it is an input so
+the choice is visible in the caller's file.** A self-hosted runner belongs to one repository
+or one organization, so this body cannot know whether a caller has one. Such a caller passes
+its own label, normally through its own fallback expression so that one variable sends it
+back to hosted runners. A caller that passes nothing is unaffected. The auto-close guard
+takes the same input, with the same default.
 
 ⚠️ **`track` is an input rather than a lookup, and that is a content-policy
 consequence, not a preference.** Track follows from which repo an item came from, and
@@ -70,7 +78,9 @@ jobs:
 ```
 
 Nothing else is needed — no vendored script, no secret. The guard uses the
-caller's own `GITHUB_TOKEN`.
+caller's own `GITHUB_TOKEN`. One optional input, `runner` (default `ubuntu-latest`), is
+described under the Card Shark sync above; pass it under `with:` only if the caller has a
+self-hosted runner of its own.
 
 ⚠️ **Verify it live rather than trusting the merge.** A workflow can parse, pass
 every structural check, merge green and never run correctly. The PR that adds the

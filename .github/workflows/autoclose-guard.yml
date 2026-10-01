@@ -60,6 +60,23 @@ on:
   # `edited` for body changes plus `opened`/`reopened`/`ready_for_review` for the
   # lifecycle entry points. AGENTS.md carries the canonical stub.
   workflow_call:
+    inputs:
+      runner:
+        # WHY A CALLER INPUT: the runner a job lands on is the CALLER's to choose,
+        # because a self-hosted runner belongs to one repository (or one org) and
+        # this body cannot know whether its caller has one. A caller that does
+        # passes its own runner label, normally through its own fallback
+        # expression so one variable returns it to hosted runners. Everyone else
+        # passes nothing and runs hosted, exactly as before this input existed.
+        #
+        # WHY NOT a `vars` read in here: the routing has to be visible in the
+        # CALLER's workflow file. That is where a caller's own tests can see which
+        # of its workflows may reach a runner in its house, and a choice made in
+        # this file would be one they cannot read.
+        description: "Runner label for this job. Omit for a GitHub-hosted runner."
+        required: false
+        default: "ubuntu-latest"
+        type: string
 
 # WHY: serialize per-PR so a burst of events (open + edit) can't race past
 # the marker check and post duplicate warnings — same failure the
@@ -71,7 +88,7 @@ concurrency:
 
 jobs:
   guard:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     permissions:
       pull-requests: write   # upsert/delete the advisory comment
