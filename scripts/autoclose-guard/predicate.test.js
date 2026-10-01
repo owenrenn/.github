@@ -214,8 +214,8 @@ test("closingIntentNumbers: negated and bare mentions are not closing intent", (
 });
 
 test("closingIntentNumbers: a cross-repo ref is not claimed as this repo's number", () => {
-  // `owner/repo` between the keyword and the `#N` breaks attribution, so the
-  // number is never mistaken for a local issue we could look up by number.
+  // A qualified ref is its own token and goes to the KEYED sets, never the number
+  // sets, so another repository's number is never looked up as a local issue.
   assert.deepEqual([...closingIntentNumbers("Closes example-org/example-repo#12")], []);
 });
 
@@ -337,26 +337,38 @@ test("stated closing intent is unchanged by position — only the flag is new", 
 // registered moments later, and the guard reported OK. `unsettled` names the
 // lag-shaped disagreements the workflow waits out before evaluating.
 
+// `unsettled` names what may be LAG, as `owner/repo#N` keys. It is key-aware since
+// #942: declarations can be qualified now, and a number-only version never saw
+// them, so `Closes owner/repo#7` went red on ordinary lag with no wait at all.
+const K = (n) => `${HERE}#${n}`;
+
 test("unsettled: a stated close not yet registered is lag-shaped", () => {
-  assert.deepEqual(unsettled("Closes #5", []), [5]);
+  assert.deepEqual(unsettled("Closes #5", [], HERE), [K(5)]);
+});
+
+test("unsettled: a QUALIFIED or URL declaration waits for registration like a bare one", () => {
+  assert.deepEqual(unsettled(`Closes ${HERE}#7`, [], HERE), [K(7)]);
+  assert.deepEqual(unsettled(`Closes https://github.com/${HERE}/issues/7`, [], HERE), [K(7)]);
+  assert.deepEqual(unsettled(`Closes ${HERE}#7`, [{ repo: HERE, ...open(7) }], HERE), []);
+  assert.deepEqual(unsettled("Closes example-org/other-repo#9", [], HERE), ["example-org/other-repo#9"]);
 });
 
 test("unsettled: a settled honest close is not", () => {
-  assert.deepEqual(unsettled("Closes #5", [open(5)]), []);
+  assert.deepEqual(unsettled("Closes #5", [open(5)], HERE), []);
 });
 
 test("unsettled: a registered number the body now only references is lag-shaped", () => {
   // An edit swapped a closing keyword for `Refs`; GitHub hasn't dropped it yet.
-  assert.deepEqual(unsettled("Refs #5", [open(5)]), [5]);
+  assert.deepEqual(unsettled("Refs #5", [open(5)], HERE), [K(5)]);
 });
 
 test("unsettled: a sidebar-only link the body never mentions never triggers a retry", () => {
-  assert.deepEqual(unsettled("Unrelated summary.", [open(8)]), []);
+  assert.deepEqual(unsettled("Unrelated summary.", [open(8)], HERE), []);
 });
 
 test("unsettled: the observed opened-race shape — a prose close, empty registered set", () => {
   const body = "Refs #40\n\nThe last PR of that step closes #40.";
-  assert.deepEqual(unsettled(body, []), [40]);
+  assert.deepEqual(unsettled(body, [], HERE), [K(40)]);
 });
 
 test("unsettled, pinned cost: a GENUINE mismatch waits the full budget, then reports", () => {
@@ -364,8 +376,8 @@ test("unsettled, pinned cost: a GENUINE mismatch waits the full budget, then rep
   // unsettled on every read. The guard waits out its retries and THEN reports
   // #2 as unregistered. A real contradiction (Refs + a registered close) behaves
   // the same. Pinned so the ~20s wait is a known cost, never a surprise.
-  assert.deepEqual(unsettled("Closes #1, #2", [open(1)]), [2]);
-  assert.deepEqual(unsettled("Refs #3", [open(3)]), [3]);
+  assert.deepEqual(unsettled("Closes #1, #2", [open(1)], HERE), [K(2)]);
+  assert.deepEqual(unsettled("Refs #3", [open(3)], HERE), [K(3)]);
 });
 
 // ── the verdict: declared vs registered, and a RED check (#942) ───────────────
@@ -515,23 +527,186 @@ test("renderComment: it says the check is RED and not required, and no longer ca
   assert.match(text, /on a line of its own/);
 });
 
-test("the workflow EXITS NON-ZERO on a failing verdict, after the comment is written", () => {
-  // The acceptance for #942: an undeclared registered close is a RED row in the checks list, asserted here
-  // and not by watching one PR. A workflow cannot be executed in a test, so this pins the wiring as text.
-  const yml = readFileSync(join(__dirname, "../../.github/workflows/autoclose-guard.yml"), "utf8");
-  const main = yml.slice(yml.indexOf("const main = async () => {"), yml.indexOf("// WHY surface a crash in the PR timeline"));
-  assert.match(main, /const judge = \(issueStates\) => verdict\(\{/);
-  assert.match(main, /const v = judge\(issueStates\);/);
-  assert.match(main, /invisibleRegistered: read\.invisible/, "unreadable registered refs are counted, never dropped");
-  assert.match(main, /const body = renderComment\(v\);/);
-  const failAt = main.indexOf("core.setFailed(");
-  assert.ok(failAt > 0, "the non-crash path fails the job");
-  assert.match(main.slice(failAt - 80, failAt), /if \(v\.fail\)/);
-  for (const write of ["updateComment(", "createComment("]) {
-    assert.ok(main.indexOf(write) > 0 && main.indexOf(write) < failAt, `${write} happens before the job is failed`);
+// ── the workflow itself, EXECUTED ────────────────────────────────────────────
+//
+// A workflow cannot be run in a test, but its inline script can: it is sliced out
+// of the YAML and run against mock `github` / `core` / `context`. This replaced a
+// set of pattern matches over the YAML text, which review showed stayed green
+// with the non-zero exit deleted, with the repository dropped from every
+// registered ref, and with `repoSlug` never passed (which would have turned every
+// bare `Closes #N` red fleet-wide). Text can describe wiring; only running it
+// shows the wiring works.
+
+const GUARD_YML = readFileSync(join(__dirname, "../../.github/workflows/autoclose-guard.yml"), "utf8");
+const guardScript = (() => {
+  const opener = "          script: |\n";
+  const at = GUARD_YML.indexOf(opener);
+  assert.ok(at > 0, "the guard's inline script was not found — the harness is looking at nothing");
+  const lines = [];
+  for (const line of GUARD_YML.slice(at + opener.length).split("\n")) {
+    if (line.trim() !== "" && !line.startsWith("            ")) break;
+    lines.push(line.slice(12));
   }
-  assert.match(main, /repository \{ nameWithOwner \}/, "registered references carry their repository");
-  assert.equal(/Advisory only/.test(yml), false);
+  const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+  return new AsyncFunction("github", "context", "core", "require", "process", "setTimeout", lines.join("\n"));
+})();
+
+const node = (number, extra = {}) => ({
+  number, title: `issue ${number}`, state: "OPEN",
+  repository: { nameWithOwner: "Example-Org/Example-Repo" },   // canonical case, as GitHub returns it
+  labels: { nodes: [] }, ...extra,
+});
+const registeredRead = (nodes, totalCount = nodes.length) =>
+  ({ repository: { pullRequest: { closingIssuesReferences: { totalCount, nodes } } } });
+
+/**
+ * Run the guard once. `reads` are the successive answers to the registered-set query (the last repeats);
+ * an Error in the list is thrown. `states` answers the local state query by number, `cross` the
+ * cross-repository one by `owner/repo#N`. Returns everything the script did, in order.
+ */
+async function runGuard({ body, reads = [registeredRead([])], states = {}, cross = {}, comments = [], writeFails = false }) {
+  const log = [];
+  const queue = [...reads];
+  const queries = [];
+  const core = {
+    info: () => {}, warning: (m) => log.push(["warning", String(m)]), setFailed: (m) => log.push(["setFailed", String(m)]),
+  };
+  const github = {
+    graphql: async (query, vars) => {
+      queries.push(query);
+      if (query.includes("closingIssuesReferences")) {
+        const next = queue.length > 1 ? queue.shift() : queue[0];
+        if (next instanceof Error) throw next;
+        return next;
+      }
+      if (query.includes("$number")) {
+        const hit = cross[`${vars.owner}/${vars.repo}#${vars.number}`];
+        if (!hit) throw Object.assign(new Error("Could not resolve to a Repository"), { data: { repository: null } });
+        return { repository: { issue: { number: vars.number, ...hit } } };
+      }
+      const out = {};
+      let missing = false;
+      for (const [, alias, n] of query.matchAll(/(i\d+): issue\(number: (\d+)\)/g)) {
+        out[alias] = states[n] ? { number: Number(n), ...states[n] } : null;
+        if (!states[n]) missing = true;
+      }
+      if (missing) throw Object.assign(new Error("Could not resolve to an Issue"), { data: { repository: out } });
+      return { repository: out };
+    },
+    paginate: async () => comments,
+    rest: { issues: {
+      listComments: () => {},
+      createComment: async ({ body: text }) => { if (writeFails) throw new Error("Resource not accessible by integration"); log.push(["createComment", text]); },
+      updateComment: async ({ body: text }) => { if (writeFails) throw new Error("Resource not accessible by integration"); log.push(["updateComment", text]); },
+      deleteComment: async ({ comment_id }) => { log.push(["deleteComment", comment_id]); },
+    } },
+  };
+  const context = { payload: { pull_request: { number: 26, body } }, repo: { owner: "example-org", repo: "example-repo" } };
+  const waits = [];
+  await guardScript(
+    github, context, core,
+    () => require("./predicate.js"),
+    { env: { GITHUB_WORKSPACE: "/nowhere" } },
+    (fn, ms) => { waits.push(ms); fn(); },
+  );
+  return {
+    log, waits, queries,
+    failed: log.filter(([k]) => k === "setFailed").map(([, m]) => m),
+    warnings: log.filter(([k]) => k === "warning").map(([, m]) => m),
+    did: log.map(([k]) => k),
+  };
+}
+
+test("ACCEPTANCE (#942): an undeclared registered close FAILS the job, and the comment is written first", async () => {
+  const r = await runGuard({ body: "Tidies the build.", reads: [registeredRead([node(938)])] });
+  assert.equal(r.failed.length, 1, "the row is red");
+  assert.match(r.failed[0], /1 will close undeclared/);
+  assert.deepEqual(r.did.filter(k => k !== "warning"), ["createComment", "setFailed"], "the red row always has its explanation");
+  assert.match(r.log[0][1], /example-org\/example-repo#938/);
+});
+
+test("workflow: a clean PR is green, and a stale guard comment from an earlier run is removed", async () => {
+  const stale = { id: 77, user: { type: "Bot" }, body: `${MARKER}\nold finding` };
+  const r = await runGuard({ body: "Tidies the build.\n\nRefs #12", comments: [stale] });
+  assert.deepEqual(r.failed, []);
+  assert.deepEqual(r.log.filter(([k]) => k === "deleteComment").map(([, id]) => id), [77]);
+});
+
+test("workflow: a bare `Closes #N` that registered HERE is green: the repository reaches the verdict", async () => {
+  // Kills three mutants at once: `repoSlug` not passed, every node attributed to a fixed repo, and the
+  // registered side compared case-sensitively (the node carries GitHub's canonical case).
+  const r = await runGuard({ body: "Closes #7", reads: [registeredRead([node(7)])] });
+  assert.deepEqual([r.failed, r.did], [[], []]);
+});
+
+test("workflow: a cross-repository close that registered is matched to its own declaration", async () => {
+  const other = { repository: { nameWithOwner: "example-org/other-repo" } };
+  const ok = await runGuard({ body: "Closes example-org/other-repo#7", reads: [registeredRead([node(7, other)])] });
+  assert.deepEqual(ok.failed, []);
+  // The same registration with only a LOCAL declaration of that number is a mismatch both ways.
+  const clash = await runGuard({ body: "Closes #7", reads: [registeredRead([node(7, other)])], states: { 7: { state: "OPEN", title: "local seven" } } });
+  assert.match(clash.failed[0], /1 will close undeclared, 1 unregistered so far/);
+});
+
+test("workflow: a registered ref it cannot read is COUNTED, whether the node is null or has no repository", async () => {
+  const hidden = await runGuard({ body: "Tidies the build.", reads: [registeredRead([null])] });
+  assert.match(hidden.failed[0], /1 unreadable and undeclared/);
+  // A node with no repository cannot be attributed. Calling it local would let it match a local `Closes #7`.
+  const orphan = await runGuard({ body: "Closes #7", reads: [registeredRead([node(7, { repository: null })])], states: { 7: { state: "OPEN", title: "local seven" } } });
+  assert.match(orphan.failed[0], /1 unregistered so far, 1 unreadable and undeclared/);
+});
+
+test("workflow: PARTIAL data is the answer for what it could read; no data at all is a crash, and says so", async () => {
+  const partial = Object.assign(new Error("Resource not accessible"), { data: registeredRead([node(5), null]) });
+  const r = await runGuard({ body: "Closes #5\nCloses example-org/private#9", reads: [partial] });
+  assert.deepEqual(r.failed, [], "#5 matched, and the unreadable one is accounted for by the cross-repository declaration");
+  const dead = await runGuard({ body: "Closes #5", reads: [new Error("upstream connect error")] });
+  assert.match(dead.failed[0], /crashed/);
+  assert.match(dead.log.find(([k]) => k === "createComment")[1], /was NOT checked/);
+});
+
+test("workflow: a QUALIFIED declaration waits out registration lag like a bare one", async () => {
+  const body = "Closes example-org/example-repo#7";
+  const r = await runGuard({ body, reads: [registeredRead([]), registeredRead([node(7)])] });
+  assert.deepEqual(r.failed, [], "the second read registered it");
+  assert.deepEqual(r.waits, [5000], "one wait, then settled");
+});
+
+test("workflow: when the comment cannot be written, the verdict still fails the job, and is not reported as a crash", async () => {
+  // A fork PR's token is read-only. The finding was computed; a 403 on the comment must not turn it into
+  // "the guard crashed, this PR was NOT checked", which is false, and the row is now the only signal.
+  const r = await runGuard({ body: "Tidies the build.", reads: [registeredRead([node(938)])], writeFails: true });
+  assert.equal(r.failed.length, 1);
+  assert.match(r.failed[0], /1 will close undeclared/);
+  assert.equal(/crashed/.test(r.failed[0]), false);
+  assert.ok(r.warnings.some(w => /could not write the comment/i.test(w)));
+});
+
+test("workflow: more registered refs than one page holds is refused, never judged on the first 25", async () => {
+  const many = Array.from({ length: 25 }, (_, i) => node(100 + i));
+  const r = await runGuard({ body: "Tidies the build.", reads: [registeredRead(many, 26)] });
+  assert.match(r.failed[0], /crashed.*26 registered/);
+});
+
+test("workflow: a declared close of an issue that is already CLOSED is quiet: the states reach the final verdict", async () => {
+  const r = await runGuard({ body: "Closes #8", states: { 8: { state: "CLOSED", title: "done" } } });
+  assert.deepEqual(r.failed, []);
+});
+
+test("workflow: a number too large to be an issue is never sent to the API, and does not cost its neighbour its state", async () => {
+  const r = await runGuard({ body: "Closes #8\nCloses #99999999999", states: { 8: { state: "CLOSED", title: "done" } } });
+  assert.match(r.failed[0], /1 unregistered so far/, "#8 is closed and quiet; only the impossible number is reported");
+  assert.equal(r.queries.some(q => /99999999999|e\+/.test(q)), false);
+});
+
+test("workflow: another repository's declared close is judged if the token can read it, and only said if it cannot", async () => {
+  const body = "Closes example-org/other-repo#40";
+  const readable = await runGuard({ body, cross: { "example-org/other-repo#40": { state: "OPEN", title: "forty" } } });
+  assert.match(readable.failed[0], /1 unregistered so far/);
+  const blind = await runGuard({ body });
+  assert.deepEqual(blind.failed, []);
+  assert.ok(blind.warnings.some(w => /cannot verify.*example-org\/other-repo#40/.test(w)));
+  assert.deepEqual(blind.did.filter(k => k !== "warning"), ["createComment"], "said in a comment, on a green row");
 });
 
 test("this repo's own PRs run the BRANCH's decision logic, and every other caller gets main's", () => {
@@ -542,5 +717,128 @@ test("this repo's own PRs run the BRANCH's decision logic, and every other calle
   assert.match(guard, /logic_ref:[\s\S]*?default: "main"/, "callers that pass nothing read main");
   assert.match(guard, /repository: owenrenn\/\.github\n\s+ref: \$\{\{ inputs\.logic_ref \}\}/);
   const own = readFileSync(join(__dirname, "../../.github/workflows/guard-own-prs.yml"), "utf8");
-  assert.match(own, /uses: \.\/\.github\/workflows\/autoclose-guard\.yml\n\s+with:\n(?:\s+#.*\n)*\s+logic_ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/);
+  // `github.sha`, NOT the PR's head: on `pull_request` the workflow file comes from the test-merge commit
+  // (main merged with the branch), so the logic has to come from that same commit. The head alone skews the
+  // other way the moment main moves under an open PR.
+  assert.match(own, /uses: \.\/\.github\/workflows\/autoclose-guard\.yml\n\s+with:\n(?:\s+#.*\n)*\s+logic_ref: \$\{\{ github\.sha \}\}/);
+  assert.equal(/still read from `main`/.test(own), false, "the stale claim that contradicted the line above is gone");
+});
+
+// ── review of the #942 branch: the parse ─────────────────────────────────────
+
+test("a declaration does NOT chain across a line break: the next paragraph's `#N` is a mention", () => {
+  // The gap rule allowed any whitespace, newlines included. Harmless while the guard only advised; under a
+  // failing verdict, a body whose next paragraph opens with an issue number declared that issue too.
+  assert.deepEqual([...closingIntentNumbers("Closes #5\n\n#6 tracks the follow-up.")], [5]);
+  assert.deepEqual([...closingIntentNumbers("Fixes #5\n\n\n#6, #7 and #8 are related but stay open.")], [5]);
+  assert.equal(judge("Closes #5\n\n#6 tracks the follow-up.", [reg(5)], { issueStates: OPEN(6) }).fail, false);
+  // On ONE line a list still chains, so the comma list keeps failing as it must.
+  assert.deepEqual([...closingIntentNumbers("Closes #1, #2")], [1, 2]);
+});
+
+test("an owner or repository that starts with a KEYWORD is still one ref", () => {
+  // The keyword alternative was tried first, so `close-io/x#7` was read as the keyword `close`.
+  for (const repo of ["close-io/repo", "fix-org/repo", "see-saw/x", "ref-lab/x", "example-org/closes"]) {
+    assert.equal(judge(`Closes ${repo}#7`, [reg(7, { repo })]).fail, false, repo);
+  }
+});
+
+test("repository names keep their dots and underscores, wherever they sit", () => {
+  for (const repo of ["example-org/.github", "example-org/my.repo-x", "example-org/my__repo", "example-org/_repo", "example-org/repo_"]) {
+    assert.equal(judge(`Closes ${repo}#7`, [reg(7, { repo })]).fail, false, repo);
+  }
+  // Emphasis underscores are still stripped, so `_Closes #5_` and `Does _not_ close #5` read as before.
+  assert.deepEqual([...closingIntentNumbers("_Closes #5_")], [5]);
+  assert.deepEqual([...referenceIntentNumbers("Does _not_ close #5")], [5]);
+  // An owner cannot start with `-`, so stray punctuation is not swallowed into the name: the ref is read as
+  // `example-org/x#5`. (It is then a bare mention, because `-` is not list punctuation after a keyword.)
+  assert.deepEqual(judge("Closes -example-org/x#5", [reg(5, { repo: "example-org/x" })]).accidental.map(a => a.key), ["example-org/x#5"]);
+});
+
+test("the registered side is compared case-insensitively too: GitHub returns the canonical case", () => {
+  assert.equal(judge("Closes example-org/example-repo#7", [reg(7, { repo: "Example-Org/Example-Repo" })]).fail, false);
+  assert.equal(verdict({ body: "Closes #7", closingRefs: [reg(7, { repo: "Example-Org/Example-Repo" })], repoSlug: "EXAMPLE-ORG/example-repo" }).fail, false);
+});
+
+test("a QUALIFIED close is a declaration only when it leads its line, and it carries its reason when it does not", () => {
+  const other = "example-org/other-repo";
+  const prose = judge(`This also fixes ${other}#4 in passing.`, [reg(4, { repo: other })]);
+  assert.deepEqual(prose.accidental.map(a => [a.key, a.reasons]), [[`${other}#4`, ["prose-keyword"]]]);
+  const negated = judge(`Does not close ${other}#4.`, [reg(4, { repo: other })]);
+  assert.deepEqual(negated.accidental[0].reasons, ["contradiction"]);
+});
+
+test("`GH-5` is the same ref as `#5`", () => {
+  assert.equal(judge("Closes GH-5", [reg(5)]).fail, false);
+});
+
+test("a line inside a FENCED code block is an example, not a declaration", () => {
+  // A body that quotes the rule ("write it like this") would otherwise declare the example and go red.
+  const body = "How to close:\n\n```\nCloses #12\n```\n\nRefs #3";
+  assert.deepEqual([...closingIntentNumbers(body)], []);
+  assert.equal(judge(body).fail, false);
+  // If GitHub did register it, the PR is still caught, as undeclared.
+  assert.equal(judge(body, [reg(12)]).fail, true);
+});
+
+// ── review of the #942 branch: the verdict ───────────────────────────────────
+
+test("verdict REFUSES to run without a repository: every bare `#N` would be compared against nothing", () => {
+  assert.throws(() => verdict({ body: "Closes #5", closingRefs: [] }), /repoSlug/);
+  assert.throws(() => verdict({ body: "Closes #5", closingRefs: [], repoSlug: "" }), /repoSlug/);
+});
+
+test("verdict: a registered ref whose state is MISSING is treated as open, never skipped", () => {
+  const v = judge("Tidies the build.", [reg(9, { state: undefined })]);
+  assert.equal(v.fail, true);
+});
+
+test("verdict: a ref registered twice is reported once", () => {
+  assert.equal(judge("Tidies the build.", [reg(9), reg(9)]).accidental.length, 1);
+});
+
+test("verdict: a cross-repository close the token CAN read is judged, not waved through as unverifiable", () => {
+  // `Closes other#1, other#2` registers `other#1` alone: the comma-list bug, in a repository this check
+  // can see. "Unverifiable" is for a repository it cannot read, and whether it can is measured: the
+  // workflow tries to read each such issue and passes what it got as `crossStates`.
+  const other = "example-org/other-repo";
+  const body = `Closes ${other}#1, ${other}#2`;
+  const readable = judge(body, [reg(1, { repo: other })], { crossStates: { [`${other}#2`]: { state: "OPEN", title: "two" } } });
+  assert.equal(readable.fail, true);
+  assert.deepEqual(readable.unregistered.map(u => u.key), [`${other}#2`]);
+  assert.deepEqual(readable.unverifiable, []);
+  // Readable and already closed: nothing to orphan.
+  assert.equal(judge(body, [reg(1, { repo: other })], { crossStates: { [`${other}#2`]: { state: "CLOSED", title: "two" } } }).fail, false);
+  // Not readable: still said, still not failed.
+  const blind = judge(body, [reg(1, { repo: other })]);
+  assert.deepEqual([blind.fail, blind.unverifiable], [false, [`${other}#2`]]);
+});
+
+// ── review of the #942 branch: the comment ───────────────────────────────────
+
+test("renderComment: it says how the red row CLEARS, because a registration arriving later fires no event", () => {
+  // The guard runs on opened / edited / reopened / ready_for_review. When GitHub registers late, or the
+  // sidebar link is removed, none of those fire, so the row stays red until someone re-runs the check.
+  const lag = renderComment(judge("Closes #938", [], { issueStates: OPEN(938) }));
+  assert.match(lag, /re-run this check/i);
+  const sidebar = renderComment(judge("Tidies the build.", [reg(938)]));
+  assert.match(sidebar, /re-run this check/i);
+  assert.equal(/clears itself when declared and registered agree/.test(lag + sidebar), false, "it does not clear by itself");
+});
+
+test("renderComment: advice for another repository's issue names it in the qualified form", () => {
+  const other = "example-org/other-repo";
+  const text = renderComment(judge("Tidies the build.", [reg(4, { repo: other })]));
+  assert.match(text, new RegExp(`Closes ${other}#4`));
+  assert.match(text, new RegExp(`Refs ${other}#4`));
+  // A local issue keeps the short form.
+  assert.match(renderComment(judge("Tidies the build.", [reg(938)])), /`Closes #938`/);
+});
+
+test("renderComment: every section a verdict can carry is rendered, and an unseen-only verdict reads on its own", () => {
+  const watch = renderComment(judge("Closes #20", [reg(20, { labels: ["no-autoclose"] })]));
+  assert.match(watch, /no-autoclose/);
+  assert.match(watch, /#20/);
+  const unseen = renderComment(judge("Tidies the build.", [], { invisibleRegistered: 2 }));
+  assert.match(unseen, /Merging will close \*\*2\*\* issue\(s\) this check cannot read/);
 });

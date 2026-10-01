@@ -43,14 +43,17 @@
 #
 # ⚠️ It FAILS when declared and registered disagree (#942). It used to be
 # advisory: it found the problem, wrote a comment, and exited `pass`, so the
-# check row read green beside a finding nobody opened. That happened ten times.
+# check row read green beside a finding nobody opened. That kept happening.
 # The finding now lives on the status surface. DECLARED is a closing keyword on a
 # line of its own and nothing else; write nothing and the PR declares it closes
 # nothing (`verdict` in the predicate has the full rule and what it cannot see).
 #
 # ⚠️ Red, and NOT a required check. Callers must keep it out of their required
-# set: a merge is never blocked by it. Self-heals: correct the reference and both
-# the comment and the red row clear themselves on the next `edited` event.
+# set: a merge is never blocked by it. It clears on the next run once declared
+# and registered agree. ⚠️ That needs a RUN: editing the body fires one, but a
+# registration that arrives late, or a Development-sidebar link being removed,
+# fires no event this workflow is called on. The comment tells the reader to
+# re-run the check.
 #
 # ⚠️ CALLER CONTRACT: the stub MUST declare its own `permissions:` block. A called
 # workflow cannot exceed the CALLING workflow's token permissions, and the repos
@@ -92,11 +95,14 @@ on:
         # WHY it exists: this workflow file and the predicate it loads are two
         # files fetched two ways. A caller's `uses:` pins the FILE; the checkout
         # below fetched the predicate from `main` regardless. So this repo's own
-        # PRs ran the branch's workflow against main's predicate: a PR that
-        # changed both could not be checked before merge, and the one that added
-        # `verdict` crashed on itself with "verdict is not a function". This
-        # repo's own caller passes the PR's head commit, so both halves come
-        # from the branch.
+        # PRs ran the PR's workflow against main's predicate: a PR that changed
+        # both could not be checked before merge, and the one that added
+        # `verdict` crashed on itself with "verdict is not a function".
+        #
+        # This repo's own caller passes `github.sha`, the SAME commit its
+        # `uses: ./…` resolves the workflow file at. On `pull_request` that is
+        # the test-merge commit, not the PR's head: the head alone would skew
+        # the other way as soon as main moved under an open PR.
         #
         # ⚠️ Not for other callers. Pinning the logic to anything but `main` while
         # the stub resolves this file at `@main` recreates the same skew.
@@ -202,6 +208,7 @@ jobs:
                   repository(owner:$owner, name:$repo) {
                     pullRequest(number:$pr) {
                       closingIssuesReferences(first: 25) {
+                        totalCount
                         nodes {
                           number
                           title
@@ -226,10 +233,21 @@ jobs:
                   core.warning(`closingIssuesReferences returned partial data: ${e.message}`);
                   data = e.data;
                 }
-                const nodes = data.repository.pullRequest.closingIssuesReferences.nodes || [];
+                const conn = data.repository.pullRequest.closingIssuesReferences;
+                const nodes = conn.nodes || [];
+                // One page is all this reads. A PR registering more than that is
+                // refused, not judged on the first 25: a declared close on the
+                // second page would read as "unregistered".
+                if (typeof conn.totalCount === "number" && conn.totalCount > nodes.length) {
+                  throw new Error(`${conn.totalCount} registered closing references, and this check reads ${nodes.length}: it cannot judge a set it has not seen`);
+                }
+                // A node is READABLE only if it says which repository it is in.
+                // One that does not cannot be attributed, and calling it local
+                // would let it match a local `Closes #N` by number alone.
+                const readable = nodes.filter(n => n && n.repository?.nameWithOwner);
                 return {
-                  refs: nodes.filter(Boolean).map(n => ({
-                    repo: n.repository?.nameWithOwner || here,
+                  refs: readable.map(n => ({
+                    repo: n.repository.nameWithOwner,
                     number: n.number,
                     title: n.title,
                     state: n.state,
@@ -237,10 +255,9 @@ jobs:
                   })),
                   // Registered, and unreadable with this token. Counted, never dropped:
                   // the verdict decides whether the body's declarations account for them.
-                  invisible: nodes.filter(n => !n).length,
+                  invisible: nodes.length - readable.length,
                 };
               };
-              const isHere = r => r.repo.toLowerCase() === here.toLowerCase();
 
               // ⚠️ SETTLE BEFORE JUDGING (#916). The registered set lags a body
               // write, and on `opened` it read EMPTY for a PR whose close
@@ -252,24 +269,30 @@ jobs:
               const RETRIES = 4, WAIT_MS = 5000;
               let read = await readClosingRefs();
               for (let attempt = 1; attempt <= RETRIES; attempt++) {
-                const pending = unsettled(pr.body || "", read.refs.filter(isHere));
+                const pending = unsettled(pr.body || "", read.refs, here);
                 if (pending.length === 0) break;
-                core.info(`registered set not settled for #${pending.join(", #")}; re-reading in ${WAIT_MS / 1000}s (attempt ${attempt}/${RETRIES})`);
+                core.info(`registered set not settled for ${pending.join(", ")}; re-reading in ${WAIT_MS / 1000}s (attempt ${attempt}/${RETRIES})`);
                 await new Promise(r => setTimeout(r, WAIT_MS));
                 read = await readClosingRefs();
               }
 
-              const judge = (issueStates) => verdict({
+              const judge = (issueStates, crossStates = {}) => verdict({
                 closingRefs: read.refs, invisibleRegistered: read.invisible,
-                body: pr.body || "", repoSlug: here, issueStates,
+                body: pr.body || "", repoSlug: here, issueStates, crossStates,
               });
 
-              // Resolve the issues the body DECLARES it closes here that GitHub
-              // did not register, so the verdict can tell "still open" from
-              // "already closed, so harmless". Asked of a first pass with no
-              // states, so the list is the predicate's and not a second parse.
-              // Capped at 25 to match the bound above.
-              const unresolved = judge({}).unregistered.map(u => u.number).slice(0, 25);
+              // Resolve the issues the body DECLARES it closes that GitHub did
+              // not register, so the verdict can tell "still open" from "already
+              // closed, so harmless". Asked of a first pass with no states, so
+              // the lists are the predicate's and not a second parse. Capped at
+              // 25 to match the bound above.
+              const first = judge({});
+              // ⚠️ Only numbers GraphQL can carry. One over-range number in the
+              // aliased query below gets the WHOLE query rejected, and every
+              // neighbour then loses its state and reads "could not read".
+              const unresolved = first.unregistered.map(u => u.number)
+                .filter(n => Number.isSafeInteger(n) && n > 0 && n <= 2147483647)
+                .slice(0, 25);
               const issueStates = {};
               if (unresolved.length > 0) {
                 const aliases = unresolved
@@ -300,7 +323,33 @@ jobs:
                 }
               }
 
-              const v = judge(issueStates);
+              // The same question for a declared close in ANOTHER repository,
+              // and it doubles as the measurement of whether this token can see
+              // that repository at all. Readable: the verdict judges it like a
+              // local one. Unreadable: it stays "unverifiable", said and not
+              // failed. One small query each, so one private repository cannot
+              // cost the others their answer.
+              const crossStates = {};
+              for (const key of first.unverifiable.slice(0, 10)) {
+                const cut = key.lastIndexOf("#");
+                const [crossOwner, crossRepo] = key.slice(0, cut).split("/");
+                const number = Number(key.slice(cut + 1));
+                if (!(Number.isSafeInteger(number) && number > 0 && number <= 2147483647)) continue;
+                try {
+                  const res = await github.graphql(`
+                    query($owner:String!, $repo:String!, $number:Int!) {
+                      repository(owner:$owner, name:$repo) { issue(number:$number) { number title state } }
+                    }`,
+                    { owner: crossOwner, repo: crossRepo, number }
+                  );
+                  const issue = res?.repository?.issue;
+                  if (issue) crossStates[key] = { state: issue.state, title: issue.title };
+                } catch (e) {
+                  core.info(`${key} is not readable with this token: ${e.message}`);
+                }
+              }
+
+              const v = judge(issueStates, crossStates);
               // The two sets, in the run log on every run. When a verdict looks
               // wrong, this is the first thing anyone needs and the one thing the
               // comment does not carry in full.
@@ -329,16 +378,25 @@ jobs:
                 return;
               }
 
-              if (existing) {
-                await github.rest.issues.updateComment({
-                  owner, repo, comment_id: existing.id, body,
-                });
-                core.info(`Updated guard comment on PR #${pr.number}.`);
-              } else {
-                await github.rest.issues.createComment({
-                  owner, repo, issue_number: pr.number, body,
-                });
-                core.info(`Posted guard comment on PR #${pr.number}.`);
+              // ⚠️ A comment that cannot be WRITTEN is not a crash. On a fork PR
+              // the token is read-only and this write 403s. The verdict was
+              // still reached, so the job still fails on it below. Letting the
+              // 403 reach the crash handler reported "this PR was NOT checked",
+              // which is false, on the one signal left.
+              try {
+                if (existing) {
+                  await github.rest.issues.updateComment({
+                    owner, repo, comment_id: existing.id, body,
+                  });
+                  core.info(`Updated guard comment on PR #${pr.number}.`);
+                } else {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: pr.number, body,
+                  });
+                  core.info(`Posted guard comment on PR #${pr.number}.`);
+                }
+              } catch (e) {
+                core.warning(`The verdict stands, but this run could not write the comment that explains it: ${e.message}. The verdict is in this run's log.`);
               }
 
               // ⚠️ THE POINT OF #942. The comment above was always written, and
@@ -356,7 +414,7 @@ jobs:
                 ].filter(Boolean).join(", ")}. See the comment on this PR.`);
               } else {
                 // Only an unverifiable cross-repository close: said, not failed.
-                core.warning(`declared cross-repository close(s) this token cannot verify: ${v.unverifiable.join(", ")}`);
+                core.warning(`this token cannot verify the declared close(s) in another repository: ${v.unverifiable.join(", ")}`);
               }
             };
 

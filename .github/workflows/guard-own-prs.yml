@@ -4,10 +4,11 @@ name: auto-close guard (this repo's own PRs)
 # `workflow_call` body — but until #911 nothing ran it on this repo's own PRs.
 # The one repo where guard changes land was the one repo the guard never saw.
 #
-# `uses: ./.github/...` resolves the called workflow AS OF THE PR'S COMMIT, so a
-# PR that changes the guard's workflow runs its own version on itself. (The
-# predicate module is still read from `main` — see the body's checkout step,
-# `repository:` + `ref: main`.)
+# `uses: ./.github/...` resolves the called workflow at this run's commit, so a
+# PR that changes the guard's workflow runs its own version on itself. The
+# predicate module it loads comes from that SAME commit, through `logic_ref`
+# below. Until #942 it was read from `main` whatever the PR changed, so a PR
+# that changed both halves ran new YAML against old logic and crashed.
 #
 # ⚠️ The `permissions:` block is required for the same reason as every fleet
 # stub: a called workflow cannot exceed the calling workflow's token. This job
@@ -28,6 +29,7 @@ jobs:
   guard:
     uses: ./.github/workflows/autoclose-guard.yml
     with:
-      # The decision logic from THIS PR's head, to match the workflow file `uses: ./…` already takes from
-      # it. Without this the branch's workflow ran main's predicate (why: `logic_ref` in the guard).
-      logic_ref: ${{ github.event.pull_request.head.sha }}
+      # The decision logic from the SAME commit `uses: ./…` takes the workflow file from. On
+      # `pull_request` that is `github.sha`, the test-merge commit (main merged with the branch),
+      # NOT the PR's head: the head alone skews the other way as soon as main moves under an open PR.
+      logic_ref: ${{ github.sha }}

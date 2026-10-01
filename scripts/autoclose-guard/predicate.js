@@ -68,21 +68,32 @@ const REFERENCE_WORDS = new Set([
 const ALL_WORDS = [...CLOSING_WORDS, ...REFERENCE_WORDS];
 
 // One pass yields keywords and issue refs in document order, so each ref can be
-// attributed to the keyword that governs it. Alternation order matters: the
-// longer forms must precede their prefixes or `close` would shadow `closes`.
+// attributed to the keyword that governs it.
 //
-// A ref is one of three shapes, and all three are ONE token:
-//   `#12`                                        this repository's issue
+// A ref is one of four shapes, and each is ONE token:
+//   `#12`, `GH-12`                               this repository's issue
 //   `owner/repo#12`                              a named repository's issue
 //   `https://github.com/owner/repo/issues/12`    the same, as a URL
 // The qualified shapes matter since #942: an exact comparison of declared and
 // registered has to see the form a cross-repository close is REQUIRED to take,
 // or it reads that PR as declaring nothing.
-const NAME = "[A-Za-z0-9_.-]+";
+//
+// ⚠️ ORDER MATTERS, twice. The ref alternatives come BEFORE the keyword one, or
+// an owner that begins with a keyword (`close-io/x#7`, `see-saw/x#5`) is read as
+// that keyword and the ref is lost. Within the keywords, longer forms precede
+// their prefixes or `close` would shadow `closes`.
+//
+// An owner is alphanumerics and hyphens and cannot start with a hyphen (GitHub's
+// own rule), so stray punctuation before a ref is not swallowed into the name. A
+// repository name may carry dots and underscores anywhere (`.github`, `my_repo`).
+const OWNER = "[A-Za-z0-9][A-Za-z0-9-]*";
+const REPO = "[A-Za-z0-9_.-]+";
 const TOKEN_RE = new RegExp(
-  `\\b(${ALL_WORDS.sort((a, b) => b.length - a.length).join("|")})\\b` +
-  `|https?://github\\.com/(${NAME}/${NAME})/issues/(\\d+)` +
-  `|(?:(${NAME}/${NAME}))?#(\\d+)`,
+  `https?://github\\.com/(${OWNER}/${REPO})/issues/(\\d+)` +
+  `|(?<![A-Za-z0-9])(${OWNER}/${REPO})#(\\d+)` +
+  `|#(\\d+)` +
+  `|\\bGH-(\\d+)\\b` +
+  `|\\b(${ALL_WORDS.sort((a, b) => b.length - a.length).join("|")})\\b`,
   "gi",
 );
 
@@ -90,7 +101,12 @@ const TOKEN_RE = new RegExp(
 // sits between them. This is what makes `Refs #11, #12` attribute BOTH numbers
 // to `Refs`, while `Closes #11. This also touches #12.` leaves #12 ungoverned
 // rather than wrongly inheriting `Closes`.
-const LIST_GAP_RE = /^(?:[\s,;:.]|and|also|&)*$/i;
+//
+// ⚠️ The gap never crosses a LINE BREAK. It used to allow any whitespace, so
+// `Closes #5` followed by a paragraph opening with `#6` attributed #6 to
+// `Closes` as well. GitHub does not register that, and under a failing verdict
+// it turned a correct body red.
+const LIST_GAP_RE = /^(?:[ \t,;:.]|and|also|&)*$/i;
 
 // A closing keyword directly negated states reference intent, not closing
 // intent — "Does not close #N" is the exact prose that lulled a real PR into
@@ -105,12 +121,18 @@ const NEGATION_RE = /(?:\bnot\b|\bnever\b|n't)\s*$/i;
  * a single observed PR. Stripping it first lets the matchers stay simple.
  */
 function normalize(body) {
-  // An underscore is emphasis only at the EDGE of a word. Inside one it is part
-  // of a name, and stripping it turned `owner/my_repo#7` into a different
-  // repository, which an exact comparison then reported as a mismatch.
   return String(body || "")
+    // A fenced code block is an EXAMPLE. A body that quotes the rule ("write it
+    // like this") would otherwise declare the example. Blanked line by line, so
+    // every other line keeps its position. If GitHub does register a keyword in
+    // a fence, the PR is still caught: registered, and not declared.
+    .replace(/^([ \t]*)(```|~~~)[^\n]*\n[\s\S]*?\n[ \t]*\2[^\n]*$/gm, (block) => block.replace(/[^\n]/g, ""))
     .replace(/[*`~]/g, "")
-    .replace(/(?<![A-Za-z0-9])_+|_+(?![A-Za-z0-9])/g, "");
+    // An underscore is emphasis only when the whole RUN of them sits at the edge
+    // of a word. Inside a name, or against the `/` and `#` of a ref, it is part
+    // of a repository name: stripping it turned `owner/my_repo#7` into a
+    // different repository, which an exact comparison then called a mismatch.
+    .replace(/(?<![A-Za-z0-9_/])_+(?![A-Za-z0-9_#])|(?<![A-Za-z0-9_/])_+(?=[A-Za-z0-9])|(?<=[A-Za-z0-9])_+(?![A-Za-z0-9_#])/g, "");
 }
 
 /**
@@ -144,7 +166,7 @@ function intentNumbers(body) {
   let governorEnd = -1; // index just past the last attributed token
 
   for (const m of text.matchAll(TOKEN_RE)) {
-    const [raw, word, urlRepo, urlNum, refRepo, refNum] = m;
+    const [raw, urlRepo, urlNum, refRepo, refNum, bareNum, ghNum, word] = m;
 
     if (word) {
       const preceding = text.slice(Math.max(0, m.index - 24), m.index);
@@ -166,7 +188,7 @@ function intentNumbers(body) {
     // An issue ref. Attribute it to the governor only if the intervening text
     // is pure list punctuation; otherwise it's a bare mention with no intent.
     const repo = urlRepo || refRepo || null;
-    const n = Number(urlNum || refNum);
+    const n = Number(urlNum || refNum || bareNum || ghNum);
     const gap = text.slice(governorEnd, m.index);
     if (governor && governorEnd >= 0 && LIST_GAP_RE.test(gap)) {
       // A qualified ref goes to `keyed` and NEVER to the number sets: another
@@ -260,17 +282,25 @@ function explainReason(reason) {
  * or a real contradiction — costs the retry budget in seconds, never a missed
  * report, and the waiting stays inside the 1-minute billing floor.
  *
+ * ⚠️ KEY-AWARE since #942. It used to read the bare-number sets only, and a
+ * declaration can now be qualified (`Closes owner/repo#7`, or the issue URL):
+ * that form never entered a number set, so it was never "pending", the loop
+ * never waited, and ordinary lag went straight to a red row.
+ *
  * @param {string} body raw PR body
- * @param {Array<{number:number}>} [closingRefs] GitHub's registered set, as read
- * @returns {number[]} ascending
+ * @param {Array<{repo?:string,number:number}>} [closingRefs] GitHub's registered set, as read
+ * @param {string} repoSlug `owner/repo` of the PR's own repository
+ * @returns {string[]} `owner/repo#N` keys, sorted
  */
-function unsettled(body, closingRefs = []) {
-  const { reference, closing } = intentNumbers(body);
-  const registered = new Set(closingRefs.map(r => r.number));
+function unsettled(body, closingRefs = [], repoSlug = "") {
+  const here = String(repoSlug).toLowerCase();
+  const walk = intentNumbers(body);
+  const keysOf = (name) => new Set([...[...walk[name]].map(n => `${here}#${n}`), ...walk.keyed[name]]);
+  const registered = new Set(closingRefs.map(r => `${String(r.repo || repoSlug).toLowerCase()}#${r.number}`));
   const out = new Set();
-  for (const n of closing) if (!registered.has(n)) out.add(n);
-  for (const n of registered) if (reference.has(n)) out.add(n);
-  return [...out].sort((a, b) => a - b);
+  for (const k of keysOf("closing")) if (!registered.has(k)) out.add(k);
+  for (const k of registered) if (keysOf("reference").has(k)) out.add(k);
+  return [...out].sort();
 }
 
 /** Marker on the guard's own PR comment, so a later run can find and replace it. */
@@ -282,8 +312,8 @@ const MARKER = "<!-- autoclose-guard -->";
  *
  * WHY a verdict and not a warning: the guard used to reach the right answer
  * and exit `pass`. The finding sat in a comment while the check row, the
- * surface people act on, read green. That happened ten times, four of them to
- * authors writing the rule down at the time. So the finding moves onto the
+ * surface people act on, read green. That kept happening, often to authors who
+ * were writing the rule down at the time. So the finding moves onto the
  * status surface: `fail` is what the workflow turns into a non-zero exit.
  *
  * DECLARED is one thing only: a closing keyword that LEADS its line, the
@@ -312,10 +342,12 @@ const MARKER = "<!-- autoclose-guard -->";
  *                 body's cross-repository declarations could account for
  *
  * What does NOT fail, and is still said: `unverifiable`, a declared close of
- * ANOTHER repository's issue that is absent from the registered set. This
- * check runs on its caller's token, which cannot read another private
- * repository, so "absent" may mean "registered and invisible". Red on every
- * such PR would teach the eye to scroll past the row; silence would be a lie.
+ * ANOTHER repository's issue that is absent from the registered set AND that
+ * this token could not read (it is not in `crossStates`). The check runs on its
+ * caller's token, which cannot read another private repository, so "absent" may
+ * mean "registered and invisible". Red on every such PR would teach the eye to
+ * scroll past the row; silence would be a lie. An issue the token CAN read is
+ * judged like a local one.
  *
  * ⚠️ Not covered, by construction: a keyword that arrives in a commit message
  * folded into a squash merge. It registers at merge time, after any check.
@@ -328,9 +360,16 @@ const MARKER = "<!-- autoclose-guard -->";
  *   State of the declared-but-unregistered issues HERE. A number absent from it
  *   could not be read: it names no issue, or the read failed. Either way the
  *   author meant to close something and nothing says it will, so it fails.
+ * @param {Object<string,{state:string,title:string}>} [input.crossStates]
+ *   State of declared-but-unregistered issues in OTHER repositories that the
+ *   token could read, keyed `owner/repo#N`. A key absent from it is unreadable.
  * @param {number} [input.invisibleRegistered] registered refs returned as null
  */
-function verdict({ closingRefs = [], body = "", repoSlug = "", issueStates = {}, invisibleRegistered = 0 } = {}) {
+function verdict({ closingRefs = [], body = "", repoSlug = "", issueStates = {}, crossStates = {}, invisibleRegistered = 0 } = {}) {
+  // Without "here", every bare `#N` is compared against a key that matches
+  // nothing: each declared close reads unregistered and each registered one
+  // accidental. That is a broken caller, and it must not look like a verdict.
+  if (!repoSlug) throw new Error("verdict needs repoSlug: the owner/repo this PR is in");
   const here = String(repoSlug).toLowerCase();
   const local = (n) => `${here}#${n}`;
   const walk = intentNumbers(body);
@@ -344,10 +383,15 @@ function verdict({ closingRefs = [], body = "", repoSlug = "", issueStates = {},
 
   const accidental = [];
   const protectedRefs = [];
+  const judged = new Set();
   for (const ref of closingRefs) {
-    // A closed issue cannot be wrongly closed again.
-    if (String(ref.state).toUpperCase() !== "OPEN") continue;
+    // A closed issue cannot be wrongly closed again. ⚠️ Only a state that SAYS
+    // closed is skipped: a missing state is treated as open, because skipping
+    // what could not be read is the omission-reads-as-all-clear failure.
+    if (String(ref.state).toUpperCase() === "CLOSED") continue;
     const key = keyOf(ref);
+    if (judged.has(key)) continue; // a ref returned twice is one finding
+    judged.add(key);
     const labels = ref.labels || [];
     if (declared.has(key)) {
       // `no-autoclose` means "never by merge", so a declaration contradicts the
@@ -368,8 +412,12 @@ function verdict({ closingRefs = [], body = "", repoSlug = "", issueStates = {},
   for (const key of declared) {
     if (registered.has(key)) continue;
     const [repo, number] = [key.slice(0, key.lastIndexOf("#")), Number(key.slice(key.lastIndexOf("#") + 1))];
-    if (repo !== here) { unverifiable.push(key); continue; }
-    const known = issueStates[number];
+    // Another repository's issue. Whether this token can read it is MEASURED,
+    // not assumed: the workflow tries, and what it could read arrives in
+    // `crossStates`. Readable means it can be judged like a local one, which is
+    // what catches `Closes other#1, other#2` registering `other#1` alone.
+    if (repo !== here && !crossStates[key]) { unverifiable.push(key); continue; }
+    const known = repo === here ? issueStates[number] : crossStates[key];
     // Already closed: nothing is orphaned, and the row stays quiet.
     if (known && String(known.state).toUpperCase() !== "OPEN") continue;
     unregistered.push({ key, number, title: known ? known.title : null, known: Boolean(known) });
@@ -382,6 +430,9 @@ function verdict({ closingRefs = [], body = "", repoSlug = "", issueStates = {},
 
   return {
     fail: accidental.length > 0 || protectedRefs.length > 0 || unregistered.length > 0 || unseen > 0,
+    // The repository the verdict was reached in, so the comment can write a
+    // local ref in its short form and any other in its qualified one.
+    here,
     accidental, protected: protectedRefs, unregistered, unverifiable, unseen,
   };
 }
@@ -397,6 +448,19 @@ function verdict({ closingRefs = [], body = "", repoSlug = "", issueStates = {},
  */
 function renderComment(v) {
   if (!v.fail && v.unverifiable.length === 0) return null;
+  // A ref as the author should WRITE it: bare for this repository's issue,
+  // qualified for any other. Advice in the bare form for another repository's
+  // issue, followed literally, declares a LOCAL issue with the same number.
+  const written = (key) => {
+    const cut = key.lastIndexOf("#");
+    return key.slice(0, cut) === v.here ? key.slice(cut) : key;
+  };
+  // ⚠️ The guard runs on opened / edited / reopened / ready_for_review. A
+  // registration that arrives late, or a sidebar link that is removed, fires
+  // NONE of those, so the row stays red until someone re-runs the job. The
+  // comment has to say so, or its own advice leaves the PR red forever.
+  const RERUN = "Then **re-run this check** (or edit the body): fixing the registration alone fires no event this check runs on.";
+
   const out = [MARKER];
   out.push(v.fail
     ? "🔴 **This PR's declared closes do not match what merging will do.**"
@@ -410,12 +474,13 @@ function renderComment(v) {
       v.accidental.map(r => [
         `- **${r.key}** — ${r.title}`,
         ...r.reasons.map(reason => `  - ${explainReason(reason)}`),
+        `  - meant to close it: put \`Closes ${written(r.key)}\` on a line of its own`,
+        `  - did not mean to: write \`Refs ${written(r.key)}\`, and unlink the issue from the Development sidebar (that link closes it with no keyword at all)`,
       ].join("\n")).join("\n"),
       "",
-      "A close is declared by a closing keyword **on a line of its own** (`Closes #N`), and by nothing else.",
+      "A close is declared by a closing keyword **on a line of its own**, and by nothing else.",
       "",
-      "- **Meant to close it:** add that line.",
-      "- **Did not mean to:** change the wording to `Refs #N`, and unlink the issue from the Development sidebar. The sidebar link closes it with no keyword at all.",
+      RERUN,
     );
   }
 
@@ -424,9 +489,9 @@ function renderComment(v) {
       "",
       "These issues carry `no-autoclose` and will be closed by this merge:",
       "",
-      v.protected.map(r => `- **${r.key}** — ${r.title}`).join("\n"),
+      v.protected.map(r => `- **${r.key}** — ${r.title}: write \`Refs ${written(r.key)}\``).join("\n"),
       "",
-      "Change the line to `Refs #N` and close the issue by hand when its watch is over.",
+      "Close the issue by hand when its watch is over.",
     );
   }
 
@@ -445,7 +510,9 @@ function renderComment(v) {
       "gh pr view <number> --json closingIssuesReferences",
       "```",
       "",
-      "If it never registers, check the line itself: GitHub needs a keyword before **each** number, so `Closes #1, #2` registers `#1` only.",
+      RERUN,
+      "",
+      "If it never registers, check the line itself: GitHub needs a keyword before **each** number, so a comma list after one keyword registers the first number only.",
     );
   }
 
@@ -463,14 +530,14 @@ function renderComment(v) {
   if (v.unseen > 0) {
     out.push(
       "",
-      `Merging will also close **${v.unseen}** issue(s) this check cannot read, likely in another repository, that the body does not declare. Check the Development sidebar.`,
+      `Merging will close **${v.unseen}** issue(s) this check cannot read, likely in another repository, that the body does not declare. Check the Development sidebar.`,
     );
   }
 
   out.push(
     "",
     v.fail
-      ? "_This check is red on purpose and is not a required check: it never blocks the merge. It clears itself when declared and registered agree._"
+      ? "_This check is red on purpose and is not a required check: it never blocks the merge. It turns green on the next body edit or re-run once declared and registered agree._"
       : "_The check is green: nothing it could read disagrees._",
   );
   return out.join("\n");
