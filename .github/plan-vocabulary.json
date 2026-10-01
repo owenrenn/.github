@@ -1,11 +1,12 @@
 {
-  "$comment": "GENERATED from owenrenn/owen-ops .github/labels.json (`universal` for names and meanings, `order` for order); do not hand-edit. The vocabulary is decided there and only there (owen-ops#1120). Change it there, then regenerate this copy: `node <owen-ops checkout>/scripts/plan-vocabulary/export.js > .github/plan-vocabulary.json`. Every list is in order: lanes most-costly-to-PM first (the tiebreak when an item carries two lane labels), priorities highest first, pm tiers claiming-PM first. `engagement` is the Card Shark Engagement option a lane mirrors. The fleet conformance drift scan reports any divergence between this file and labels.json.",
+  "$comment": "GENERATED from owenrenn/owen-ops .github/labels.json (`universal` for names and meanings, `order` for order, `cost.laneMinutes` for lane cost); do not hand-edit. The vocabulary is decided there and only there (owen-ops#1120). Change it there, then regenerate this copy: `node <owen-ops checkout>/scripts/plan-vocabulary/export.js > .github/plan-vocabulary.json`. Every list is in order: lanes most-costly-to-PM first (the tiebreak when an item carries two lane labels), priorities highest first, pm tiers claiming-PM first. `engagement` is the Card Shark Engagement option a lane mirrors. `costMinutes` is what a lane's next move costs PM, in minutes of PM's own time; lane:do's is a floor, not an estimate (owen-ops#1127). The fleet conformance drift scan reports any divergence between this file and labels.json.",
   "lanes": [
     {
       "label": "lane:do",
       "key": "do",
       "engagement": "Do",
       "rank": 0,
+      "costMinutes": 120,
       "meaning": "Your next move is your hands, with no agent involved. Vendor portals, hardware, life admin."
     },
     {
@@ -13,6 +14,7 @@
       "key": "session",
       "engagement": "Session",
       "rank": 1,
+      "costMinutes": 60,
       "meaning": "Your next move is working alongside an agent. Spends both, at the same time."
     },
     {
@@ -20,6 +22,7 @@
       "key": "decide",
       "engagement": "Decide",
       "rank": 2,
+      "costMinutes": 2,
       "meaning": "Your next move is a judgment that releases an agent or a person. Not the work itself."
     },
     {
@@ -27,6 +30,7 @@
       "key": "kick-off",
       "engagement": "Kick off",
       "rank": 3,
+      "costMinutes": 1,
       "meaning": "Your next move starts an agent and steps back. Spends agent tokens, ~a minute of you."
     }
   ],
