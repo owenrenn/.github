@@ -10,9 +10,9 @@ the fleet's **reusable workflows**.
 | `SECURITY.md` | Default security policy inherited by every `owenrenn/*` repo (#251). |
 | `.github/workflows/card-shark-sync.yml` | **Reusable**. Keeps Card Shark membership in sync with `pm:*` labels across the fleet, **and mirrors Track / Priority / Engagement at the same moment** (#849). |
 | `scripts/card-shark-sync/` | Pure decision logic for the above (`sync.js` = membership, `fields.js` = field derivation), plus their `node --test` suites. |
-| `.github/workflows/autoclose-guard.yml` | **Reusable**. Warns when a PR's stated closing set and GitHub's computed one disagree — in either direction — or when a close was registered only by a keyword **mid-sentence** rather than a line-leading `Closes #N` (#911). Advisory; never blocks. |
+| `.github/workflows/autoclose-guard.yml` | **Reusable**. **Fails** when what a PR *declares* it closes differs from what GitHub *registered* — in either direction (#942). A close is declared by a closing keyword on a line of its own (`Closes #N`, `Closes owner/repo#N`) and by nothing else; write nothing and the PR declares it closes nothing. Red, and **never a required check**: it does not block a merge. |
 | `scripts/autoclose-guard/` | Pure decision logic for the above, plus its `node --test` suite. |
-| `.github/workflows/guard-own-prs.yml` | **This repo's own caller** of the guard above (#911). It uses `uses: ./…`, so a PR that changes the guard's workflow runs its own version on itself. Until it existed, the repo where guard changes land was the one fleet repo the guard never checked. |
+| `.github/workflows/guard-own-prs.yml` | **This repo's own caller** of the guard above (#911). It uses `uses: ./…` **and passes `logic_ref: github.sha`**, so a PR that changes the guard runs its own version of both halves on itself: the workflow file and the predicate it loads come from the same commit (on `pull_request`, the test-merge commit). ⚠️ Until #942 only the workflow half was the PR's; the predicate still came from `main`, so a PR changing both crashed on itself. No other caller passes `logic_ref`. Until this caller existed, the repo where guard changes land was the one fleet repo the guard never checked. |
 | `actions/publish-update-feed/` | **Composite action.** Uploads release payloads + an optional manifest to S3-compatible object storage, then verifies the feed from the public URL a client reads. |
 | `.github/workflows/tests.yml` | This repo's CI: the `node --test` suite, plus the structural check that every workflow here parses and every job carries `timeout-minutes` (#587). |
 
@@ -78,7 +78,7 @@ jobs:
 ```
 
 Nothing else is needed — no vendored script, no secret. The guard uses the
-caller's own `GITHUB_TOKEN`. One optional input, `runner` (default `ubuntu-latest`), is
+caller's own `GITHUB_TOKEN`. One optional input for callers, `runner` (default `ubuntu-latest`), is
 described under the Card Shark sync above; pass it under `with:` only if the caller has a
 self-hosted runner of its own.
 
@@ -91,6 +91,48 @@ check that run before assuming the wiring holds. ⚠️ That arrival run is an
 guard now waits and re-reads (up to 4 × 5s) until the registered set settles, so an
 arrival run that says OK can be believed. It can also take ~20s longer than you'd
 expect when the body really does disagree.
+
+### What a red guard means, and what a caller must not do with it
+
+⚠️ **The guard fails the job when declared and registered disagree (#942).** It used to be
+advisory: it reached the right verdict, wrote it in a PR comment, and exited `pass`. The check
+row read green beside a finding nobody opened, again and again. The finding now sits on the
+status surface, and the comment explains it.
+
+| The body declares | GitHub registered | Result |
+|---|---|---|
+| nothing | nothing | pass, with no ceremony |
+| nothing | an open issue | **fail** — an accidental close (a mid-sentence keyword, a negation, a sidebar link) |
+| `Closes #N` | nothing | **fail** — a close that will not fire, or has not registered yet |
+| `Closes #N` | `#N` | pass |
+| `Closes #N` | `#N` and another | **fail** — closes more than declared |
+
+- **Do not add it to a caller's required checks.** It is red by design and non-blocking by
+  decision: a merge is never held by it. A caller that asserts its own required set should
+  assert that this job is absent from it.
+- **An "unregistered so far" failure on a well-formed PR is usually lag.** GitHub's registration
+  can run behind a body edit, sometimes for hours. The comment says to re-check and then close
+  the issue by hand after merge. It does not say the body is wrong, because usually it is not.
+- **A red row does not clear by itself.** The guard runs on `opened`, `edited`, `reopened` and
+  `ready_for_review`. A registration that arrives late, or a sidebar link being removed, fires
+  none of them, so the row stays red until the body is edited or the job is re-run. The comment
+  says so.
+- **A declared close in ANOTHER repository is judged if the guard can read that issue, and
+  only reported if it cannot.** The guard runs on its caller's token. It tries to read each such
+  issue: readable, it is compared like a local one; unreadable (another private repository), an
+  absent registration may be an invisible one, so it is said in the comment and the row stays
+  green. Whether that token ever sees a cross-repository *registration* has not been observed
+  yet; the run log prints the registered set on every run so the first such PR will say.
+- **Declared means the line, strictly.** A list chains only on one line (`Closes #1, #2` declares
+  both, and fails, because GitHub registers the first). A fenced code block is an example and
+  declares nothing. `GH-5` is `#5`. Forms the guard does not read as a declaration (a markdown
+  link around the ref, a URL in angle brackets, a ref in parentheses) fail as *undeclared* if
+  GitHub registers them, which is the safe direction. ⚠️ A line-leading keyword inside an **HTML
+  comment** IS read as a declaration. Whether GitHub registers one there has not been checked: if
+  it does not, a template that hides an example line with a real number in a comment reads
+  "unregistered so far" on every PR.
+- **Not covered:** a closing keyword that arrives in a commit message folded into a squash
+  merge. It registers at merge time, after every check has run.
 
 ## Calling the update-feed publisher
 
