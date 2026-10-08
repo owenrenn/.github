@@ -121,16 +121,24 @@ status surface, and the comment explains it.
   only reported if it cannot.** The guard runs on its caller's token. It tries to read each such
   issue: readable, it is compared like a local one; unreadable (another private repository), an
   absent registration may be an invisible one, so it is said in the comment and the row stays
-  green. Whether that token ever sees a cross-repository *registration* has not been observed
-  yet; the run log prints the registered set on every run so the first such PR will say.
+  green. **Measured (#1167): that token never sees a registration in another private
+  repository.** It reads an empty registered set where a token with access to both
+  repositories reads the registration. So between two private repositories this is
+  permanent: the guard always says it cannot verify, and the author confirms with their own
+  token. ⚠️ On such a PR the guard also waits out its whole settle window (about 20 seconds),
+  because it cannot tell an invisible registration from a late one. Known, and left: telling
+  them apart means probing the other repository before the wait, in workflow code no test
+  executes.
 - **Declared means the line, strictly.** A list chains only on one line (`Closes #1, #2` declares
   both, and fails, because GitHub registers the first). A fenced code block is an example and
   declares nothing. `GH-5` is `#5`. Forms the guard does not read as a declaration (a markdown
   link around the ref, a URL in angle brackets, a ref in parentheses) fail as *undeclared* if
-  GitHub registers them, which is the safe direction. ⚠️ A line-leading keyword inside an **HTML
-  comment** IS read as a declaration. Whether GitHub registers one there has not been checked: if
-  it does not, a template that hides an example line with a real number in a comment reads
-  "unregistered so far" on every PR.
+  GitHub registers them, which is the safe direction. An **HTML comment** is an example too and
+  declares nothing. **Measured (#1167): GitHub registers nothing for a closing keyword inside
+  one**, and the guard used to read it as a declaration, so a template hiding an example line
+  with a real number in a comment failed every PR as "unregistered so far". Only a comment that
+  ends counts: an unclosed `<!--` is read as written, and what GitHub does with one was not
+  measured.
 - **Not covered:** a closing keyword that arrives in a commit message folded into a squash
   merge. It registers at merge time, after every check has run.
 

@@ -781,6 +781,40 @@ test("a line inside a FENCED code block is an example, not a declaration", () =>
   assert.equal(judge(body, [reg(12)]).fail, true);
 });
 
+test("a line inside an HTML COMMENT is an example, not a declaration (#1167)", () => {
+  // Measured on a scratch PR: GitHub registers NOTHING for a closing keyword
+  // inside an HTML comment, while this guard read it as a declaration and went
+  // red with "unregistered so far". A template that hides an example line with a
+  // real number in a comment would have failed every PR opened from it.
+  for (const body of [
+    "Tidies the build.\n\n<!--\nCloses #12\n-->\n",
+    "Tidies the build.\n\n<!-- Closes #12 -->\n",
+    "<!--\n  Write it like this:\n  Closes #12\n  Fixes example-org/other-repo#40\n-->\nTidies the build.",
+  ]) {
+    assert.deepEqual([...closingIntentNumbers(body)], [], body);
+    assert.equal(judge(body).fail, false, body);
+    // Same safety net as the fence: if GitHub ever DID register one there, the
+    // PR is still caught, as registered and not declared.
+    assert.equal(judge(body, [reg(12)]).fail, true, body);
+  }
+});
+
+test("an HTML comment hides only itself: a declaration beside it or after it still counts (#1167)", () => {
+  // Blanked in place, so every other line keeps its position and its meaning.
+  const body = "<!-- example: Closes #12 -->\nCloses #7\n\n<!--\nCloses #13\n-->\n\nCloses #8";
+  assert.deepEqual([...closingIntentNumbers(body)].sort(), [7, 8]);
+  assert.equal(judge(body, [reg(7), reg(8)]).fail, false);
+  // And two comments on one line do not swallow what sits between them.
+  assert.deepEqual([...closingIntentNumbers("<!-- a -->\nCloses #9 <!-- b -->")], [9]);
+});
+
+test("an UNCLOSED HTML comment is not treated as a comment (#1167)", () => {
+  // Only a comment that ends is blanked. What GitHub does with one that never
+  // closes was not measured, so the guard keeps reading it as written: a
+  // declaration there that does not register stays loud, which is the safe side.
+  assert.deepEqual([...closingIntentNumbers("<!-- note to self\nCloses #12")], [12]);
+});
+
 // ── review of the #942 branch: the verdict ───────────────────────────────────
 
 test("verdict REFUSES to run without a repository: every bare `#N` would be compared against nothing", () => {
