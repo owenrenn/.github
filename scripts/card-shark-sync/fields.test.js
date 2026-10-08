@@ -197,9 +197,9 @@ test("a draft card is never reported as frozen", () => {
   );
 });
 
-// owen-ops#1120: the constants are DERIVED from the vendored vocabulary, and the switch changed no behaviour.
+// #1120: the constants are DERIVED from the vendored vocabulary, and the switch changed no behaviour.
 // ⚠️ Never delete the pinned literals below: they're the order this sweep enforced before the vocabulary moved to
-// owen-ops. If a regenerated copy changes them, that's a real change to which lane label wins, and it should fail
+// the operations repo. If a regenerated copy changes them, that's a real change to which lane label wins, and it should fail
 // here and be argued in the PR that regenerates, not slip through as a data refresh.
 test("#1120: lane precedence and priorities come from .github/plan-vocabulary.json, unchanged", () => {
   const vocab = require("../../.github/plan-vocabulary.json");

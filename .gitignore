@@ -11,7 +11,7 @@ CLAUDE.local.md
 
 # NOTE: CLAUDE.md itself is TRACKED and must stay so — it is the shim that
 # @-imports AGENTS.md. Ignoring it would silently stop Claude Code loading the
-# repo's instructions at all, which is why owen-ops's conformance scan asserts
+# repo's instructions at all, which is why the operations repo's conformance scan asserts
 # this file does NOT list it.
 
 # OS / editor noise
