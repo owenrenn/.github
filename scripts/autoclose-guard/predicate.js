@@ -127,6 +127,15 @@ function normalize(body) {
     // every other line keeps its position. If GitHub does register a keyword in
     // a fence, the PR is still caught: registered, and not declared.
     .replace(/^([ \t]*)(```|~~~)[^\n]*\n[\s\S]*?\n[ \t]*\2[^\n]*$/gm, (block) => block.replace(/[^\n]/g, ""))
+    // An HTML comment is an EXAMPLE too (#1167), for the same reason and with
+    // the same safety net. This was measured, not assumed: GitHub registers
+    // nothing for a closing keyword inside one, and the guard used to read it as
+    // a declaration and fail the PR as "unregistered" — so a template hiding an
+    // example line with a real number in a comment went red on every PR.
+    // Blanked to SPACES, in place: a comment can share a line with real text,
+    // and that text must keep its column as well as its line. Only a comment
+    // that ENDS is blanked; an unclosed one is read as written.
+    .replace(/<!--[\s\S]*?-->/g, (comment) => comment.replace(/[^\n]/g, " "))
     .replace(/[*`~]/g, "")
     // An underscore is emphasis only when the whole RUN of them sits at the edge
     // of a word. Inside a name, or against the `/` and `#` of a ref, it is part
