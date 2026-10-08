@@ -32,13 +32,13 @@
 // Consumed by sync.js (membership time, all fleet repos) and by the operations
 // repo's four-hourly reconciler, which imports this file from its checkout.
 
-// The Plan vocabulary is VENDORED from owen-ops, not written here (owen-ops#1120). owen-ops
+// The Plan vocabulary is VENDORED from the operations repo, not written here (#1120). That repo's
 // `.github/labels.json` owns the lane/priority names, meanings AND order. This repo commits the generated
-// copy at `.github/plan-vocabulary.json`, and owen-ops's Sunday conformance scan flags it the moment it
-// goes stale. To change a lane or priority, or their order, change labels.json and regenerate:
-//   node <owen-ops checkout>/scripts/plan-vocabulary/export.js > .github/plan-vocabulary.json
+// copy at `.github/plan-vocabulary.json`, and the operations repo's weekly conformance scan flags it the
+// moment it goes stale. To change a lane or priority, or their order, change labels.json and regenerate:
+//   node <the operations repo's checkout>/scripts/plan-vocabulary/export.js > .github/plan-vocabulary.json
 // A missing or malformed copy fails the require at import, loudly: every caller checks this repo out WHOLE
-// (card-shark-sync.yml and owen-ops's reconciler both use `path: .card-shark-sync`, no sparse checkout),
+// (card-shark-sync.yml and the operations repo's reconciler both use `path: .card-shark-sync`, no sparse checkout),
 // so its absence is a broken contract, never a state to degrade through.
 const VOCAB = require("../../.github/plan-vocabulary.json");
 

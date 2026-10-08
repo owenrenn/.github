@@ -448,7 +448,7 @@ jobs:
             // readBoard fails closed here by default rather than open.
             if (board.status !== "ok") {
               const detail = {
-                "no-project": "project owenrenn/projects/5 did not resolve",
+                "no-project": "the configured project did not resolve",
                 "wrong-project": `read project ${board.got}, expected ${PROJECT_ID}`,
                 "truncated": "board read exceeded 20 pages — cursor not advancing",
                 "malformed": `board response shape invalid — ${board.detail}`,
