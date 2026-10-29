@@ -107,6 +107,11 @@ jobs:
           python3 - <<'PY'
           import glob, os, sys, yaml
 
+          # Built from parts: the expression's opening characters written
+          # literally in a `run:` block are evaluated by Actions before Python
+          # ever sees them, which first made this whole file fail to load.
+          SHA_EXPR = "$" + "{{github.sha}}"
+
           bodies = []
           for f in sorted(glob.glob(".github/workflows/*.yml")):
               doc = yaml.safe_load(open(f)) or {}
@@ -120,7 +125,7 @@ jobs:
               for job in (doc.get("jobs") or {}).values():
                   uses = (job or {}).get("uses", "") if isinstance(job, dict) else ""
                   if uses.startswith("./.github/workflows/") and \
-                     str((job.get("with") or {}).get("logic_ref", "")).replace(" ", "") == "${{github.sha}}":
+                     str((job.get("with") or {}).get("logic_ref", "")).replace(" ", "") == SHA_EXPR:
                       callers.setdefault(uses.rsplit("/", 1)[1], []).append(f)
           if not bodies:
               print("no reusable workflow declares logic_ref -- this check looked at nothing", file=sys.stderr)
@@ -128,7 +133,7 @@ jobs:
           missing = [b for b in bodies if b not in callers]
           print(f"== own-PR callers: {len(bodies) - len(missing)} of {len(bodies)} logic_ref bodies covered ==")
           for b in missing:
-              print(f"{b} reads its logic at logic_ref but no workflow here calls it with logic_ref: ${{{{ github.sha }}}}", file=sys.stderr)
+              print(f"{b} reads its logic at logic_ref but no workflow here calls it with logic_ref: {SHA_EXPR}", file=sys.stderr)
           sys.exit(1 if missing else 0)
           PY
       - name: Every composite action parses, and every run step names its shell
