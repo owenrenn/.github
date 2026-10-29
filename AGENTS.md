@@ -167,7 +167,7 @@ files in the caller shape what the checks do, both optional:
 | File | What it holds |
 |---|---|
 | `.github/fleet-checks.json` | Release **streams**, each with a tag prefix and the paths that ship in it (none declared: one stream, `v*`, every path); dead-path **exemptions**, each with a `why`; **`foreignNames`**, the names of other repos the caller's comments cite, so a line naming one is not judged. Unknown keys are refused. |
-| `.github/dead-paths-baseline.json` | The dead-path counts per file the repo had when it adopted the check. **Write it with the CLI, never by hand**: `node <checkout of this repo>/scripts/fleet-checks/cli.js dead-paths --write-baseline`. |
+| `.github/dead-paths-baseline.json` | Each file's dead targets (no line numbers) as the repo had them when it adopted the check. **Write it with the CLI, never by hand**: `node <checkout of this repo>/scripts/fleet-checks/cli.js dead-paths --write-baseline`. |
 
 **A fragment**, one per PR, at `changelog.d/<issue>-<slug>.md`:
 
@@ -189,8 +189,9 @@ The panel reconnects after the machine wakes.
   `[bot]` account are not asked for a fragment.
 - ⚠️ **The dead-path check is a ratchet, in both directions.** A new dead path fails. A fixed one
   fails too, until the baseline is regenerated in the same PR, so the baseline stays a true
-  record rather than a ceiling. A count is per file: fixing one dead path and adding another in
-  the same file nets to zero and passes.
+  record rather than a ceiling. It is keyed by target, not by count, so fixing one dead path and
+  adding another in the same file still fails; a target repeated in a file is listed once per
+  occurrence.
 - ⚠️ **`edited` is required in the stub's `types:`**, or adding the opt-out line never re-runs
   the check and the row stays red.
 

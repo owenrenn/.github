@@ -25,11 +25,24 @@ test("dead-paths: no baseline fails on an existing dead path; --write-baseline r
     assert.equal(run(r, ["dead-paths"]).code, 1);
     const w = run(r, ["dead-paths", "--write-baseline"]);
     assert.equal(w.code, 0, w.err);
-    assert.equal(fs.readFileSync(path.join(r.root, ".github/dead-paths-baseline.json"), "utf8"), '{\n  "src/a.ts": 1\n}\n');
+    assert.equal(fs.readFileSync(path.join(r.root, ".github/dead-paths-baseline.json"), "utf8"), '{\n  "src/a.ts": [\n    "src/gone.ts"\n  ]\n}\n');
     r.commit("baseline");
     const ok = run(r, ["dead-paths"]);
     assert.equal(ok.code, 0, ok.err);
     assert.match(ok.out, /1 dead path\(s\) in 1 file\(s\)/);
+  } finally { r.cleanup(); }
+});
+
+test("dead-paths: swapping one dead path for another in the SAME file fails", () => {
+  const r = makeRepo();
+  try {
+    r.commit("init", { "src/a.ts": "// see src/gone.ts\n" });
+    run(r, ["dead-paths", "--write-baseline"]);
+    r.write({ "src/a.ts": "// see src/other-gone.ts\n" });
+    const swap = run(r, ["dead-paths"]);
+    assert.equal(swap.code, 1);
+    assert.match(swap.out, /src\/other-gone\.ts/);
+    assert.match(swap.err, /src\/a\.ts: src\/gone\.ts is recorded and no longer dead/);
   } finally { r.cleanup(); }
 });
 
@@ -41,7 +54,7 @@ test("dead-paths: a NEW dead path fails, and so does a FIXED one until the basel
     r.write({ "src/b.ts": "// and src/also-gone.ts\n" });
     const grew = run(r, ["dead-paths"]);
     assert.equal(grew.code, 1);
-    assert.match(grew.err, /src\/b\.ts: 0 recorded, 1 now/);
+    assert.match(grew.out, /src\/b\.ts:1 \[comment-path\] src\/also-gone\.ts/);
     r.write({ "src/a.ts": "// fixed\n", "src/b.ts": "" });
     const shrank = run(r, ["dead-paths"]);
     assert.equal(shrank.code, 1);

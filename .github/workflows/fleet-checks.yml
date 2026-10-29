@@ -13,10 +13,10 @@
 #               or opts out with a line `Changelog: none — <why>` in its body. A
 #               fragment's `ships:` must name a stream the PR's paths reach.
 #               Docs-only PRs and bot-authored PRs are not asked for one.
-#   dead-paths  Per-file counts of paths in docs and code comments that resolve to
-#               nothing, against the caller's committed .github/dead-paths-baseline.json.
-#               Growth fails; so does shrinkage, until the baseline is lowered in the
-#               same PR. Existing dead paths are never swept (#1555, D7).
+#   dead-paths  Each file's paths in docs and code comments that resolve to nothing,
+#               against the caller's committed .github/dead-paths-baseline.json, keyed
+#               by target. A new one fails; so does a fixed one, until the baseline is
+#               regenerated in the same PR. Existing dead paths are never swept (#1555, D7).
 #
 # Node is installed here, so a caller in any language needs nothing of its own.
 #

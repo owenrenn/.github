@@ -156,19 +156,30 @@ test("globToRegExp: ** crosses directories, * does not, a trailing / is the whol
 
 // ── the ratchet ─────────────────────────────────────────────────────────────
 
-test("the ratchet fails growth AND shrinkage, and refuses a zero entry", () => {
-  const live = { "a.ts": 2, "b.ts": 1 };
-  const r = dp.compareToBaseline(live, { "a.ts": 1, "b.ts": 1, "c.ts": 3, "d.ts": 0 });
-  assert.deepEqual(r.grew, [{ file: "a.ts", was: 1, now: 2 }]);
-  assert.deepEqual(r.shrank, [{ file: "c.ts", was: 3, now: 0 }]);
-  assert.equal(r.invalid.length, 1);
-  assert.deepEqual(dp.compareToBaseline(live, { ...live }), { grew: [], shrank: [], invalid: [] });
+test("the ratchet is keyed by target: fixing one and adding another in the same file fails both ways", () => {
+  // The count-shaped first version netted this to zero and passed (#1561).
+  const r = dp.compareToBaseline({ "a.ts": ["src/new.ts"] }, { "a.ts": ["src/old.ts"] });
+  assert.deepEqual(r.added, [{ file: "a.ts", target: "src/new.ts" }]);
+  assert.deepEqual(r.removed, [{ file: "a.ts", target: "src/old.ts" }]);
+});
+
+test("a repeated target is a multiset: a second copy of a known dead path is new", () => {
+  const r = dp.compareToBaseline({ "a.md": ["x.md", "x.md"] }, { "a.md": ["x.md"] });
+  assert.deepEqual(r.added, [{ file: "a.md", target: "x.md" }]);
+  assert.deepEqual(r.removed, []);
+  assert.deepEqual(dp.compareToBaseline({ "a.md": ["x.md", "x.md"] }, { "a.md": ["x.md", "x.md"] }), { added: [], removed: [], invalid: [] });
+});
+
+test("an empty entry, or the count shape this format replaced, is refused", () => {
+  const r = dp.compareToBaseline({}, { "a.ts": [], "b.ts": 2 });
+  assert.equal(r.invalid.length, 2);
+  assert.deepEqual(r.removed, []);
 });
 
 test("a written baseline is deterministic, so regenerating an unchanged tree is an empty diff", () => {
-  const f = (file) => ({ file });
-  const a = dp.renderBaseline(dp.countsByFile([f("z.ts"), f("a.md"), f("z.ts")]));
-  const b = dp.renderBaseline(dp.countsByFile([f("a.md"), f("z.ts"), f("z.ts")]));
+  const f = (file, target) => ({ file, target });
+  const a = dp.renderBaseline(dp.targetsByFile([f("z.ts", "src/b.ts"), f("a.md", "x.md"), f("z.ts", "src/a.ts")]));
+  const b = dp.renderBaseline(dp.targetsByFile([f("a.md", "x.md"), f("z.ts", "src/a.ts"), f("z.ts", "src/b.ts")]));
   assert.equal(a, b);
-  assert.equal(a, '{\n  "a.md": 1,\n  "z.ts": 2\n}\n');
+  assert.equal(a, '{\n  "a.md": [\n    "x.md"\n  ],\n  "z.ts": [\n    "src/a.ts",\n    "src/b.ts"\n  ]\n}\n');
 });

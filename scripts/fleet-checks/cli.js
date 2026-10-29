@@ -15,9 +15,9 @@
  *   cli.js changelog check --base <ref> [--head <ref>] [--author <login>]
  *                                    reads the PR body from $PR_BODY
  *   cli.js changelog lint            every fragment in the working tree
- *   cli.js dead-paths                the ratchet: per-file counts against
+ *   cli.js dead-paths                the ratchet: each file's dead targets against
  *                                    the repo's .github/dead-paths-baseline.json, both ways
- *   cli.js dead-paths --write-baseline   record today's counts (adoption, or after a fix)
+ *   cli.js dead-paths --write-baseline   record today's dead targets (adoption, or after a fix)
  *   cli.js dead-paths --all          list every dead path; exit 1 if there is any
  *
  * Common: --root <dir> (default: cwd). Exit 0 clean · 1 findings · 2 could not run.
@@ -122,7 +122,7 @@ function deadPaths(flags, root, cfg) {
     root, tracked, docs, code,
     linksResolveElsewhere: cfg.deadPaths.linksResolveElsewhere, foreignNames: cfg.deadPaths.foreignNames,
   });
-  const live = dp.countsByFile(findings);
+  const live = dp.targetsByFile(findings);
   const baselineFile = path.join(root, dp.BASELINE_PATH);
   // The denominator is printed every run: a quiet run over a smaller corpus
   // must not read the same as a clean one (#867).
@@ -130,7 +130,7 @@ function deadPaths(flags, root, cfg) {
     `${code.length} code files judged · ${excused.length} excused · ${skippedIgnored} gitignored path(s) skipped`;
 
   if (flags.json) {
-    process.stdout.write(`${JSON.stringify({ findings, counts: live, docs: docs.length, code: code.length, excused: excused.length, skippedIgnored }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ findings, targets: live, docs: docs.length, code: code.length, excused: excused.length, skippedIgnored }, null, 2)}\n`);
     return 0;
   }
   if (flags["write-baseline"]) {
@@ -153,29 +153,31 @@ function deadPaths(flags, root, cfg) {
     try { baseline = JSON.parse(fs.readFileSync(baselineFile, "utf8")); }
     catch (e) { throw new ConfigError(`${dp.BASELINE_PATH}: not valid JSON (${e.message})`); }
   }
-  const { grew, shrank, invalid } = dp.compareToBaseline(live, baseline);
+  const { added, removed, invalid } = dp.compareToBaseline(live, baseline);
   for (const msg of invalid) { console.error(`error: ${dp.BASELINE_PATH} ${msg}`); annotate("error", msg, dp.BASELINE_PATH); }
-  if (grew.length) {
+  if (added.length) {
     console.error(`error: new dead paths — a path in a doc or comment that resolves to nothing in this repo. Fix the path;` +
       ` if it names another repo's file, say which repo on the same line.`);
-    for (const g of grew) {
-      console.error(`${g.file}: ${g.was} recorded, ${g.now} now`);
-      for (const f of findings.filter((x) => x.file === g.file)) {
+    for (const a of added) {
+      // A target the baseline holds fewer copies of is new, but which occurrence
+      // is the new one is not knowable, so every occurrence in the file is shown.
+      for (const f of findings.filter((x) => x.file === a.file && x.target === a.target)) {
         show(f);
-        annotate("error", `${f.target}: ${f.reason} (${g.file} has ${g.now}, the baseline records ${g.was})`, f.file, f.line);
+        annotate("error", `${f.target}: ${f.reason} (not in ${dp.BASELINE_PATH})`, f.file, f.line);
       }
     }
   }
-  if (shrank.length) {
+  if (removed.length) {
     console.error(`error: dead paths were fixed — lower the baseline in this same PR so it stays true:` +
       ` run \`cli.js dead-paths --write-baseline\` and commit ${dp.BASELINE_PATH}.`);
-    for (const s of shrank) {
-      console.error(`${s.file}: ${s.was} recorded, ${s.now} now`);
-      annotate("error", `${s.file}: ${s.was} recorded, ${s.now} now — lower the baseline`, dp.BASELINE_PATH);
+    for (const r of removed) {
+      console.error(`  ${r.file}: ${r.target} is recorded and no longer dead`);
+      annotate("error", `${r.file}: ${r.target} is recorded and no longer dead — lower the baseline`, dp.BASELINE_PATH);
     }
   }
-  const failed = grew.length + shrank.length + invalid.length > 0;
-  console.log(`dead-paths: ${failed ? "FAIL" : "ok"} — ${summary} · baseline ${Object.values(baseline).reduce((a, b) => a + (Number(b) || 0), 0)}`);
+  const failed = added.length + removed.length + invalid.length > 0;
+  const recorded = Object.values(baseline).reduce((n, v) => n + (Array.isArray(v) ? v.length : 0), 0);
+  console.log(`dead-paths: ${failed ? "FAIL" : "ok"} — ${summary} · baseline ${recorded} · ${added.length} new · ${removed.length} fixed`);
   return failed ? 1 : 0;
 }
 
