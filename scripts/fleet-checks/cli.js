@@ -69,8 +69,8 @@ function changelog(sub, pos, flags, root, cfg) {
       throw new UsageError(`"${tag}" matches no stream's prefix (${Object.entries(streams).map(([n, s]) => `${n}: ${s.tagPrefix}*`).join(", ")})`);
     }
     const cut = cl.refExists(root, `refs/tags/${tag}`);
-    const { entries, tags, problems } = collect(root, cut ? `refs/tags/${tag}` : "HEAD", streams);
-    const r = cl.renderRelease(entries, stream, tag, { pending: !cut, streamTags: tags[stream].map((t) => t.tag), prefix: streams[stream].tagPrefix });
+    const { entries, tags, reaches } = collect(root, cut ? `refs/tags/${tag}` : "HEAD", streams);
+    const r = cl.renderRelease(entries, stream, tag, { pending: !cut, streamTags: tags[stream].map((t) => t.tag), prefix: streams[stream].tagPrefix, reaches });
     process.stdout.write(r.text);
     // A release with no fragments warns and still succeeds (PM ruling on #1561):
     // a deploy is never held up by its notes.

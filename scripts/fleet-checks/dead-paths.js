@@ -219,8 +219,15 @@ function decode(s) {
   try { return decodeURIComponent(s); } catch { return s; }
 }
 
-/** A line that can begin a paragraph: not blank, a list item, a quote, a table row, an ATX heading or HTML. */
-const PARAGRAPH_LINE = (l) => l.trim() !== "" && !/^ {0,3}(?:[-*+]\s|\d+[.)]\s|>|#{1,6}(?:\s|$)|<|\|)/.test(l) && !l.includes("|");
+const LIST_ITEM = /^ {0,3}(?:[-*+]|\d+[.)])(?:\s|$)/;
+const QUOTE = /^ {0,3}>/;
+/** A table's delimiter row: dashes, colons and at least one pipe, nothing else. */
+const TABLE_DELIMITER = (l) => l.includes("|") && l.includes("-") && /^[\s|:-]+$/.test(l);
+/** The tags that open a CommonMark HTML block; any other leading tag is inline HTML in a paragraph. */
+const HTML_BLOCK = /^ {0,3}<(?:!--|\/?(?:address|article|aside|blockquote|body|details|dialog|div|dl|dt|dd|fieldset|figure|footer|form|h[1-6]|header|hr|html|li|main|nav|ol|p|pre|script|section|style|summary|table|tbody|td|tfoot|th|thead|tr|ul)(?:[\s/>]|$))/i;
+
+/** A line that can begin a paragraph: not blank, an ATX heading, an HTML block or a pipe-led table row. */
+const PARAGRAPH_LINE = (l) => l.trim() !== "" && !/^ {0,3}(?:#{1,6}(?:\s|$)|\|)/.test(l) && !HTML_BLOCK.test(l);
 
 /**
  * Every anchor a markdown source offers: deduplicated heading slugs plus
@@ -228,12 +235,14 @@ const PARAGRAPH_LINE = (l) => l.trim() !== "" && !/^ {0,3}(?:[-*+]\s|\d+[.)]\s|>
  *
  * Both heading forms count: ATX (`## Title`) and setext (a paragraph
  * underlined with `===` or `---`), which GitHub slugs the same way (#1561).
- * Three things that look like headings are not: a `#` line in a fence (fences
- * are stripped first), a YAML front-matter block's `---` fences, and a `---`
- * under a blank line, a list item or a table row, which is a rule.
+ * Things that look like headings and are not: a `#` line in a fence (fences
+ * are stripped first); YAML front matter, which opens with `---` and a `key:`
+ * line (a `---` followed by anything else is a rule); and an underline under
+ * anything but a paragraph — a blank line, a list item or a quote and their
+ * continuation lines, a table, indented code, an HTML block.
  */
 function anchorsInSource(src) {
-  const prose = src.replace(FENCE, "").replace(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, "");
+  const prose = src.replace(FENCE, "").replace(/^---\r?\n(?=[A-Za-z_][\w-]*[ \t]*:)[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, "");
   const lines = prose.split(/\r?\n/);
   const seen = new Map();
   const anchors = new Set();
@@ -245,10 +254,23 @@ function anchorsInSource(src) {
     anchors.add(n === 0 ? base : `${base}-${n}`);
   };
   let para = [];
+  // The block a non-paragraph line opened, whose following lines continue it
+  // rather than start a paragraph: a list item and a quote take lazy lines, a
+  // table its rows, an HTML block everything to the next blank line. After a
+  // blank line a list continues only on an indented line.
+  let block = null;
   for (const l of lines) {
+    if (l.trim() === "") { para = []; block = block === "list" ? "list-gap" : null; continue; }
+    if (block === "list-gap") block = /^(?: {2,}|\t)/.test(l) ? "list" : null;
     const atx = /^ {0,3}#{1,6}\s+(.+?)\s*#*\s*$/.exec(l);
-    if (atx) { add(atx[1]); para = []; continue; }
+    if (atx) { add(atx[1]); para = []; block = null; continue; }
     if (para.length && /^ {0,3}(?:=+|-+)[ \t]*$/.test(l)) { add(para.join(" ").trim()); para = []; continue; }
+    if (LIST_ITEM.test(l)) { block = "list"; para = []; continue; }
+    if (QUOTE.test(l)) { block = "quote"; para = []; continue; }
+    if (TABLE_DELIMITER(l)) { block = "table"; para = []; continue; }
+    if (HTML_BLOCK.test(l)) { block = "html"; para = []; continue; }
+    if (block) continue;
+    if (!para.length && /^(?: {4}|\t)/.test(l)) continue;   // indented code
     if (PARAGRAPH_LINE(l)) para.push(l);
     else para = [];
   }
@@ -301,11 +323,13 @@ function hashComments(src) {
 
 /**
  * Characters after which a `/` starts a regex literal rather than a division.
- * `<` and `}` are left out: in JSX they precede the `/` of a close tag
- * (`</div>`, `{x} />`), and reading those as regexes swallowed the comments
- * after them (#1561).
+ * `<` is left out: in JSX it precedes the `/` of a close tag (`</div>`). `}`
+ * is in, except before `/>`, a JSX self-close (`{x} />`).
  */
-const REGEX_PRECEDERS = new Set(["(", ",", "=", ":", "[", "!", "&", "|", "?", "{", ";", "\n", "+", "-", "*", "%", ">", "~", "^"]);
+const REGEX_PRECEDERS = new Set(["(", ",", "=", ":", "[", "!", "&", "|", "?", "{", "}", ";", "\n", "+", "-", "*", "%", ">", "~", "^"]);
+
+/** Keywords after which a `/` starts a regex: `return /x/`, `typeof /x/`. */
+const REGEX_KEYWORD = /(?:^|[^\w$.])(?:return|typeof|case|do|else|in|of|new|delete|void|throw|instanceof|yield|await)\s*$/;
 
 /**
  * The comment text of a `//` + block-comment file, per line. A small lexer
@@ -313,9 +337,11 @@ const REGEX_PRECEDERS = new Set(["(", ",", "=", ":", "[", "!", "&", "|", "?", "{
  * regex both contain `//` and neither is a comment.
  *
  * `rust` changes two rules: `'a` is a lifetime unless it closes as a char
- * literal, and `r#"…"#` is a raw string.
+ * literal, and `r#"…"#` is a raw string. `jsx` makes an apostrophe inside a
+ * word (`Don't` in JSX text) plain text, which in JS proper is a syntax error
+ * anyway; it stays off elsewhere, where C's `L'x'` is a char literal.
  */
-function slashComments(src, { rust = false } = {}) {
+function slashComments(src, { rust = false, jsx = false } = {}) {
   const out = [];
   let line = 1;
   let i = 0;
@@ -352,6 +378,7 @@ function slashComments(src, { rust = false } = {}) {
       lastSig = '"';
       continue;
     }
+    if (jsx && c === "'" && /\p{L}/u.test(src[i - 1] ?? "") && /\p{L}/u.test(n ?? "")) { i++; lastSig = c; continue; }
     if (c === '"' || c === "`" || (c === "'" && !rust) || (c === "'" && rust && /^'(?:\\.[^']{0,8}|[^\\'])'/.test(src.slice(i, i + 12)))) {
       let j = i + 1;
       while (j < src.length && src[j] !== c) {
@@ -367,7 +394,8 @@ function slashComments(src, { rust = false } = {}) {
       lastSig = c;
       continue;
     }
-    if (c === "/" && !rust && REGEX_PRECEDERS.has(lastSig)) {
+    const regexStart = REGEX_PRECEDERS.has(lastSig) ? !(lastSig === "}" && n === ">") : /\w/.test(lastSig) && REGEX_KEYWORD.test(src.slice(Math.max(0, i - 12), i));
+    if (c === "/" && !rust && regexStart) {
       let j = i + 1;
       let cls = false;
       while (j < src.length && src[j] !== "\n") {
@@ -378,8 +406,8 @@ function slashComments(src, { rust = false } = {}) {
         j++;
       }
       // No closing `/` on the line: it was a division (or a JSX tag), not a
-      // regex, so lex on from the next character. Never jump the newline:
-      // skipping it uncounted shifted every later line number (#1561).
+      // regex, so lex on from the next character. The newline stays for the
+      // top of the loop, which is what counts lines.
       if (src[j] !== "/") { i++; lastSig = "/"; continue; }
       i = j + 1;
       lastSig = "/";
@@ -394,7 +422,7 @@ function slashComments(src, { rust = false } = {}) {
 function commentsOf(file, src) {
   const syntax = commentSyntax(file);
   if (syntax === "hash") return hashComments(src);
-  if (syntax === "slash") return slashComments(src, { rust: file.endsWith(".rs") });
+  if (syntax === "slash") return slashComments(src, { rust: file.endsWith(".rs"), jsx: /\.[jt]sx$/.test(file) });
   return [];
 }
 
@@ -426,8 +454,10 @@ function pathCandidates(text) {
     if (/^\d+(?:\/\d+)+$/.test(token)) continue;                      // a fraction or a date, 3/4 or 10/28
     if (!token.includes("/")) continue;
     if (!token.split("/").some((seg) => /[^.]/.test(seg))) continue;   // `../../` names no file
-    // `actions/checkout@v7`, `pkg/name@1.2`: a pinned action or package ref, not a path (#1561).
-    if (/[^/]@[^/]*$/.test(token.split("#")[0])) continue;
+    // `actions/checkout@v7`, `pkg/name@1.2`, `org/action@<sha>`: a pinned action
+    // or package ref, not a path. Only a version, a sha or a branch after the
+    // `@` counts, so `assets/icon@2x.png` stays a path.
+    if (/[^/]@(?:v?\d+(?:\.\d+)*(?:[-+][\w.]+)?|[0-9a-f]{7,40}|main|master|latest|next)$/.test(token.split("#")[0])) continue;
     if (PLACEHOLDER.test(path.posix.basename(token.split("#")[0].replace(/\/$/, "")))) continue;
     out.push(token);
   }

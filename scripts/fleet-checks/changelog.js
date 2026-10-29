@@ -25,8 +25,9 @@
  * already records which commit each release shipped, so the tags are the
  * release history and nothing else needs writing down.
  *
- * The PR number comes from the adding commit's subject, the `(#N)` a squash
- * merge appends, so an author never writes a link that can be wrong.
+ * The PR number comes from a commit subject, the `(#N)` a squash merge
+ * appends or a merge commit's `Merge pull request #N`, so an author never
+ * writes a link that can be wrong (see fragmentAdds for which subject).
  *
  * ── STREAMS ─────────────────────────────────────────────────────────────────
  *
@@ -301,16 +302,9 @@ function fragmentPathsAt(root, ref) {
   return git(root, ["ls-tree", "-r", "--name-only", ref, "--", FRAGMENT_DIR]).split("\n").filter(isFragmentPath);
 }
 
-/**
- * The commit that added each fragment on `ref`'s first-parent line, in one log walk.
- * Newest add wins: a fragment deleted and re-added ships with the re-add.
- */
-function fragmentAdds(root, ref) {
-  // First parent only, with merges diffed against it: in a repo that merges
-  // PRs with merge commits, the add is credited to the `Merge pull request #N`
-  // commit that brought it into the branch, not to the branch commit, whose
-  // subject carries no PR number (#1561).
-  const out = git(root, ["log", ref, "--first-parent", "-m", "--diff-filter=A", "--no-renames", "--format=%x00%H%x09%s", "--name-only", "--", FRAGMENT_DIR]);
+/** Per fragment path, the newest commit in `ref`'s history that added it, as git log `extra` selects. */
+function addingCommits(root, ref, extra) {
+  const out = git(root, ["log", ref, ...extra, "--diff-filter=A", "--no-renames", "--format=%x00%H%x09%s", "--name-only", "--", FRAGMENT_DIR]);
   const adds = new Map();
   for (const chunk of out.split("\0").filter(Boolean)) {
     const [head, ...files] = chunk.split("\n").filter(Boolean);
@@ -321,7 +315,50 @@ function fragmentAdds(root, ref) {
   return adds;
 }
 
-/** Every release tag, by stream, oldest version first, with its date. */
+/** The PR of the oldest merge on the ancestry path from `sha` to `ref` whose subject names one. */
+function prOnPath(root, sha, ref) {
+  const out = git(root, ["log", "--ancestry-path", "--merges", "--reverse", "--format=%s", `${sha}..${ref}`]);
+  for (const subject of out.split("\n")) { const n = prNumber(subject); if (n) return n; }
+  return null;
+}
+
+/**
+ * Each fragment on `ref`: the commit that added it, and the PR it came in with.
+ *
+ * `sha` is the authoring commit, merges left out, because a tag ships a
+ * fragment exactly when its history contains that commit, whichever merge
+ * carried it there. A merge commit is the wrong one to judge by: a branch that
+ * merged `main` into itself credits the add to that merge, which no tag on
+ * `main` contains. An add made only inside a merge has no authoring commit and
+ * falls back to the merge.
+ *
+ * `pr` is the first PR number found in: the first-parent commit that brought
+ * the add into `ref` (a squash's `(#N)`, a `Merge pull request #N`), then the
+ * authoring commit, then the oldest PR merge on the ancestry path from it to
+ * `ref`. The last covers the branch that merged `main`: its own merge names no
+ * PR, and the path still passes through `main`'s.
+ *
+ * Newest add wins: a fragment deleted and re-added ships with the re-add.
+ */
+function fragmentAdds(root, ref) {
+  const authored = addingCommits(root, ref, ["--no-merges"]);
+  const credited = addingCommits(root, ref, ["--first-parent", "-m"]);
+  const adds = new Map();
+  for (const [p, credit] of credited) {
+    const own = authored.get(p) ?? credit;
+    adds.set(p, { sha: own.sha, pr: prNumber(credit.subject) ?? prNumber(own.subject) ?? prOnPath(root, own.sha, ref) });
+  }
+  return adds;
+}
+
+/** The tag names `ref`'s history contains, itself included when it is a tag. */
+const tagsMergedInto = (root, ref) => new Set(git(root, ["tag", "--merged", ref]).split("\n").filter(Boolean));
+
+/**
+ * Every release tag, by stream, oldest version first, with its date. A stable
+ * tag also carries `reaches`, the tags its history contains, which decides
+ * the pre-releases its notes take in (see releaseEntries).
+ */
 function streamTags(root, streams) {
   const out = git(root, ["for-each-ref", "--format=%(refname:strip=2)%09%(creatordate:short)", "refs/tags"]);
   const by = Object.fromEntries(Object.keys(streams).map((s) => [s, []]));
@@ -330,15 +367,14 @@ function streamTags(root, streams) {
     const s = tagStream(tag, streams);
     if (s) by[s].push({ tag, date });
   }
-  for (const s of Object.keys(by)) by[s].sort((a, b) => compareVersions(a.tag.slice(streams[s].tagPrefix.length), b.tag.slice(streams[s].tagPrefix.length)));
+  for (const s of Object.keys(by)) {
+    const prefix = streams[s].tagPrefix;
+    by[s].sort((a, b) => compareVersions(a.tag.slice(prefix.length), b.tag.slice(prefix.length)));
+    for (const t of by[s]) if (!isPrerelease(t.tag, prefix)) t.reaches = tagsMergedInto(root, `refs/tags/${t.tag}`);
+  }
   return by;
 }
 
-/**
- * Gather every fragment at `ref` with its PR and, per stream, its release.
- * An invalid fragment is returned in `problems` and left out: the PR check is
- * where it is refused, and a release body is no place to stop a deploy.
- */
 /**
  * The first tag, in version order, whose history contains each wanted commit.
  *
@@ -346,13 +382,20 @@ function streamTags(root, streams) {
  * printed only by the first tag that reaches it, and the cost grows with tags
  * rather than with fragments × tags (#1561). Deliberately NOT path-limited:
  * history simplification would drop a merge commit that is TREESAME to the
- * branch it merged, and that merge is the commit `fragmentAdds` credits.
+ * branch it merged, and a merge is what `fragmentAdds` falls back to.
+ *
+ * One walk over every tag first finds which wanted commits any tag contains,
+ * so the per-tag loop stops once those are placed instead of walking every
+ * tag for an unreleased fragment.
  */
 function firstContainingTags(root, sortedTags, wanted) {
   const first = new Map();
+  if (!sortedTags.length) return first;
+  const tagged = git(root, ["rev-list", "--stdin"], { input: `${sortedTags.join("\n")}\n` }).split("\n").filter((sha) => wanted.has(sha));
+  const reachable = new Set(tagged);
   const prior = [];
   for (const tag of sortedTags) {
-    if (first.size === wanted.size) break;
+    if (first.size === reachable.size) break;
     const input = `${[tag, ...prior.map((t) => `^${t}`)].join("\n")}\n`;
     for (const sha of git(root, ["rev-list", "--stdin"], { input }).split("\n")) {
       if (wanted.has(sha) && !first.has(sha)) first.set(sha, tag);
@@ -386,9 +429,10 @@ function collect(root, { ref = "HEAD", streams }) {
     const add = adds.get(fragment.path);
     const releases = {};
     for (const s of fragment.ships) releases[s] = add ? firstBy[s].get(add.sha) ?? null : null;
-    return { ...fragment, sha: add?.sha ?? null, pr: add ? prNumber(add.subject) : null, releases };
+    return { ...fragment, sha: add?.sha ?? null, pr: add?.pr ?? null, releases };
   });
-  return { entries, tags, problems };
+  // `reaches` for the release being cut at `ref`, whose tag may not exist yet.
+  return { entries, tags, problems, reaches: tagsMergedInto(root, ref) };
 }
 
 // ── rendering ───────────────────────────────────────────────────────────────
@@ -417,15 +461,27 @@ function renderSections(entries) {
  * (#1561). A pending (uncut) tag follows the same rule, with unreleased
  * entries as its own.
  *
+ * Both the previous stable tag and the pre-releases are counted only when the
+ * release's history contains them (`reaches`): version order alone would hand
+ * `v1.1.0` a `v1.0.1-rc.1` cut on a maintenance branch it never merged.
+ *
+ * `prefix` and `reaches` have no defaults. A defaulted "" prefix reads every
+ * stable tag of a hyphenated stream (`desktop-v1.1.0`) as a pre-release.
+ *
  * @param {string[]} streamTags the stream's cut tags, oldest version first
+ * @param {Set<string>} reaches the tags `tag`'s history contains (collect's `reaches` for one not yet cut)
  */
-function releaseEntries(entries, stream, tag, { pending = false, streamTags = [], prefix = "" } = {}) {
+function releaseEntries(entries, stream, tag, { pending = false, streamTags = [], prefix, reaches } = {}) {
   const ships = entries.filter((e) => e.ships.includes(stream));
   const own = (e) => (pending ? e.releases[stream] === null : e.releases[stream] === tag);
-  if (tag === null || isPrerelease(tag, prefix)) return ships.filter(own);
+  if (tag === null) return ships.filter(own);
+  if (typeof prefix !== "string") throw new TypeError(`releaseEntries(${tag}): pass the stream's tag prefix`);
+  if (isPrerelease(tag, prefix)) return ships.filter(own);
+  if (!(reaches instanceof Set)) throw new TypeError(`releaseEntries(${tag}): pass reaches, the tags its history contains`);
   const v = (t) => t.slice(prefix.length);
-  const prevStable = streamTags.filter((t) => !isPrerelease(t, prefix) && compareVersions(v(t), v(tag)) < 0).pop() ?? null;
-  const since = new Set(streamTags.filter((t) => compareVersions(v(t), v(tag)) < 0 && (prevStable === null || compareVersions(v(t), v(prevStable)) > 0)));
+  const before = streamTags.filter((t) => reaches.has(t) && compareVersions(v(t), v(tag)) < 0);
+  const prevStable = before.filter((t) => !isPrerelease(t, prefix)).pop() ?? null;
+  const since = new Set(before.filter((t) => prevStable === null || compareVersions(v(t), v(prevStable)) > 0));
   return ships.filter((e) => own(e) || since.has(e.releases[stream]));
 }
 
@@ -448,7 +504,7 @@ function renderChangelog({ entries, tags, streams, only = null, legacy = false }
     const unreleased = renderRelease(entries, s, null, { pending: true });
     if (unreleased.count) out.push(`## Unreleased${label}`, "", unreleased.text);
     for (const { tag, date } of [...tags[s]].reverse()) {
-      const r = renderRelease(entries, s, tag, { streamTags: streamTagNames, prefix });
+      const r = renderRelease(entries, s, tag, { streamTags: streamTagNames, prefix, reaches: tags[s].find((t) => t.tag === tag).reaches });
       if (!r.count) continue;
       out.push(`## ${tag}${label} — ${date}`, "", r.text);
     }
@@ -459,7 +515,7 @@ function renderChangelog({ entries, tags, streams, only = null, legacy = false }
 
 module.exports = {
   FRAGMENT_DIR, TYPES, isFragmentPath, parseShips, parseFragment,
-  frontmatterValue, tagStream, compareVersions, isPrerelease, prNumber, inStream, isDocsOnly, OPT_OUT, optOutOf, evaluatePr,
+  frontmatterValue, tagStream, compareVersions, isPrerelease, prNumber, inStream, isDocsOnly, optOutOf, evaluatePr,
   refExists, prChanges, showAt, fragmentPathsAt, fragmentAdds, streamTags, firstContainingTags, collect,
   entryLine, renderSections, releaseEntries, renderRelease, renderChangelog,
 };
