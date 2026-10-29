@@ -13,6 +13,8 @@ the fleet's **reusable workflows**.
 | `.github/workflows/autoclose-guard.yml` | **Reusable**. **Fails** when what a PR *declares* it closes differs from what GitHub *registered* — in either direction (#942). A close is declared by a closing keyword on a line of its own (`Closes #N`, `Closes owner/repo#N`) and by nothing else; write nothing and the PR declares it closes nothing. Red, and **never a required check**: it does not block a merge. |
 | `scripts/autoclose-guard/` | Pure decision logic for the above, plus its `node --test` suite. |
 | `.github/workflows/guard-own-prs.yml` | **This repo's own caller** of the guard above (#911). It uses `uses: ./…` **and passes `logic_ref: github.sha`**, so a PR that changes the guard runs its own version of both halves on itself: the workflow file and the predicate it loads come from the same commit (on `pull_request`, the test-merge commit). ⚠️ Until #942 only the workflow half was the PR's; the predicate still came from `main`, so a PR changing both crashed on itself. No other caller passes `logic_ref`. Until this caller existed, the repo where guard changes land was the one fleet repo the guard never checked. |
+| `.github/workflows/fleet-checks.yml` | **Reusable**. On a pull request, the **changelog fragment check** and the **dead-path ratchet** (#1561, the D7 and D8 rulings on #1555). |
+| `scripts/fleet-checks/` | The two checks, the changelog generator and their CLI, plus `node --test` suites. ⚠️ **Published here byte for byte from the operations repo's `scripts/fleet-checks/` by its `publish.sh` — never hand-edit them here**: the next publish erases the edit. They live here because this is where they execute. |
 | `actions/publish-update-feed/` | **Composite action.** Uploads release payloads + an optional manifest to S3-compatible object storage, then verifies the feed from the public URL a client reads. |
 | `.github/workflows/tests.yml` | This repo's CI: the `node --test` suite, plus the structural check that every workflow here parses and every job carries `timeout-minutes` (#587). |
 
@@ -141,6 +143,59 @@ status surface, and the comment explains it.
   measured.
 - **Not covered:** a closing keyword that arrives in a commit message folded into a squash
   merge. It registers at merge time, after every check has run.
+
+## Calling the fleet checks
+
+Drop this in a consuming repo as `.github/workflows/fleet-checks.yml`:
+
+```yaml
+name: fleet checks
+on:
+  pull_request:
+    # `edited` is what re-runs the check when a `Changelog: none` line is added to the body.
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+jobs:
+  checks:
+    uses: owenrenn/.github/.github/workflows/fleet-checks.yml@main
+```
+
+Node is installed by the shared body, so a repo in any language needs nothing else in CI. Two
+files in the caller shape what the checks do, both optional:
+
+| File | What it holds |
+|---|---|
+| `.github/fleet-checks.json` | Release **streams**, each with a tag prefix and the paths that ship in it (none declared: one stream, `v*`, every path); dead-path **exemptions**, each with a `why`; **`foreignNames`**, the names of other repos the caller's comments cite, so a line naming one is not judged. Unknown keys are refused. |
+| `.github/dead-paths-baseline.json` | The dead-path counts per file the repo had when it adopted the check. **Write it with the CLI, never by hand**: `node <checkout of this repo>/scripts/fleet-checks/cli.js dead-paths --write-baseline`. |
+
+**A fragment**, one per PR, at `changelog.d/<issue>-<slug>.md`:
+
+```markdown
+---
+type: fixed          # added | changed | fixed | removed
+ships: desktop       # a stream name, a list, `all`, or `both`; required only with two or more streams
+---
+The panel reconnects after the machine wakes.
+```
+
+- **No fragment is ever assembled into a committed file.** A fragment's release, per stream, is
+  the first tag *of that stream's prefix* containing the commit that added it, and its PR number
+  is the `(#N)` the squash merge appended to that commit. `cli.js changelog release <tag>`
+  renders one release's body (a tag not cut yet renders what would ship); `cli.js changelog
+  print` prints the whole changelog. A release with no fragments warns and exits 0.
+- **The opt-out is a line in the PR body**, `Changelog: none — <why>`, for a change no user of
+  the repo can see. Docs-only PRs (every path under `docs/` or ending `.md`) and PRs opened by a
+  `[bot]` account are not asked for a fragment.
+- ⚠️ **The dead-path check is a ratchet, in both directions.** A new dead path fails. A fixed one
+  fails too, until the baseline is regenerated in the same PR, so the baseline stays a true
+  record rather than a ceiling. A count is per file: fixing one dead path and adding another in
+  the same file nets to zero and passes.
+- ⚠️ **`edited` is required in the stub's `types:`**, or adding the opt-out line never re-runs
+  the check and the row stays red.
+
+The CLI's exit codes are its contract: **0** clean, **1** findings, **2** could not run (a bad
+argument, a bad config, a git failure). A release script reads them the same way CI does.
 
 ## Calling the update-feed publisher
 
@@ -272,7 +327,7 @@ stub comment for why.
   exists and is inert, including the audience it declares: none of the audience semantics
   described above ever run against this repo. Adding or editing that row changes nothing —
   the filter is a layer below it. Tracked as #473.
-- Run `node --test scripts/card-shark-sync/*.test.js` before pushing.
+- Run `node --test scripts/*/*.test.js` before pushing — every suite `tests.yml` runs.
 - ⚠️ **A bound set here is the fleet's only bound.** A caller job that invokes a
   reusable workflow with `uses:` cannot carry `timeout-minutes` — GitHub permits only
   `name`/`uses`/`with`/`secrets`/`needs`/`if`/`permissions` on it — so every stub in the
