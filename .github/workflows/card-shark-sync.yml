@@ -97,17 +97,23 @@ jobs:
     # job there is -- and overage BILLS rather than stopping at a wall, so an
     # unbounded stall here spends money quietly instead of failing loudly.
     #
-    # 10 minutes is ~25x the observed max (p50 9s, p90 19s, max 24s over 100
-    # runs) and matches the bound every other job in the fleet carries. It is a
-    # ceiling on a stall, not a budget -- the paging loop's own maxPages cap is
-    # what bounds the expected path.
+    # 15 minutes, above the fleet's usual 10, because this job's legitimate
+    # worst case is not its typical run (p50 9s, p90 19s, max 24s over 100
+    # runs). The remove path's board read retries through a batch sweep
+    # (RETRY_BUDGET in sync.js): up to five full board reads, each about half a
+    # minute at a thousand-plus items and slower under the very load that causes
+    # the retries, plus jittered waits of up to about five minutes. That is about
+    # eight minutes before any slowdown, which leaves a 10-minute ceiling too
+    # little room, and a run killed mid-retry strands its card exactly as a failed
+    # read does. It is still a ceiling on a stall, not a budget -- the paging
+    # loop's maxPages cap and the retry budget bound the expected path.
     #
     # WHY the bound is HERE and not in each caller: a job that invokes a
     # reusable workflow with `uses:` cannot set timeout-minutes -- GitHub
     # permits only name/uses/with/secrets/needs/if/permissions on such a job and
     # rejects the workflow outright otherwise (verified with actionlint 1.7.7,
     # not assumed). So every stub in the fleet is bounded by this one line.
-    timeout-minutes: 10
+    timeout-minutes: 15
     # Every write in this job goes through the PAT below, not GITHUB_TOKEN --
     # this is the one permission a caller of a REUSABLE workflow cannot see, so
     # it stays minimal here rather than inheriting whatever the caller granted.
@@ -389,8 +395,14 @@ jobs:
             // independent, and a mismatch between them -- a recreated or
             // renumbered board -- fails loudly here instead of silently paging the
             // wrong board and reporting every removal `absent` forever.
+            //
+            // rateLimit is what readBoard's retry floor reads (RETRY_BUDGET.
+            // minRemaining in sync.js). Selecting it costs nothing: the query
+            // still costs 1 point a page with it. A response without it reads
+            // as a spent budget, so removing it silently ends every retry.
             const BOARD_QUERY = `
               query($cursor: String) {
+                rateLimit { remaining resetAt }
                 user(login: "owenrenn") {
                   projectV2(number: 5) {
                     id
@@ -425,11 +437,15 @@ jobs:
             // single-digit number of pages. Hitting 20 means the cursor stopped
             // advancing, on a workflow that fires on every label event across
             // the whole fleet -- left unbounded this loops to the job timeout.
+            //
+            // The retry budget is NOT passed here: sync.js's RETRY_BUDGET is the
+            // one place it is set, its request arithmetic is written there, and
+            // the suite asserts both the budget and that this call leaves it
+            // alone. The job's timeout-minutes is sized against it.
             const board = await readBoard({
               runQuery: (cursor) => github.graphql(BOARD_QUERY, { cursor }),
               projectId: PROJECT_ID,
               maxPages: 20,
-              maxAttempts: 3,
             });
 
             // ⚠️ ALLOWLIST, NOT A BLOCKLIST, and the distinction is the whole
@@ -461,6 +477,15 @@ jobs:
                 "inconsistent":
                   `board read never settled: received ${board.received} of ${board.declared} ` +
                   `after ${board.attempts} attempts (${board.reason}) — refusing to conclude absence`,
+                // The same refusal, reached early: the read was retryable but
+                // the hourly GraphQL budget was under the retry floor, or
+                // unmeasured. The card stays on the board until the daily
+                // reconcile reports it orphaned, which is the backstop for this.
+                "budget-low":
+                  `board read not retried: ${board.reason} after ${board.attempts} attempt(s), and the ` +
+                  `GraphQL budget has ${board.remaining === null ? "an unmeasured amount" : `${board.remaining} points`} left ` +
+                  `(floor ${board.minRemaining}, resets ${board.resetAt || "at an unknown time"}) — ` +
+                  `refusing to conclude absence; the daily reconcile will report this card as orphaned`,
               }[board.status] || `board read returned an unhandled status: ${board.status}`;
               core.setFailed(detail);
               return;

@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const { decideAction, isPmLabel } = require("./sync.js");
-const { resolveRemoval, datesOf, preservationComment, readBoard } = require("./sync.js");
+const { resolveRemoval, datesOf, preservationComment, readBoard, RETRY_BUDGET, retryDelay } = require("./sync.js");
 
 test("any pm:-prefixed label counts, including one not yet in canon", () => {
   // WHY prefix rather than a derived set: reconcile.js derives the pm:* set from
@@ -452,6 +452,10 @@ test("the reusable workflow declares its contract: workflow_call + a required au
 // order; one entry per call. Deliberately NOT a copy of the real query -- these
 // tests are about paging and retry arithmetic, not about the GraphQL selection
 // (which the WORKFLOW_CODE text assertions above cover).
+// A budget well above the retry floor. Every fixture a retry follows carries
+// one: a response without rateLimit reads as a spent budget and ends the retry.
+const FULL_BUDGET = { remaining: 5000, resetAt: "2030-01-01T00:00:00Z" };
+
 function fakePager(attemptsPages, { projectId = "PVT_test" } = {}) {
   let attempt = -1;
   let page = 0;
@@ -471,6 +475,7 @@ function fakePager(attemptsPages, { projectId = "PVT_test" } = {}) {
       const p = pages[page];
       page = page + 1 >= pages.length ? 0 : page + 1;
       return {
+        rateLimit: FULL_BUDGET,
         user: {
           projectV2: {
             id: projectId,
@@ -594,7 +599,7 @@ test("a cursor that stops advancing is truncated, not retried forever", async ()
   assert.equal(r.status, "truncated");
   // Pins the BYPASS, not just the status. Letting truncation fall into the retry
   // loop would still yield status "truncated" (from the final attempt) with this
-  // assertion absent -- green, while spending two extra full board reads and the
+  // assertion absent -- green, while spending every remaining full board read and the
   // backoff on a cursor that is never going to advance.
   assert.equal(r.attempts, 1);
 });
@@ -623,12 +628,14 @@ test("a query that THROWS is retried, not aborted", async () => {
   // same transient class, and the likelier one. A 502 or a secondary rate limit
   // on a later page aborted the entire read, went red, and left the label
   // removed with the board item still present. github-script does not retry
-  // GraphQL by default, so nothing underneath covered it either.
+  // GraphQL by default, so nothing underneath covered it either. The throw
+  // lands on page 2, after page 1 measured the budget: a throw carries no
+  // rateLimit of its own.
   let n = 0;
-  const runQuery = async () => {
-    if (++n === 1) throw new Error("502 Bad Gateway");
-    return { user: { projectV2: { id: "PVT_test", items: {
-      totalCount: 1, nodes: [item(1)], pageInfo: { hasNextPage: false },
+  const runQuery = async (cursor) => {
+    if (++n === 2) throw new Error("502 Bad Gateway");
+    return { rateLimit: FULL_BUDGET, user: { projectV2: { id: "PVT_test", items: {
+      totalCount: 2, nodes: [item(n)], pageInfo: { hasNextPage: !cursor, endCursor: "c1" },
     }}}};
   };
   const r = await readBoard({ runQuery, projectId: "PVT_test", sleep: async () => {} });
@@ -636,14 +643,33 @@ test("a query that THROWS is retried, not aborted", async () => {
   assert.equal(r.attempts, 2);
 });
 
-test("a query that throws on EVERY attempt still fails, and names the cause", async () => {
+test("a query that throws on EVERY later request still fails, and names the cause", async () => {
   // The retry must not swallow a persistent failure into a confident answer.
-  const runQuery = async () => { throw new Error("401 Unauthorized"); };
+  let n = 0;
+  const runQuery = async () => {
+    if (++n > 1) throw new Error("401 Unauthorized");
+    return { rateLimit: FULL_BUDGET, user: { projectV2: { id: "PVT_test", items: {
+      totalCount: 2, nodes: [item(1)], pageInfo: { hasNextPage: true, endCursor: "c1" },
+    }}}};
+  };
   const r = await readBoard({
     runQuery, projectId: "PVT_test", maxAttempts: 2, sleep: async () => {},
   });
   assert.equal(r.status, "inconsistent");
   assert.match(r.reason, /401 Unauthorized/);
+});
+
+test("a throw before any response has measured the budget is not retried", async () => {
+  // Nothing has reported the hourly budget, so it reads as spent (fail-closed).
+  // The first read still ran; only the retry is withheld, and the cause is
+  // named rather than lost.
+  let calls = 0;
+  const runQuery = async () => { calls++; throw new Error("502 Bad Gateway"); };
+  const r = await readBoard({ runQuery, projectId: "PVT_test", sleep: async () => {} });
+  assert.equal(r.status, "budget-low");
+  assert.equal(r.remaining, null);
+  assert.match(r.reason, /502 Bad Gateway/);
+  assert.equal(calls, 1);
 });
 
 test("a missing totalCount is a broken response, not a race", async () => {
@@ -668,8 +694,8 @@ test("a project that vanishes MID-read is retried, not reported as unresolvable"
   let n = 0;
   const runQuery = async (cursor) => {
     n++;
-    if (n === 2) return { user: { projectV2: null } };       // page 2 of attempt 1
-    return { user: { projectV2: { id: "PVT_test", items: {
+    if (n === 2) return { rateLimit: FULL_BUDGET, user: { projectV2: null } };       // page 2 of attempt 1
+    return { rateLimit: FULL_BUDGET, user: { projectV2: { id: "PVT_test", items: {
       totalCount: 2,
       nodes: [item(n)],
       pageInfo: { hasNextPage: !cursor, endCursor: "c1" },
@@ -697,7 +723,7 @@ test("retry backoff is jittered, so correlated runs do not re-read in lockstep",
   // random draws must produce two different delays.
   const delays = [];
   const runQuery = async () => ({
-    user: { projectV2: { id: "PVT_test", items: {
+    rateLimit: FULL_BUDGET, user: { projectV2: { id: "PVT_test", items: {
       totalCount: 9, nodes: [], pageInfo: { hasNextPage: false },
     }}},
   });
@@ -715,6 +741,91 @@ test("retry backoff is jittered, so correlated runs do not re-read in lockstep",
   });
   assert.notDeepEqual(lo, delays);
   assert.ok(lo.every((d, i) => d < delays[i]));
+});
+
+// --- The retry budget (#1571) -----------------------------------------------
+//
+// A batch sweep lasts minutes, and every read overlapping it mismatches, so a
+// budget of a few seconds' spread failed those runs and stranded their cards
+// until the daily reconcile. The budget is few attempts (each is a full paged
+// read against a shared hourly request budget) and long waits (free). These
+// pin both halves, and the timeout the worst case has to fit inside.
+
+const persistentMismatch = (budgets = [FULL_BUDGET]) => {
+  let calls = 0;
+  return {
+    calls: () => calls,
+    run: async () => {
+      calls++;
+      const b = budgets[Math.min(calls, budgets.length) - 1];
+      return { ...(b === undefined ? {} : { rateLimit: b }), user: { projectV2: { id: "PVT_test", items: {
+        totalCount: 9, nodes: [], pageInfo: { hasNextPage: false },
+      }}}};
+    },
+  };
+};
+
+async function delaysAt(randomValue) {
+  const delays = [];
+  const q = persistentMismatch();
+  await readBoard({
+    runQuery: q.run, projectId: "PVT_test",
+    sleep: async (ms) => { delays.push(ms); }, random: () => randomValue,
+  });
+  return delays;
+}
+
+test("the retry budget is five attempts, a 15s base doubling to a 90s cap, and a 1,000-point floor", () => {
+  assert.deepEqual({ ...RETRY_BUDGET }, { maxAttempts: 5, backoffMs: 15000, maxBackoffMs: 90000, minRemaining: 1000 });
+});
+
+test("by default a read that never settles makes exactly five attempts, and no more requests", async () => {
+  // Attempts are the cost: each is a full paged read. Ten would put a sweep's
+  // worth of concurrent runs over the token's hourly budget.
+  const q = persistentMismatch();
+  const r = await readBoard({ runQuery: q.run, projectId: "PVT_test", sleep: async () => {} });
+  assert.equal(r.status, "inconsistent");
+  assert.equal(r.attempts, 5);
+  assert.equal(q.calls(), 5);
+});
+
+test("the default waits are 15s, 30s, 60s and 90s at the jitter midpoint", async () => {
+  // About three and a quarter minutes in all: long enough that the last read
+  // lands after a sweep of a few dozen removals has ended.
+  assert.deepEqual(await delaysAt(0.5), [15000, 30000, 60000, 90000]);
+});
+
+test("jitter spans half to one-and-a-half of the base, and the cap binds the BASE, not the delay", async () => {
+  // The top of the last wait is 135s, above the 90s cap. Capping the delay
+  // instead would pin every high draw to exactly 90s, and the runs a sweep
+  // started together would wake together on the retry most likely to succeed.
+  assert.deepEqual(await delaysAt(0), [7500, 15000, 30000, 45000]);
+  assert.deepEqual(await delaysAt(1), [22500, 45000, 90000, 135000]);
+});
+
+test("retryDelay doubles until the cap and then holds the base there", () => {
+  const opts = { backoffMs: 15000, maxBackoffMs: 90000, random: () => 0.5 };
+  assert.deepEqual([1, 2, 3, 4, 5, 6].map((a) => retryDelay(a, opts)), [15000, 30000, 60000, 90000, 90000, 90000]);
+});
+
+test("the workflow leaves the retry budget to the module", () => {
+  // An override in the call would make every assertion above describe a
+  // budget production does not use.
+  assert.ok(!/maxAttempts|backoffMs|maxBackoffMs/.test(WORKFLOW_CODE));
+});
+
+test("the worst-case retry path fits inside the job's timeout with margin", async () => {
+  // Every jitter draw at the top, plus a full read per attempt at a generous
+  // minute each (a read is about half a minute at the board's current size, and
+  // slower under the load that causes the retries), must leave a quarter of the
+  // timeout spare. A run killed mid-retry strands its card exactly as a failed
+  // read does.
+  const timeouts = [...WORKFLOW_CODE.matchAll(/timeout-minutes:\s*(\d+)/g)].map((m) => Number(m[1]));
+  assert.equal(timeouts.length, 1, "expected exactly one job timeout in the sync workflow");
+  const worstWaitMs = (await delaysAt(1)).reduce((a, b) => a + b, 0);
+  const worstMs = worstWaitMs + RETRY_BUDGET.maxAttempts * 60000;
+  assert.ok(worstMs <= timeouts[0] * 60000 * 0.75,
+    `worst case ${worstMs / 1000}s does not leave a quarter of ${timeouts[0]} minutes spare`);
 });
 
 test("the workflow proceeds ONLY on an explicit ok status", () => {
@@ -929,4 +1040,87 @@ test("the gate evaluator refuses anything outside its grammar", () => {
   assert.throws(() => evalGate("github.event.sender.login == 'x'", ctx), /unknown context path/);
   assert.throws(() => evalGate("endsWith(github.event.action, 'x')", ctx), /unknown function/);
   assert.throws(() => evalGate("github.event.action != 'x'", ctx), /unexpected input|trailing/);
+});
+
+// --- The retry floor (#1571) ------------------------------------------------
+//
+// The hourly GraphQL budget belongs to the token's user and is shared with
+// every other token that user holds. Under RETRY_BUDGET.minRemaining a run
+// makes its one read and stops, which bounds the valve's spend whatever the
+// board size.
+
+const atBudget = (remaining) => ({ remaining, resetAt: "2030-01-01T00:00:00Z" });
+
+test("below the floor a retryable read is not retried, and says what is left", async () => {
+  let slept = 0;
+  const q = persistentMismatch([atBudget(999)]);
+  const r = await readBoard({ runQuery: q.run, projectId: "PVT_test", sleep: async () => { slept++; } });
+  assert.equal(r.status, "budget-low");
+  assert.equal(r.attempts, 1);
+  assert.equal(q.calls(), 1);
+  assert.equal(slept, 0);
+  assert.equal(r.remaining, 999);
+  assert.equal(r.minRemaining, 1000);
+  assert.equal(r.resetAt, "2030-01-01T00:00:00Z");
+  assert.equal(r.reason, "count mismatch");
+  assert.equal(r.received, 0);
+  assert.equal(r.declared, 9);
+});
+
+test("at the floor the retry still happens", async () => {
+  const q = persistentMismatch([atBudget(1000)]);
+  const r = await readBoard({ runQuery: q.run, projectId: "PVT_test", sleep: async () => {} });
+  assert.equal(r.status, "inconsistent");
+  assert.equal(q.calls(), 5);
+});
+
+test("a response without rateLimit counts as a spent budget: no retry", async () => {
+  // Fail-closed. An unmeasured budget is not a spendable one.
+  const q = persistentMismatch([undefined]);
+  const r = await readBoard({ runQuery: q.run, projectId: "PVT_test", sleep: async () => {} });
+  assert.equal(r.status, "budget-low");
+  assert.equal(r.remaining, null);
+  assert.equal(q.calls(), 1);
+});
+
+test("a rateLimit without a numeric remaining counts as a spent budget too", async () => {
+  const q = persistentMismatch([{ resetAt: "2030-01-01T00:00:00Z" }]);
+  const r = await readBoard({ runQuery: q.run, projectId: "PVT_test", sleep: async () => {} });
+  assert.equal(r.status, "budget-low");
+  assert.equal(q.calls(), 1);
+});
+
+test("the floor reads the LATEST response, so a budget that drops mid-run stops the retries", async () => {
+  const q = persistentMismatch([FULL_BUDGET, FULL_BUDGET, atBudget(400)]);
+  const r = await readBoard({ runQuery: q.run, projectId: "PVT_test", sleep: async () => {} });
+  assert.equal(r.status, "budget-low");
+  assert.equal(r.attempts, 3);
+  assert.equal(r.remaining, 400);
+});
+
+test("the first read is never skipped for budget, and a settled read is ok at any budget", async () => {
+  const f = { calls: 0 };
+  const runQuery = async () => {
+    f.calls++;
+    return { rateLimit: atBudget(0), user: { projectV2: { id: "PVT_test", items: {
+      totalCount: 1, nodes: [item(1)], pageInfo: { hasNextPage: false },
+    }}}};
+  };
+  const r = await readBoard({ runQuery, projectId: "PVT_test", sleep: async () => {} });
+  assert.equal(r.status, "ok");
+  assert.equal(f.calls, 1);
+});
+
+test("the board query selects rateLimit { remaining resetAt } at the top level", () => {
+  // Without it every response reads as a spent budget and no read is ever
+  // retried -- silently, since that path refuses rather than errors.
+  assert.match(WORKFLOW_CODE, /query\(\$cursor: String\) \{\s*rateLimit \{ remaining resetAt \}\s*user\(login:/);
+});
+
+test("the workflow maps budget-low to a refusal, never to the removal path", () => {
+  // The verdict mapping is an allowlist on `ok`, so budget-low already fails;
+  // it also gets its own message naming the budget left and the reset time.
+  const failBlock = WORKFLOW_CODE.slice(WORKFLOW_CODE.indexOf('if (board.status !== "ok")'));
+  assert.match(failBlock, /"budget-low":[\s\S]*?board\.remaining[\s\S]*?board\.resetAt[\s\S]*?refusing to conclude absence/);
+  assert.ok(failBlock.indexOf('"budget-low"') < failBlock.indexOf("core.setFailed(detail)"));
 });

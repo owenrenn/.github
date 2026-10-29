@@ -147,7 +147,8 @@ function datesOf(boardNode) {
  * pair on ONE issue) and is deliberately left alone.
  *
  * `runQuery(cursor)` returns the raw GraphQL response; `sleep` and the bounds
- * are injected so the suite can exercise the retry without waiting on it.
+ * are injected so the suite can exercise the retry without waiting on it. The
+ * retry budget's defaults are RETRY_BUDGET, below.
  *
  * ⚠️ THERE IS A SECOND IMPLEMENTATION OF THIS READ, and it is not in this repo.
  * The operations repo's escalation reconciler pages the same board and applies
@@ -163,16 +164,72 @@ function datesOf(boardNode) {
  * next person needs to be told. Fixing anything below WITHOUT checking the port
  * is how #491 happened.
  */
+
+/**
+ * The retry budget for a count-mismatched or thrown board read (#1571).
+ *
+ * The attempts stay FEW and the waits grow LONG, because only an attempt costs
+ * requests. Every attempt is a full paged read: at 100 items a page, a board
+ * of a thousand-plus items is a dozen-plus GraphQL requests, measured at one
+ * rate-limit point each. The 5,000-point hourly budget belongs to the token's
+ * USER, so every token that user holds spends from it: this workflow, the
+ * operations repo's scanners, the dashboard and local agents. The busiest hour
+ * runs a few dozen valve runs, so
+ *
+ *   a few dozen runs x 5 attempts x a dozen-plus pages = a few thousand points,
+ *
+ * most of the budget at today's board size, and all of it once the board grows
+ * toward the page cap. Waiting costs nothing; attempts are what spend it.
+ *
+ * So `minRemaining` is a floor under the retries: a retry is scheduled only
+ * while the latest response reports at least that many points left. That bounds
+ * the valve's spend whatever the board size: under the floor a run makes its
+ * one read and stops. The check is per run and not atomic, so concurrent runs
+ * can each pass it and overshoot by up to one read apiece -- a few dozen runs
+ * times a dozen-plus pages is several hundred points, and 1,000 sits above that.
+ * The FIRST attempt is never skipped for budget: the floor only stops retries.
+ *
+ * The waits exist to outlast a sweep: a few dozen removals take about three
+ * minutes, and every read that overlaps one of them mismatches. The base waits
+ * double from `backoffMs` to `maxBackoffMs` (15s, 30s, 60s, 90s), so the four
+ * waits sum to about three and a quarter minutes and the fifth read lands after
+ * the sweep has ended. The worst case, every draw at the top of its jitter, is
+ * 1.5 x that, about five minutes; the job's timeout-minutes is sized against it.
+ */
+const RETRY_BUDGET = Object.freeze({ maxAttempts: 5, backoffMs: 15000, maxBackoffMs: 90000, minRemaining: 1000 });
+
+/**
+ * The wait after failed attempt `attempt` (1-based): the capped base, scaled
+ * by a jitter draw in [0.5, 1.5).
+ *
+ * The cap applies to the BASE, never to the jittered delay. Capping the delay
+ * would pin every draw above the cap to exactly the cap, and the runs a sweep
+ * started together would wake together on the last wait, the one most likely to
+ * succeed. The spread on each wait is as wide as the wait itself, as full jitter's
+ * is, and the 0.5 floor keeps a run from retrying straight back into the sweep.
+ */
+function retryDelay(attempt, { backoffMs, maxBackoffMs, random }) {
+  const base = Math.min(maxBackoffMs, backoffMs * 2 ** (attempt - 1));
+  return Math.round(base * (0.5 + random()));
+}
+
 async function readBoard({
   runQuery,
   projectId,
   maxPages = 20,
-  maxAttempts = 3,
+  maxAttempts = RETRY_BUDGET.maxAttempts,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-  backoffMs = 2000,
+  backoffMs = RETRY_BUDGET.backoffMs,
+  maxBackoffMs = RETRY_BUDGET.maxBackoffMs,
+  minRemaining = RETRY_BUDGET.minRemaining,
   random = Math.random,
 }) {
   let last = null;
+  // The hourly budget as the LATEST response reported it, or null when that
+  // response carried no rateLimit or no response has arrived yet. Null reads as
+  // spent: an unmeasured budget is not a spendable one. A throw carries no
+  // response, so it leaves the previous measurement standing.
+  let budget = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let cursor = null;
@@ -184,6 +241,10 @@ async function readBoard({
     try {
       do {
         const res = await runQuery(cursor);
+        const rl = res?.rateLimit;
+        budget = rl && typeof rl.remaining === "number"
+          ? { remaining: rl.remaining, resetAt: rl.resetAt ?? null }
+          : null;
         const project = res?.user?.projectV2;
         if (!project) {
           // Two different faults wearing one shape, and only the first is
@@ -223,7 +284,7 @@ async function readBoard({
         // advancing, and telling those apart is the entire job of this guard.
         //
         // Returns rather than setting `retry`: a stuck cursor loops the same way
-        // on a re-read, so retrying only spends two more full board reads to
+        // on a re-read, so retrying only spends every remaining full board read to
         // reach the same answer. Returning HERE also makes falling through to
         // the retry structurally impossible rather than merely absent.
         if (cursor && page >= maxPages) {
@@ -249,14 +310,24 @@ async function readBoard({
 
     last = { received: nodes.length, declared, reason: retry };
     if (attempt < maxAttempts) {
+      // The floor stops a RETRY, never the first read, and it refuses exactly
+      // as `inconsistent` does: the read is still unsettled, so absence is
+      // still unknown. Checked before the wait, on the freshest measurement.
+      if (!budget || budget.remaining < minRemaining) {
+        return {
+          status: "budget-low", ...last, attempts: attempt, minRemaining,
+          remaining: budget ? budget.remaining : null,
+          resetAt: budget ? budget.resetAt : null,
+        };
+      }
       // JITTERED, and that is the point rather than a refinement. The trigger
       // for these retries is CORRELATED -- a batch de-escalation fires many runs
       // at once, they collide on the same board, and they all mismatch within a
       // second of each other. A fixed delay marches every one of them back into
-      // the API in lockstep, re-reading the whole board (~7 pages) each time, at
-      // exactly the moment the board is busiest. Spreading them is what keeps
-      // the fix from amplifying the load it was written to survive.
-      await sleep(Math.round(backoffMs * attempt * (0.5 + random())));
+      // the API in lockstep, re-reading the whole board each time, at exactly
+      // the moment the board is busiest. Spreading them is what keeps the fix
+      // from amplifying the load it was written to survive.
+      await sleep(retryDelay(attempt, { backoffMs, maxBackoffMs, random }));
     }
   }
 
@@ -368,4 +439,4 @@ function preservationComment({ dates, itemId }) {
   ].join("\n");
 }
 
-module.exports = { isPmLabel, decideAction, shouldSync, datesOf, readBoard, resolveRemoval, preservationComment };
+module.exports = { isPmLabel, decideAction, shouldSync, datesOf, readBoard, RETRY_BUDGET, retryDelay, resolveRemoval, preservationComment };
