@@ -1,0 +1,32 @@
+name: fleet checks (this repo's own PRs)
+
+# This repo HOSTS the reusable fleet checks (`fleet-checks.yml` is a
+# `workflow_call` body), so without this caller a PR changing that workflow or
+# the scripts it runs is never run by them before every fleet repo picks the
+# change up from `main` (#1561, the guard-own-prs.yml pattern from #911).
+#
+# `uses: ./.github/...` takes the workflow file from this run's commit, and
+# `logic_ref: github.sha` takes the scripts from the same one, so a PR changing
+# both runs both halves of itself.
+#
+# Consequence, deliberately accepted: this repo is held to the checks it hosts.
+# A PR here that changes code adds a fragment under changelog.d/, or says
+# `Changelog: none — <why>` in its body, and dead paths ratchet against
+# .github/dead-paths-baseline.json here like anywhere else.
+#
+# No `timeout-minutes`: a `uses:` job cannot carry one; the called job's bound
+# applies, and `tests.yml` counts this as an exempt reusable-workflow caller.
+on:
+  pull_request:
+    # `edited` re-runs the check when a `Changelog: none` line is added to the body.
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: ./.github/workflows/fleet-checks.yml
+    with:
+      # The test-merge commit, the same one `uses: ./…` resolved the workflow at.
+      logic_ref: ${{ github.sha }}

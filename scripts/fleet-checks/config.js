@@ -91,6 +91,9 @@ function normalize(raw) {
   }
   const dp = raw.deadPaths ?? {};
   onlyKeys(dp, ["exempt", "linksResolveElsewhere", "foreignNames", "comments"], `${CONFIG_PATH} deadPaths`);
+  if (dp.exempt !== undefined && !Array.isArray(dp.exempt)) {
+    throw new ConfigError(`${CONFIG_PATH} deadPaths.exempt: expected a list of { glob, why }`);
+  }
   const exempt = (dp.exempt ?? []).map((e, i) => {
     const where = `${CONFIG_PATH} deadPaths.exempt[${i}]`;
     onlyKeys(e, ["glob", "why"], where);

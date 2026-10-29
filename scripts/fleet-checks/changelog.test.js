@@ -46,6 +46,21 @@ test("ships: names, lists, all and both; both refuses a repo that does not have 
   assert.match(cl.parseShips("site", names).error, /"site"/);
 });
 
+test("the documented fragment example, with inline # comments, parses verbatim", () => {
+  // Review finding 1 (#1561): the AGENTS.md example failed its own check.
+  const text = "---\ntype: fixed          # added | changed | fixed | removed\nships: desktop       # a stream name\n---\nThe panel reconnects.\n";
+  const { fragment, errors } = cl.parseFragment("changelog.d/1-x.md", text, TWO);
+  assert.deepEqual(errors, []);
+  assert.equal(fragment.type, "fixed");
+  assert.deepEqual(fragment.ships, ["desktop"]);
+  assert.equal(cl.frontmatterValue('"web # not a comment"  # but this is'), "web # not a comment");
+});
+
+test("ships: accepts a quoted flow list", () => {
+  assert.deepEqual(cl.parseShips('["web", "desktop"]', Object.keys(TWO)).ships, ["web", "desktop"]);
+  assert.deepEqual(cl.parseShips("['web']", Object.keys(TWO)).ships, ["web"]);
+});
+
 // ── tags ────────────────────────────────────────────────────────────────────
 
 test("a tag belongs to the longest prefix followed by a digit, and nothing else is a release", () => {
@@ -58,6 +73,12 @@ test("a tag belongs to the longest prefix followed by a digit, and nothing else 
 test("versions compare numerically, and a pre-release sorts before its release", () => {
   const sorted = ["12.10.0", "12.9.1", "12.9.1-rc.1", "2.0.0"].sort(cl.compareVersions);
   assert.deepEqual(sorted, ["2.0.0", "12.9.1-rc.1", "12.9.1", "12.10.0"]);
+});
+
+test("pre-release identifiers follow semver: numbers numerically, a number before a word", () => {
+  // Review finding 8 (#1561): rc.10 sorted before rc.2 as a string.
+  const sorted = ["1.0.0-rc.10", "1.0.0-rc.2", "1.0.0-beta", "1.0.0-rc", "1.0.0-1", "1.0.0-rc-x.1"].sort(cl.compareVersions);
+  assert.deepEqual(sorted, ["1.0.0-1", "1.0.0-beta", "1.0.0-rc", "1.0.0-rc.2", "1.0.0-rc.10", "1.0.0-rc-x.1"]);
 });
 
 test("the PR number is the squash suffix, or a merge commit's number, or nothing", () => {
@@ -83,6 +104,28 @@ test("docs-only, bot-authored and opted-out PRs need no fragment, and each says 
   const r = pr([["M", "src/a.ts"]], {}, { body: "Summary\n\nChangelog: none — an internal refactor\n" });
   assert.deepEqual(r.errors, []);
   assert.match(r.notices[0], /an internal refactor/);
+});
+
+test("an added fragment that fails to parse reports its parse errors only, not 'adds no fragment'", () => {
+  // Review finding 4 (#1561).
+  const f = "changelog.d/9-x.md";
+  const r = pr([["M", "src/a.ts"], ["A", f]], { [f]: "---\ntype: fix\n---\nX.\n" });
+  // Its own problems only (the bad type, the missing `ships:`), each naming the file.
+  assert.ok(r.errors.length > 0);
+  for (const e of r.errors) assert.match(e, /^changelog\.d\/9-x\.md: /, e);
+  assert.ok(!r.errors.some((e) => /adds no fragment/.test(e)));
+});
+
+test("the opt-out needs a reason, and the template's <why> placeholder is not one", () => {
+  // Review finding 7 (#1561).
+  const code = [["M", "src/a.ts"]];
+  const bare = pr(code, {}, { body: "Changelog: none\n" });
+  assert.equal(bare.errors.length, 2);
+  assert.match(bare.errors[0], /gives no reason/);
+  assert.equal(pr(code, {}, { body: "Changelog: none — <why>\n" }).errors.length, 2);
+  const real = pr(code, {}, { body: "Changelog: none — <why>\n\nChangelog: none: a CI-only change\n" });
+  assert.deepEqual(real.errors, []);
+  assert.match(real.notices[0], /a CI-only change/);
 });
 
 test("ships: is held to the paths the PR touched", () => {
@@ -150,6 +193,62 @@ test("the full changelog prints each stream newest first, unreleased on top", ()
     const text = cl.renderChangelog({ entries, tags, streams: TWO });
     const heads = text.split("\n").filter((l) => l.startsWith("## ")).map((l) => l.replace(/ — \d{4}-\d{2}-\d{2}$/, ""));
     assert.deepEqual(heads, ["## Unreleased — web", "## v1.1.0 — web", "## Unreleased — desktop", "## desktop-v0.1.0 — desktop"]);
+  } finally { r.cleanup(); }
+});
+
+test("a stable release lists everything since the previous stable tag, its pre-releases included", () => {
+  // Review finding B (#1561): with v1.1.0-rc.1 and v1.1.0 cut, v1.1.0 rendered empty.
+  const r = makeRepo();
+  try {
+    r.commit("init", { "src/a.ts": "" });
+    r.git("tag", "v1.0.0");
+    r.commit("feat(#1): one (#11)", { "src/a.ts": "1", "changelog.d/1-one.md": frag("added", "One.") });
+    r.git("tag", "v1.1.0-rc.1");
+    r.commit("fix(#2): two (#12)", { "src/a.ts": "2", "changelog.d/2-two.md": frag("fixed", "Two.") });
+    r.git("tag", "v1.1.0-rc.2");
+    r.git("tag", "v1.1.0");
+    r.commit("feat(#3): three (#13)", { "src/a.ts": "3", "changelog.d/3-three.md": frag("added", "Three.") });
+    const { entries, tags } = cl.collect(r.root, { streams: ONE });
+    const opts = { streamTags: tags.default.map((t) => t.tag), prefix: "v" };
+    const issues = (tag, extra = {}) => cl.releaseEntries(entries, "default", tag, { ...opts, ...extra }).map((e) => e.issue).sort();
+    assert.deepEqual(issues("v1.1.0-rc.1"), [1]);
+    assert.deepEqual(issues("v1.1.0-rc.2"), [2]);
+    assert.deepEqual(issues("v1.1.0"), [1, 2]);
+    assert.deepEqual(issues("v1.2.0-rc.1", { pending: true }), [3]);
+    assert.deepEqual(issues("v1.2.0", { pending: true }), [3]);
+  } finally { r.cleanup(); }
+});
+
+test("in a merge-commit repo the add is credited to the merge, so its PR number resolves", () => {
+  // Review finding C (#1561).
+  const r = makeRepo();
+  try {
+    r.commit("init", { "src/a.ts": "" });
+    r.git("checkout", "-q", "-b", "topic");
+    r.commit("work on the topic", { "src/a.ts": "1", "changelog.d/4-topic.md": frag("added", "Topic.") });
+    r.git("checkout", "-q", "main");
+    r.git("merge", "-q", "--no-ff", "topic", "-m", "Merge pull request #7 from someone/topic");
+    r.git("tag", "v1.0.0");
+    const { entries } = cl.collect(r.root, { streams: ONE });
+    assert.equal(entries[0].pr, 7);
+    assert.equal(entries[0].releases.default, "v1.0.0");
+  } finally { r.cleanup(); }
+});
+
+test("first containing tags: one walk per tag, version order, an untagged commit absent", () => {
+  // Review finding 10 (#1561): the walk is per tag, not per fragment × tag.
+  const r = makeRepo();
+  try {
+    const a = r.commit("a", { "x": "1" });
+    r.git("tag", "v1.0.0");
+    const b = r.commit("b", { "x": "2" });
+    r.git("tag", "v1.0.10");
+    r.git("tag", "v1.0.9");
+    const c = r.commit("c", { "x": "3" });
+    const first = cl.firstContainingTags(r.root, ["v1.0.0", "v1.0.9", "v1.0.10"], new Set([a, b, c]));
+    assert.equal(first.get(a), "v1.0.0");
+    assert.equal(first.get(b), "v1.0.9");
+    assert.equal(first.has(c), false);
   } finally { r.cleanup(); }
 });
 

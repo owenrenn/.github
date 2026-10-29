@@ -34,3 +34,10 @@ test("a dead-path exemption needs a reason", () => {
   assert.equal(c.deadPaths.exempt[0].glob, "docs/x/");
   assert.deepEqual(c.deadPaths.foreignNames, ["other"]);
 });
+
+test("a non-list exemption, or a non-object config, is a named ConfigError, not a TypeError", () => {
+  // Review finding G (#1561).
+  assert.throws(() => normalize({ deadPaths: { exempt: "docs/" } }), /deadPaths\.exempt: expected a list/);
+  assert.throws(() => normalize(null), ConfigError);
+  assert.throws(() => normalize({ deadPaths: { exempt: [null] } }), ConfigError);
+});

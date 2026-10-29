@@ -70,6 +70,7 @@ test("pathCandidates takes paths and leaves URLs, globs, placeholders, quoted co
   assert.deepEqual(take("3/4 of the time, on 10/28"), []);
   assert.deepEqual(take("climb ../../ twice"), []);
   assert.deepEqual(take("docs/README.md#the-matrix,"), ["docs/README.md#the-matrix"]);
+  assert.deepEqual(take("uses actions/add-to-project@v2 and pkg/name@1.2"), []);
 });
 
 // ── the judge, over a real repository ───────────────────────────────────────
@@ -116,7 +117,7 @@ test("a path resolves with a module suffix, file-relative, from ./ either way, o
   assert.deepEqual(findings, []);
 });
 
-test("a gitignored output, or the parent of one, is not a finding", () => {
+test("a gitignored output, file or directory, is not a finding", () => {
   const { findings, skippedIgnored } = judge({
     ".gitignore": "/public/out/\n/public/generated/\n",
     "public/keep.txt": "",
@@ -152,6 +153,57 @@ test("globToRegExp: ** crosses directories, * does not, a trailing / is the whol
   assert.ok(!dp.globToRegExp("src/*.ts").test("src/x/a.ts"));
   assert.ok(dp.globToRegExp("docs/").test("docs/x/y.md"));
   assert.ok(dp.globToRegExp("**/README.md").test("README.md"));
+});
+
+test("a parent of an ignored entry is NOT ignored: a deleted directory is still a dead path", () => {
+  // Review finding E (#1561): a hand-written prefix rule skipped this.
+  const { findings } = judge({
+    ".gitignore": "scripts/old-tool/cache\n",
+    "scripts/keep.sh": "",
+    "src/a.ts": "// moved out of scripts/old-tool/\n",
+  });
+  assert.deepEqual(findings.map((f) => f.target), ["scripts/old-tool/"]);
+});
+
+test("a root-absolute doc link resolves from the repo root, not the doc's directory", () => {
+  const { findings } = judge({ "src/x.ts": "", "docs/sub/a.md": "[ok](/src/x.ts) [bad](/src/nope.ts)\n" });
+  assert.deepEqual(findings.map((f) => f.target), ["/src/nope.ts"]);
+});
+
+test("a stray % in a link is a finding, never a crash", () => {
+  const { findings } = judge({ "docs/a.md": "# T\n\n[x](100%.md) [y](#50%off) [z](a.md#bad%)\n" });
+  assert.deepEqual(findings.map((f) => f.target).sort(), ["#50%off", "100%.md", "a.md#bad%"]);
+});
+
+test("setext headings offer anchors; front matter, rules under a list or table, and fences do not", () => {
+  const src = [
+    "---", "title: not a heading", "---", "Setext One", "===", "",
+    "Two lines", "of heading", "---", "", "- item", "---", "",
+    "| a | b |", "|---|---|", "", "para", "", "---", "```", "Fenced", "===", "```", "## Atx", "",
+  ].join("\n");
+  assert.deepEqual([...dp.anchorsInSource(src)], ["setext-one", "two-lines-of-heading", "atx"]);
+});
+
+test("JSX close tags are not regexes: comments after them are read, on the right lines", () => {
+  // Review finding A (#1561): `</div>` lexed as a regex jumped the newline uncounted.
+  const src = [
+    "const A = () => (",
+    "  <div>{x}</div> // after a close tag",
+    "  <Img {...p} /> // after a self-close",
+    ");",
+    "const d = a / b; // after a division",
+  ].join("\n");
+  assert.deepEqual(dp.slashComments(src).map((c) => [c.line, c.text.trim()]), [
+    [2, "after a close tag"], [3, "after a self-close"], [5, "after a division"],
+  ]);
+});
+
+test("a suffix shared by two tracked files resolves to neither", () => {
+  const { findings } = judge({
+    "a/design/x-css.test.ts": "", "b/design/x-css.test.ts": "", "src/k.ts": "// see design/x-css.test.ts\n",
+    "design/keep.md": "",
+  });
+  assert.deepEqual(findings.map((f) => f.target), ["design/x-css.test.ts"]);
 });
 
 // ── the ratchet ─────────────────────────────────────────────────────────────

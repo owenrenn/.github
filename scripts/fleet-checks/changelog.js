@@ -37,7 +37,7 @@
  */
 
 const { execFileSync } = require("node:child_process");
-const { globToRegExp } = require("./dead-paths.js");
+const { matchesAny } = require("./dead-paths.js");
 
 const FRAGMENT_DIR = "changelog.d";
 const TYPES = ["added", "changed", "fixed", "removed"];
@@ -51,7 +51,8 @@ const isFragmentPath = (p) => p.startsWith(`${FRAGMENT_DIR}/`) && p.endsWith(".m
 
 /** `web` · `web, desktop` · `[web, desktop]` · `all` · `both` → stream names, or an error string. */
 function parseShips(value, streamNames) {
-  const list = value.replace(/^\[|\]$/g, "").split(",").map((s) => s.trim()).filter(Boolean);
+  // Each element may be quoted, as YAML allows: `["web", "desktop"]` (#1561).
+  const list = value.replace(/^\[|\]$/g, "").split(",").map((s) => s.trim().replace(/^(["'])(.*)\1$/, "$2").trim()).filter(Boolean);
   if (list.length === 0) return { error: "`ships:` is empty" };
   if (list.length === 1 && list[0] === "all") return { ships: [...streamNames] };
   if (list.length === 1 && list[0] === "both") {
@@ -61,6 +62,18 @@ function parseShips(value, streamNames) {
   const unknown = list.filter((s) => !streamNames.includes(s));
   if (unknown.length) return { error: `\`ships:\` names ${unknown.map((u) => `"${u}"`).join(", ")}; this repo's streams are ${streamNames.join(", ")}` };
   return { ships: [...new Set(list)] };
+}
+
+/**
+ * A frontmatter value as YAML reads it: a quoted scalar is its contents, and
+ * an unquoted one ends at ` #`, which starts a comment. The documented
+ * fragment example carries such comments, so copying it verbatim must pass
+ * (#1561).
+ */
+function frontmatterValue(raw) {
+  const quoted = /^(["'])(.*?)\1(?:\s+#.*)?$/.exec(raw);
+  if (quoted) return quoted[2];
+  return raw.replace(/(?:^|\s+)#.*$/, "").trim();
 }
 
 /**
@@ -86,7 +99,7 @@ function parseFragment(relPath, text, streams) {
     const kv = /^([a-z]+):\s*(.*?)\s*$/.exec(line);
     if (!kv) { errors.push(`${relPath}: cannot read frontmatter line "${line}"`); continue; }
     if (!["type", "ships"].includes(kv[1])) { errors.push(`${relPath}: unknown frontmatter key "${kv[1]}" (type, ships)`); continue; }
-    fields[kv[1]] = kv[2].replace(/^["']|["']$/g, "");
+    fields[kv[1]] = frontmatterValue(kv[2]);
   }
   if (!fields.type) errors.push(`${relPath}: \`type:\` is required (${TYPES.join(" | ")})`);
   else if (!TYPES.includes(fields.type)) errors.push(`${relPath}: \`type: ${fields.type}\` is not one of ${TYPES.join(" | ")}`);
@@ -129,11 +142,17 @@ function tagStream(tag, streams) {
   return best;
 }
 
-/** Numeric dotted compare after the prefix; a pre-release sorts before its release. */
+/**
+ * Compare two versions (the part after a tag's prefix) by semver precedence:
+ * numeric dotted core, then a pre-release sorts before its release, and
+ * pre-release identifiers compare numerically when both are numbers and as
+ * strings otherwise, a number before a word, so rc.2 sorts before rc.10 (#1561).
+ */
 function compareVersions(a, b) {
   const parse = (v) => {
-    const [core, pre] = v.split("-", 2);
-    return { nums: core.split(".").map((n) => Number.parseInt(n, 10) || 0), pre: pre ?? null };
+    const cut = v.indexOf("-");
+    const core = cut === -1 ? v : v.slice(0, cut);
+    return { nums: core.split(".").map((n) => Number.parseInt(n, 10) || 0), pre: cut === -1 ? null : v.slice(cut + 1).split(".") };
   };
   const x = parse(a);
   const y = parse(b);
@@ -141,11 +160,23 @@ function compareVersions(a, b) {
     const d = (x.nums[i] ?? 0) - (y.nums[i] ?? 0);
     if (d) return d;
   }
-  if (x.pre === y.pre) return 0;
-  if (x.pre === null) return 1;
-  if (y.pre === null) return -1;
-  return x.pre < y.pre ? -1 : 1;
+  if (x.pre === null || y.pre === null) return x.pre === y.pre ? 0 : x.pre === null ? 1 : -1;
+  for (let i = 0; i < Math.max(x.pre.length, y.pre.length); i++) {
+    const p = x.pre[i];
+    const q = y.pre[i];
+    if (p === undefined) return -1;
+    if (q === undefined) return 1;
+    const pn = /^\d+$/.test(p);
+    const qn = /^\d+$/.test(q);
+    if (pn && qn) { const d = Number(p) - Number(q); if (d) return d; continue; }
+    if (pn !== qn) return pn ? -1 : 1;
+    if (p !== q) return p < q ? -1 : 1;
+  }
+  return 0;
 }
+
+/** Whether a tag is a pre-release of its stream: its version carries a `-` part. */
+const isPrerelease = (tag, prefix) => tag.slice(prefix.length).includes("-");
 
 /** The PR a squash commit came from: its trailing `(#N)`, or a merge commit's `#N`. */
 function prNumber(subject) {
@@ -155,7 +186,7 @@ function prNumber(subject) {
   return merge ? Number(merge[1]) : null;
 }
 
-const inStream = (p, s) => s.paths.some((g) => globToRegExp(g).test(p)) && !s.excludePaths.some((g) => globToRegExp(g).test(p));
+const inStream = (p, s) => matchesAny(p, s.paths) && !matchesAny(p, s.excludePaths);
 
 // ── the PR check ────────────────────────────────────────────────────────────
 
@@ -166,8 +197,23 @@ const inStream = (p, s) => s.paths.some((g) => globToRegExp(g).test(p)) && !s.ex
  */
 const isDocsOnly = (paths) => paths.length > 0 && paths.every((p) => p.startsWith("docs/") || p.endsWith(".md"));
 
-/** The explicit opt-out: a line `Changelog: none` in the PR body, with the reason after it. */
-const OPT_OUT = /^\s*changelog:\s*none\b(.*)$/im;
+/**
+ * The explicit opt-out: a line `Changelog: none — <why>` in the PR body. The
+ * reason is required, and the template's own `<why>` placeholder is not one,
+ * so a PR template carrying the hint line opts nothing out (#1561).
+ */
+const OPT_OUT = /^\s*changelog:\s*none\b(.*)$/gim;
+
+/** The first opt-out line with a real reason, or null; `bare` says a reasonless one was seen. */
+function optOutOf(body) {
+  let bare = false;
+  for (const m of body.matchAll(OPT_OUT)) {
+    const why = m[1].replace(/^[\s—–:-]+/, "").trim();
+    if (why && !/^<\s*why\s*>$/i.test(why)) return { why, bare };
+    bare = true;
+  }
+  return { why: null, bare };
+}
 
 /**
  * Judge a PR. Pure: the caller reads git and the event.
@@ -184,6 +230,7 @@ function evaluatePr({ changes, texts, streams, body = "", author = "" }) {
   const errors = [];
   const notices = [];
   const fragments = [];
+  let written = false;
   const touched = changes.filter((c) => !c.path.startsWith(`${FRAGMENT_DIR}/`)).map((c) => c.path);
 
   for (const c of changes) {
@@ -196,7 +243,9 @@ function evaluatePr({ changes, texts, streams, body = "", author = "" }) {
     }
     const r = parseFragment(c.path, texts.get(c.path) ?? "", streams);
     errors.push(...r.errors);
-    if (!r.fragment) continue;
+    // An unparseable fragment was still WRITTEN: its parse errors are the
+    // whole story, and "adds no fragment" on top of them would mislead (#1561).
+    if (!r.fragment) { if (c.status === "A") written = true; continue; }
     const shipErrors = [];
     if (touched.length === 0) {
       notices.push(`${c.path}: this PR changes only fragments, so \`ships:\` has no paths to be checked against`);
@@ -213,12 +262,13 @@ function evaluatePr({ changes, texts, streams, body = "", author = "" }) {
   }
 
   const added = fragments.filter((f) => f.added);
-  if (added.length === 0) {
-    const optOut = OPT_OUT.exec(body);
+  if (added.length === 0 && !written) {
+    const optOut = optOutOf(body);
     if (isDocsOnly(changes.map((c) => c.path))) notices.push("docs-only PR — no fragment needed");
     else if (/\[bot\]$/.test(author)) notices.push(`${author} opened this PR — a bot writes no fragment, and none is asked of it`);
-    else if (optOut) notices.push(`opted out in the PR body: "Changelog: none${optOut[1]}"`);
+    else if (optOut.why) notices.push(`opted out in the PR body: "Changelog: none — ${optOut.why}"`);
     else {
+      if (optOut.bare) errors.push("the PR body's `Changelog: none` line gives no reason; the opt-out needs one after it");
       errors.push(
         `this PR changes code and adds no fragment. Add ${FRAGMENT_DIR}/<issue>-<slug>.md (type: ${TYPES.join("|")}` +
         `${Object.keys(streams).length > 1 ? `; ships: ${Object.keys(streams).join("|")}` : ""}), ` +
@@ -252,11 +302,15 @@ function fragmentPathsAt(root, ref) {
 }
 
 /**
- * The commit that added each fragment reachable from `ref`, in one log walk.
+ * The commit that added each fragment on `ref`'s first-parent line, in one log walk.
  * Newest add wins: a fragment deleted and re-added ships with the re-add.
  */
 function fragmentAdds(root, ref) {
-  const out = git(root, ["log", ref, "--diff-filter=A", "--no-renames", "--format=%x00%H%x09%s", "--name-only", "--", FRAGMENT_DIR]);
+  // First parent only, with merges diffed against it: in a repo that merges
+  // PRs with merge commits, the add is credited to the `Merge pull request #N`
+  // commit that brought it into the branch, not to the branch commit, whose
+  // subject carries no PR number (#1561).
+  const out = git(root, ["log", ref, "--first-parent", "-m", "--diff-filter=A", "--no-renames", "--format=%x00%H%x09%s", "--name-only", "--", FRAGMENT_DIR]);
   const adds = new Map();
   for (const chunk of out.split("\0").filter(Boolean)) {
     const [head, ...files] = chunk.split("\n").filter(Boolean);
@@ -285,30 +339,55 @@ function streamTags(root, streams) {
  * An invalid fragment is returned in `problems` and left out: the PR check is
  * where it is refused, and a release body is no place to stop a deploy.
  */
+/**
+ * The first tag, in version order, whose history contains each wanted commit.
+ *
+ * One `git rev-list` per tag, each excluding every earlier tag, so a commit is
+ * printed only by the first tag that reaches it, and the cost grows with tags
+ * rather than with fragments × tags (#1561). Deliberately NOT path-limited:
+ * history simplification would drop a merge commit that is TREESAME to the
+ * branch it merged, and that merge is the commit `fragmentAdds` credits.
+ */
+function firstContainingTags(root, sortedTags, wanted) {
+  const first = new Map();
+  const prior = [];
+  for (const tag of sortedTags) {
+    if (first.size === wanted.size) break;
+    const input = `${[tag, ...prior.map((t) => `^${t}`)].join("\n")}\n`;
+    for (const sha of git(root, ["rev-list", "--stdin"], { input }).split("\n")) {
+      if (wanted.has(sha) && !first.has(sha)) first.set(sha, tag);
+    }
+    prior.push(tag);
+  }
+  return first;
+}
+
+/**
+ * Gather every fragment at `ref` with its PR and, per stream, its release.
+ * An invalid fragment is returned in `problems` and left out: the PR check is
+ * where it is refused, and a release body is no place to stop a deploy.
+ */
 function collect(root, { ref = "HEAD", streams }) {
   const adds = fragmentAdds(root, ref);
   const tags = streamTags(root, streams);
-  const containing = new Map();
-  const firstTag = (sha, stream) => {
-    const key = `${sha}:${stream}`;
-    if (!containing.has(key)) {
-      const prefix = streams[stream].tagPrefix;
-      const hits = git(root, ["tag", "--contains", sha, "--list", `${prefix}*`]).split("\n").filter((t) => t && tagStream(t, streams) === stream);
-      hits.sort((a, b) => compareVersions(a.slice(prefix.length), b.slice(prefix.length)));
-      containing.set(key, hits[0] ?? null);
-    }
-    return containing.get(key);
-  };
-  const entries = [];
+  const parsed = [];
   const problems = [];
   for (const p of fragmentPathsAt(root, ref)) {
     const { fragment, errors } = parseFragment(p, showAt(root, ref, p), streams);
     if (!fragment) { problems.push(...errors); continue; }
-    const add = adds.get(p);
-    const releases = {};
-    for (const s of fragment.ships) releases[s] = add ? firstTag(add.sha, s) : null;
-    entries.push({ ...fragment, sha: add?.sha ?? null, pr: add ? prNumber(add.subject) : null, releases });
+    parsed.push(fragment);
   }
+  const firstBy = {};
+  for (const s of Object.keys(streams)) {
+    const wanted = new Set(parsed.filter((f) => f.ships.includes(s) && adds.has(f.path)).map((f) => adds.get(f.path).sha));
+    firstBy[s] = wanted.size ? firstContainingTags(root, tags[s].map((t) => t.tag), wanted) : new Map();
+  }
+  const entries = parsed.map((fragment) => {
+    const add = adds.get(fragment.path);
+    const releases = {};
+    for (const s of fragment.ships) releases[s] = add ? firstBy[s].get(add.sha) ?? null : null;
+    return { ...fragment, sha: add?.sha ?? null, pr: add ? prNumber(add.subject) : null, releases };
+  });
   return { entries, tags, problems };
 }
 
@@ -328,11 +407,31 @@ function renderSections(entries) {
 }
 
 /**
- * The body of one release: the entries whose first containing tag in `stream`
- * is `tag`, or, for a tag not yet cut (`pending`), every unreleased entry.
+ * The entries one release's notes list.
+ *
+ * A pre-release lists what it shipped first: the entries whose first
+ * containing tag in the stream is that tag. A STABLE release lists every
+ * entry since the previous stable tag of the stream, including the ones its
+ * pre-releases shipped first, because a reader of `v1.1.0`'s notes wants
+ * everything new since `v1.0.0`, not only what changed after `v1.1.0-rc.1`
+ * (#1561). A pending (uncut) tag follows the same rule, with unreleased
+ * entries as its own.
+ *
+ * @param {string[]} streamTags the stream's cut tags, oldest version first
  */
-function renderRelease(entries, stream, tag, { pending = false } = {}) {
-  const mine = entries.filter((e) => e.ships.includes(stream) && (pending ? e.releases[stream] === null : e.releases[stream] === tag));
+function releaseEntries(entries, stream, tag, { pending = false, streamTags = [], prefix = "" } = {}) {
+  const ships = entries.filter((e) => e.ships.includes(stream));
+  const own = (e) => (pending ? e.releases[stream] === null : e.releases[stream] === tag);
+  if (tag === null || isPrerelease(tag, prefix)) return ships.filter(own);
+  const v = (t) => t.slice(prefix.length);
+  const prevStable = streamTags.filter((t) => !isPrerelease(t, prefix) && compareVersions(v(t), v(tag)) < 0).pop() ?? null;
+  const since = new Set(streamTags.filter((t) => compareVersions(v(t), v(tag)) < 0 && (prevStable === null || compareVersions(v(t), v(prevStable)) > 0)));
+  return ships.filter((e) => own(e) || since.has(e.releases[stream]));
+}
+
+/** The body of one release (see releaseEntries for which entries it lists). */
+function renderRelease(entries, stream, tag, opts = {}) {
+  const mine = releaseEntries(entries, stream, tag, opts);
   if (!mine.length) return { text: "_No changelog fragments name this release._\n", count: 0 };
   return { text: renderSections(mine).join("\n").replace(/\n+$/, "\n"), count: mine.length };
 }
@@ -344,10 +443,12 @@ function renderChangelog({ entries, tags, streams, only = null, legacy = false }
   const out = ["# Changelog", "", `Generated from \`${FRAGMENT_DIR}/\` and release tags (D8); never edited by hand.`, ""];
   for (const s of names) {
     const label = multi ? ` — ${s}` : "";
+    const prefix = streams[s].tagPrefix;
+    const streamTagNames = tags[s].map((t) => t.tag);
     const unreleased = renderRelease(entries, s, null, { pending: true });
     if (unreleased.count) out.push(`## Unreleased${label}`, "", unreleased.text);
     for (const { tag, date } of [...tags[s]].reverse()) {
-      const r = renderRelease(entries, s, tag);
+      const r = renderRelease(entries, s, tag, { streamTags: streamTagNames, prefix });
       if (!r.count) continue;
       out.push(`## ${tag}${label} — ${date}`, "", r.text);
     }
@@ -358,7 +459,7 @@ function renderChangelog({ entries, tags, streams, only = null, legacy = false }
 
 module.exports = {
   FRAGMENT_DIR, TYPES, isFragmentPath, parseShips, parseFragment,
-  tagStream, compareVersions, prNumber, inStream, isDocsOnly, OPT_OUT, evaluatePr,
-  refExists, prChanges, showAt, fragmentPathsAt, fragmentAdds, streamTags, collect,
-  entryLine, renderSections, renderRelease, renderChangelog,
+  frontmatterValue, tagStream, compareVersions, isPrerelease, prNumber, inStream, isDocsOnly, OPT_OUT, optOutOf, evaluatePr,
+  refExists, prChanges, showAt, fragmentPathsAt, fragmentAdds, streamTags, firstContainingTags, collect,
+  entryLine, renderSections, releaseEntries, renderRelease, renderChangelog,
 };

@@ -33,6 +33,17 @@ test("dead-paths: no baseline fails on an existing dead path; --write-baseline r
   } finally { r.cleanup(); }
 });
 
+test("dead-paths: a comment naming the baseline file is not recorded dead by the write that creates it", () => {
+  const r = makeRepo();
+  try {
+    r.commit("init", { "src/a.ts": "// ratchets against .github/dead-paths-baseline.json\n" });
+    assert.equal(run(r, ["dead-paths", "--write-baseline"]).code, 0);
+    assert.equal(fs.readFileSync(path.join(r.root, ".github/dead-paths-baseline.json"), "utf8"), "{}\n");
+    r.commit("baseline");
+    assert.equal(run(r, ["dead-paths"]).code, 0);
+  } finally { r.cleanup(); }
+});
+
 test("dead-paths: swapping one dead path for another in the SAME file fails", () => {
   const r = makeRepo();
   try {
@@ -88,6 +99,17 @@ test("changelog release: a release with no fragments warns and still exits 0", (
     const out = run(r, ["changelog", "release", "v1.0.0"]);
     assert.equal(out.code, 0);
     assert.match(out.err, /carries no changelog fragments/);
+  } finally { r.cleanup(); }
+});
+
+test("a malformed baseline is exit 2 with the file named", () => {
+  // Review finding G (#1561).
+  const r = makeRepo();
+  try {
+    r.commit("init", { "src/a.ts": "", ".github/dead-paths-baseline.json": "null\n" });
+    const out = run(r, ["dead-paths"]);
+    assert.equal(out.code, 2);
+    assert.match(out.err, /dead-paths-baseline\.json: expected an object/);
   } finally { r.cleanup(); }
 });
 

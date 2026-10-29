@@ -142,7 +142,15 @@ function commentSyntax(f) {
 }
 
 /** Minimal glob: `**` crosses `/`, `*` and `?` do not; a trailing `/` means the whole directory. */
+const GLOB_CACHE = new Map();
+
+/** Compiled once per glob: the stream and exemption checks ask the same globs of every path. */
 function globToRegExp(glob) {
+  if (!GLOB_CACHE.has(glob)) GLOB_CACHE.set(glob, compileGlob(glob));
+  return GLOB_CACHE.get(glob);
+}
+
+function compileGlob(glob) {
   if (glob.endsWith("/")) glob += "**";
   let re = "";
   for (let i = 0; i < glob.length; i++) {
@@ -203,20 +211,46 @@ function slugify(heading) {
 }
 
 /**
+ * A percent-decoded link target, or the raw one when it does not decode. A
+ * stray `%` throws URIError, and one bad link must cost one finding, not the
+ * whole run (#1561).
+ */
+function decode(s) {
+  try { return decodeURIComponent(s); } catch { return s; }
+}
+
+/** A line that can begin a paragraph: not blank, a list item, a quote, a table row, an ATX heading or HTML. */
+const PARAGRAPH_LINE = (l) => l.trim() !== "" && !/^ {0,3}(?:[-*+]\s|\d+[.)]\s|>|#{1,6}(?:\s|$)|<|\|)/.test(l) && !l.includes("|");
+
+/**
  * Every anchor a markdown source offers: deduplicated heading slugs plus
- * explicit `<a name>` / `<a id>` targets. Fenced code is stripped first, since
- * a `#` comment in a shell block is not a heading and would invent an anchor.
+ * explicit `<a name>` / `<a id>` targets, in document order.
+ *
+ * Both heading forms count: ATX (`## Title`) and setext (a paragraph
+ * underlined with `===` or `---`), which GitHub slugs the same way (#1561).
+ * Three things that look like headings are not: a `#` line in a fence (fences
+ * are stripped first), a YAML front-matter block's `---` fences, and a `---`
+ * under a blank line, a list item or a table row, which is a rule.
  */
 function anchorsInSource(src) {
-  const prose = src.replace(FENCE, "");
+  const prose = src.replace(FENCE, "").replace(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, "");
+  const lines = prose.split(/\r?\n/);
   const seen = new Map();
   const anchors = new Set();
-  for (const m of prose.matchAll(/^ {0,3}#{1,6}\s+(.+?)\s*#*\s*$/gm)) {
-    const base = slugify(m[1]);
-    if (base === "") continue;
+  const add = (text) => {
+    const base = slugify(text);
+    if (base === "") return;
     const n = seen.get(base) ?? 0;
     seen.set(base, n + 1);
     anchors.add(n === 0 ? base : `${base}-${n}`);
+  };
+  let para = [];
+  for (const l of lines) {
+    const atx = /^ {0,3}#{1,6}\s+(.+?)\s*#*\s*$/.exec(l);
+    if (atx) { add(atx[1]); para = []; continue; }
+    if (para.length && /^ {0,3}(?:=+|-+)[ \t]*$/.test(l)) { add(para.join(" ").trim()); para = []; continue; }
+    if (PARAGRAPH_LINE(l)) para.push(l);
+    else para = [];
   }
   for (const m of prose.matchAll(/<a\s+(?:name|id)=["']([^"']+)["']/g)) anchors.add(m[1]);
   return anchors;
@@ -265,8 +299,13 @@ function hashComments(src) {
   return out;
 }
 
-/** Characters after which a `/` starts a regex literal rather than a division. */
-const REGEX_PRECEDERS = new Set(["(", ",", "=", ":", "[", "!", "&", "|", "?", "{", "}", ";", "\n", "+", "-", "*", "%", "<", ">", "~", "^"]);
+/**
+ * Characters after which a `/` starts a regex literal rather than a division.
+ * `<` and `}` are left out: in JSX they precede the `/` of a close tag
+ * (`</div>`, `{x} />`), and reading those as regexes swallowed the comments
+ * after them (#1561).
+ */
+const REGEX_PRECEDERS = new Set(["(", ",", "=", ":", "[", "!", "&", "|", "?", "{", ";", "\n", "+", "-", "*", "%", ">", "~", "^"]);
 
 /**
  * The comment text of a `//` + block-comment file, per line. A small lexer
@@ -338,6 +377,10 @@ function slashComments(src, { rust = false } = {}) {
         else if (src[j] === "/" && !cls) break;
         j++;
       }
+      // No closing `/` on the line: it was a division (or a JSX tag), not a
+      // regex, so lex on from the next character. Never jump the newline:
+      // skipping it uncounted shifted every later line number (#1561).
+      if (src[j] !== "/") { i++; lastSig = "/"; continue; }
       i = j + 1;
       lastSig = "/";
       continue;
@@ -383,6 +426,8 @@ function pathCandidates(text) {
     if (/^\d+(?:\/\d+)+$/.test(token)) continue;                      // a fraction or a date, 3/4 or 10/28
     if (!token.includes("/")) continue;
     if (!token.split("/").some((seg) => /[^.]/.test(seg))) continue;   // `../../` names no file
+    // `actions/checkout@v7`, `pkg/name@1.2`: a pinned action or package ref, not a path (#1561).
+    if (/[^/]@[^/]*$/.test(token.split("#")[0])) continue;
     if (PLACEHOLDER.test(path.posix.basename(token.split("#")[0].replace(/\/$/, "")))) continue;
     out.push(token);
   }
@@ -403,10 +448,16 @@ function makeIndex(tracked) {
     top.add(f.split("/")[0]);
     for (let d = path.posix.dirname(f); d && d !== "."; d = path.posix.dirname(d)) dirs.add(d);
   }
+  // Indexed by basename, so a suffix lookup reads the few files sharing a name, not the whole tree.
+  const byBase = new Map();
+  for (const f of files) {
+    const b = path.posix.basename(f);
+    if (!byBase.has(b)) byBase.set(b, []);
+    byBase.get(b).push(f);
+  }
   const uniqueSuffix = (tail) => {
-    const hits = [];
-    for (const f of files) if (f.endsWith(`/${tail}`) && hits.push(f) > 1) return undefined;
-    return hits[0];
+    const hits = (byBase.get(path.posix.basename(tail)) ?? []).filter((f) => f.endsWith(`/${tail}`));
+    return hits.length === 1 ? hits[0] : undefined;
   };
   return { files, dirs, top, has: (p) => files.has(p) || dirs.has(p), uniqueSuffix };
 }
@@ -427,28 +478,6 @@ function foreignContext(foreignNames = []) {
   const words = ["\\brepo(?:s|'s|sitory|sitories)?\\b", "[A-Za-z0-9_.-]+#\\d+", "\\b[\\w-]+/\\.github\\b",
     ...foreignNames.map((n) => `(?<![\\w-])${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`)];
   return new RegExp(words.join("|"), "i");
-}
-
-/**
- * Parents of gitignored output, from every tracked `.gitignore`: `desktop/out/`
- * makes `desktop/out` a build output even on a checkout that has not built yet,
- * and `/public/maplibre/` makes `public/maplibre` one. `git check-ignore` alone
- * cannot see the second shape when only children are ignored.
- */
-function ignoredPrefixes(root, tracked) {
-  const out = [];
-  for (const f of tracked) {
-    if (path.posix.basename(f) !== ".gitignore") continue;
-    const dir = path.posix.dirname(f) === "." ? "" : `${path.posix.dirname(f)}/`;
-    let src = "";
-    try { src = fs.readFileSync(path.join(root, f), "utf8"); } catch { continue; }
-    for (let l of src.split("\n")) {
-      l = l.trim();
-      if (!l || l.startsWith("#") || l.startsWith("!") || /[*?[]/.test(l)) continue;
-      out.push(dir + l.replace(/^\//, "").replace(/\/$/, ""));
-    }
-  }
-  return out;
 }
 
 // ── the judge ───────────────────────────────────────────────────────────────
@@ -483,20 +512,22 @@ function findDeadPaths({ root, tracked, docs = [], code = [], linksResolveElsewh
     for (const { target, line } of linksOf(src)) {
       if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(target)) continue;
       if (target.startsWith("#")) {
-        if (!anchors(file).has(decodeURIComponent(target.slice(1)))) {
+        if (!anchors(file).has(decode(target.slice(1)))) {
           findings.push({ file, line, target, kind: "anchor", reason: "no heading in this file slugs to it" });
         }
         continue;
       }
       const [rawPath, frag] = target.split("#");
       if (rawPath === "" || linksResolveElsewhere.has(file)) continue;
-      const resolved = path.posix.normalize(path.posix.join(dir, decodeURIComponent(rawPath))).replace(/\/$/, "");
+      // A root-absolute link (`/src/x.ts`) resolves from the repo root, as GitHub renders it.
+      const from = rawPath.startsWith("/") ? "." : dir;
+      const resolved = path.posix.normalize(path.posix.join(from, decode(rawPath).replace(/^\/+/, ""))).replace(/\/$/, "");
       if (resolved.startsWith("..")) {
         findings.push({ file, line, target, resolved, kind: "link", reason: "resolves outside the repository" });
         continue;
       }
       if (idx.has(resolved)) {
-        if (frag && resolved.endsWith(".md") && idx.files.has(resolved) && !anchors(resolved).has(decodeURIComponent(frag))) {
+        if (frag && resolved.endsWith(".md") && idx.files.has(resolved) && !anchors(resolved).has(decode(frag))) {
           findings.push({ file, line, target, kind: "anchor", reason: `no heading in ${resolved} slugs to it` });
         }
         continue;
@@ -548,9 +579,11 @@ function findDeadPaths({ root, tracked, docs = [], code = [], linksResolveElsewh
   }
   const probes = [...new Set(pending.flatMap((p) => [p.resolved, `${p.resolved}/`]))];
   const ignored = ignoredPaths(root, probes);
-  const prefixes = ignoredPrefixes(root, idx.files);
-  const isIgnored = (p) => ignored.has(p) || ignored.has(`${p}/`) ||
-    prefixes.some((x) => x === p || x.startsWith(`${p}/`) || p.startsWith(`${x}/`));
+  // Git decides, not a parser of .gitignore here: a path is skipped only when
+  // git ignores it (as a file, or as a directory), never because something
+  // beneath it is ignored. A deleted directory with an ignored cache entry is
+  // still a dead path (#1561).
+  const isIgnored = (p) => ignored.has(p) || ignored.has(`${p}/`);
   let skippedIgnored = 0;
   for (const p of pending) {
     if (isIgnored(p.resolved)) { skippedIgnored++; continue; }
@@ -633,8 +666,8 @@ function compareToBaseline(live, baseline) {
 
 module.exports = {
   DATED_RECORD_EXEMPTIONS, CHANGELOG_EXEMPTIONS, DEFAULT_EXEMPTIONS, DOC_EXTENSIONS,
-  trackedFiles, ignoredPaths, ignoredPrefixes, foreignContext, selectCorpus, globToRegExp, matchesAny, commentSyntax,
-  slugify, anchorsInSource, anchorsOf, linksOf,
+  trackedFiles, ignoredPaths, foreignContext, selectCorpus, globToRegExp, matchesAny, commentSyntax,
+  slugify, decode, anchorsInSource, anchorsOf, linksOf,
   hashComments, slashComments, commentsOf, pathCandidates,
   findDeadPaths, BASELINE_PATH, targetsByFile, renderBaseline, compareToBaseline,
 };

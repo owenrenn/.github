@@ -69,8 +69,8 @@ function changelog(sub, pos, flags, root, cfg) {
       throw new UsageError(`"${tag}" matches no stream's prefix (${Object.entries(streams).map(([n, s]) => `${n}: ${s.tagPrefix}*`).join(", ")})`);
     }
     const cut = cl.refExists(root, `refs/tags/${tag}`);
-    const { entries, problems } = collect(root, cut ? `refs/tags/${tag}` : "HEAD", streams);
-    const r = cl.renderRelease(entries, stream, tag, { pending: !cut });
+    const { entries, tags, problems } = collect(root, cut ? `refs/tags/${tag}` : "HEAD", streams);
+    const r = cl.renderRelease(entries, stream, tag, { pending: !cut, streamTags: tags[stream].map((t) => t.tag), prefix: streams[stream].tagPrefix });
     process.stdout.write(r.text);
     // A release with no fragments warns and still succeeds (PM ruling on #1561):
     // a deploy is never held up by its notes.
@@ -117,6 +117,10 @@ function collect(root, ref, streams) {
 
 function deadPaths(flags, root, cfg) {
   const tracked = dp.trackedFiles(root);
+  // Writing the baseline creates it, so judge as if it were already tracked:
+  // otherwise a comment naming the baseline is recorded as dead, and the very
+  // next run reports it fixed (#1561).
+  if (flags["write-baseline"] && !tracked.includes(dp.BASELINE_PATH)) tracked.push(dp.BASELINE_PATH);
   const { docs, code, excused } = dp.selectCorpus(tracked, cfg.deadPaths);
   const { findings, skippedIgnored } = dp.findDeadPaths({
     root, tracked, docs, code,
@@ -152,6 +156,10 @@ function deadPaths(flags, root, cfg) {
   if (fs.existsSync(baselineFile)) {
     try { baseline = JSON.parse(fs.readFileSync(baselineFile, "utf8")); }
     catch (e) { throw new ConfigError(`${dp.BASELINE_PATH}: not valid JSON (${e.message})`); }
+    // A malformed file is "could not run", named, never a raw TypeError (#1561).
+    if (baseline === null || typeof baseline !== "object" || Array.isArray(baseline)) {
+      throw new ConfigError(`${dp.BASELINE_PATH}: expected an object of file → dead targets; regenerate with --write-baseline`);
+    }
   }
   const { added, removed, invalid } = dp.compareToBaseline(live, baseline);
   for (const msg of invalid) { console.error(`error: ${dp.BASELINE_PATH} ${msg}`); annotate("error", msg, dp.BASELINE_PATH); }

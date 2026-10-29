@@ -14,6 +14,7 @@ the fleet's **reusable workflows**.
 | `scripts/autoclose-guard/` | Pure decision logic for the above, plus its `node --test` suite. |
 | `.github/workflows/guard-own-prs.yml` | **This repo's own caller** of the guard above (#911). It uses `uses: ./…` **and passes `logic_ref: github.sha`**, so a PR that changes the guard runs its own version of both halves on itself: the workflow file and the predicate it loads come from the same commit (on `pull_request`, the test-merge commit). ⚠️ Until #942 only the workflow half was the PR's; the predicate still came from `main`, so a PR changing both crashed on itself. No other caller passes `logic_ref`. Until this caller existed, the repo where guard changes land was the one fleet repo the guard never checked. |
 | `.github/workflows/fleet-checks.yml` | **Reusable**. On a pull request, the **changelog fragment check** and the **dead-path ratchet** (#1561, the D7 and D8 rulings on #1555). |
+| `.github/workflows/fleet-checks-own-prs.yml` | **This repo's own caller** of the fleet checks (#1561), the `guard-own-prs.yml` pattern: `uses: ./…` plus `logic_ref: github.sha`, so a PR changing the workflow or its scripts runs both on itself. ⚠️ **So this repo is held to the checks it hosts**: a code PR here adds a fragment or says `Changelog: none — <why>`, and dead paths ratchet against `.github/dead-paths-baseline.json`. `tests.yml` fails if a body with a `logic_ref` input has no such caller. |
 | `scripts/fleet-checks/` | The two checks, the changelog generator and their CLI, plus `node --test` suites. ⚠️ **Published here byte for byte from the operations repo's `scripts/fleet-checks/` by its `publish.sh` — never hand-edit them here**: the next publish erases the edit. They live here because this is where they execute. |
 | `actions/publish-update-feed/` | **Composite action.** Uploads release payloads + an optional manifest to S3-compatible object storage, then verifies the feed from the public URL a client reads. |
 | `.github/workflows/tests.yml` | This repo's CI: the `node --test` suite, plus the structural check that every workflow here parses and every job carries `timeout-minutes` (#587). |
@@ -184,8 +185,14 @@ The panel reconnects after the machine wakes.
   is the `(#N)` the squash merge appended to that commit. `cli.js changelog release <tag>`
   renders one release's body (a tag not cut yet renders what would ship); `cli.js changelog
   print` prints the whole changelog. A release with no fragments warns and exits 0.
+- **A stable release's notes list everything since the previous stable tag of its stream**,
+  including what its pre-releases shipped first: `v1.1.0` lists all that is new since `v1.0.0`,
+  not only what changed after `v1.1.0-rc.1`. A pre-release lists only what it shipped first.
+  Versions sort by semver precedence, so `rc.2` comes before `rc.10`. In a repo that merges with
+  merge commits, a fragment is credited to the `Merge pull request #N` commit that brought it in.
 - **The opt-out is a line in the PR body**, `Changelog: none — <why>`, for a change no user of
-  the repo can see. Docs-only PRs (every path under `docs/` or ending `.md`) and PRs opened by a
+  the repo can see. The reason is required, and a literal `<why>` (a PR template's hint line) is
+  not one. Docs-only PRs (every path under `docs/` or ending `.md`) and PRs opened by a
   `[bot]` account are not asked for a fragment.
 - ⚠️ **The dead-path check is a ratchet, in both directions.** A new dead path fails. A fixed one
   fails too, until the baseline is regenerated in the same PR, so the baseline stays a true
