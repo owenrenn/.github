@@ -102,14 +102,15 @@ jobs:
         # A body whose scripts are read at `logic_ref` must be run on this
         # repo's own PRs at the PR's commit, or a change to it reaches every
         # caller from `main` without ever having run (#911, #1561). Asserted
-        # rather than remembered: the fleet-checks body shipped without one.
+        # here, because nothing else notices a body added without one.
         run: |
           python3 - <<'PY'
           import glob, os, sys, yaml
 
           # Built from parts: the expression's opening characters written
           # literally in a `run:` block are evaluated by Actions before Python
-          # ever sees them, which first made this whole file fail to load.
+          # sees them, and an expression Actions cannot evaluate fails the
+          # whole workflow file.
           SHA_EXPR = "$" + "{{github.sha}}"
 
           bodies = []

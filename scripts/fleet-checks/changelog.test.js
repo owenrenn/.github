@@ -177,10 +177,12 @@ test("a fragment ships in the first tag of each of ITS streams that contains it"
 test("a release body lists only that release; a pending tag lists what is unreleased; an empty one says so", () => {
   const r = history();
   try {
-    const { entries } = cl.collect(r.root, { streams: TWO });
-    assert.equal(cl.renderRelease(entries, "web", "v1.1.0").text, "### Added\n\n- A shortcut. (#11, PR #21)\n");
-    assert.equal(cl.renderRelease(entries, "desktop", "desktop-v0.2.0", { pending: true }).text, "### Added\n\n- A shortcut. (#11, PR #21)\n");
-    const empty = cl.renderRelease(entries, "web", "v1.0.0");
+    const { entries, tags, reaches } = cl.collect(r.root, { streams: TWO });
+    const cut = (s, tag) => ({ streamTags: tags[s].map((t) => t.tag), prefix: TWO[s].tagPrefix, reaches: tags[s].find((t) => t.tag === tag).reaches });
+    assert.equal(cl.renderRelease(entries, "web", "v1.1.0", cut("web", "v1.1.0")).text, "### Added\n\n- A shortcut. (#11, PR #21)\n");
+    const pending = { pending: true, streamTags: tags.desktop.map((t) => t.tag), prefix: TWO.desktop.tagPrefix, reaches };
+    assert.equal(cl.renderRelease(entries, "desktop", "desktop-v0.2.0", pending).text, "### Added\n\n- A shortcut. (#11, PR #21)\n");
+    const empty = cl.renderRelease(entries, "web", "v1.0.0", cut("web", "v1.0.0"));
     assert.equal(empty.count, 0);
     assert.match(empty.text, /No changelog fragments/);
   } finally { r.cleanup(); }
@@ -208,9 +210,10 @@ test("a stable release lists everything since the previous stable tag, its pre-r
     r.git("tag", "v1.1.0-rc.2");
     r.git("tag", "v1.1.0");
     r.commit("feat(#3): three (#13)", { "src/a.ts": "3", "changelog.d/3-three.md": frag("added", "Three.") });
-    const { entries, tags } = cl.collect(r.root, { streams: ONE });
+    const { entries, tags, reaches } = cl.collect(r.root, { streams: ONE });
     const opts = { streamTags: tags.default.map((t) => t.tag), prefix: "v" };
-    const issues = (tag, extra = {}) => cl.releaseEntries(entries, "default", tag, { ...opts, ...extra }).map((e) => e.issue).sort();
+    const reachOf = (tag) => tags.default.find((t) => t.tag === tag)?.reaches ?? reaches;
+    const issues = (tag, extra = {}) => cl.releaseEntries(entries, "default", tag, { ...opts, reaches: reachOf(tag), ...extra }).map((e) => e.issue).sort();
     assert.deepEqual(issues("v1.1.0-rc.1"), [1]);
     assert.deepEqual(issues("v1.1.0-rc.2"), [2]);
     assert.deepEqual(issues("v1.1.0"), [1, 2]);
@@ -233,6 +236,55 @@ test("in a merge-commit repo the add is credited to the merge, so its PR number 
     assert.equal(entries[0].pr, 7);
     assert.equal(entries[0].releases.default, "v1.0.0");
   } finally { r.cleanup(); }
+});
+
+test("a branch that merged main into itself still credits main's PR and main's release", () => {
+  // The first-parent credit there is the branch's own merge of main, which
+  // names no PR and which no tag on main contains.
+  const r = makeRepo();
+  try {
+    r.commit("init", { "src/a.ts": "" });
+    r.git("checkout", "-q", "-b", "rel");
+    r.commit("rel work", { "src/b.ts": "1" });
+    r.git("checkout", "-q", "main");
+    r.git("checkout", "-q", "-b", "topic");
+    r.commit("work on the topic", { "src/a.ts": "1", "changelog.d/1-x.md": frag("added", "X.") });
+    r.git("checkout", "-q", "main");
+    r.git("merge", "-q", "--no-ff", "topic", "-m", "Merge pull request #5 from someone/topic");
+    r.git("tag", "v1.1.0-rc.1");
+    r.git("checkout", "-q", "rel");
+    r.git("merge", "-q", "--no-ff", "main", "-m", "Merge branch 'main' into rel");
+    const { entries } = cl.collect(r.root, { ref: "rel", streams: ONE });
+    assert.equal(entries[0].pr, 5);
+    assert.equal(entries[0].releases.default, "v1.1.0-rc.1");
+  } finally { r.cleanup(); }
+});
+
+test("a stable release takes in only the pre-releases its history contains", () => {
+  // v1.0.1-rc.1 sorts between v1.0.0 and v1.1.0 but was cut on a maintenance branch.
+  const r = makeRepo();
+  try {
+    r.commit("init", { "src/a.ts": "" });
+    r.git("tag", "v1.0.0");
+    r.git("checkout", "-q", "-b", "maint");
+    r.commit("fix(#2): hotfix (#12)", { "src/a.ts": "h", "changelog.d/2-hot.md": frag("fixed", "Hot.") });
+    r.git("tag", "v1.0.1-rc.1");
+    r.git("checkout", "-q", "main");
+    r.commit("feat(#1): one (#11)", { "src/b.ts": "1", "changelog.d/1-one.md": frag("added", "One.") });
+    r.git("tag", "v1.1.0");
+    r.git("merge", "-q", "--no-ff", "maint", "-m", "Merge branch 'maint'");
+    const { entries, tags } = cl.collect(r.root, { streams: ONE });
+    const v110 = tags.default.find((t) => t.tag === "v1.1.0");
+    const got = cl.releaseEntries(entries, "default", "v1.1.0", { streamTags: tags.default.map((t) => t.tag), prefix: "v", reaches: v110.reaches });
+    assert.deepEqual(got.map((e) => e.issue), [1]);
+  } finally { r.cleanup(); }
+});
+
+test("a release with a tag has no default prefix or ancestry: leaving either out throws", () => {
+  // A defaulted "" reads every hyphenated-prefix stable tag (desktop-v1.1.0) as a pre-release.
+  assert.throws(() => cl.releaseEntries([], "desktop", "desktop-v1.1.0", { streamTags: [], reaches: new Set() }), /prefix/);
+  assert.throws(() => cl.releaseEntries([], "desktop", "desktop-v1.1.0", { streamTags: [], prefix: "desktop-v" }), /reaches/);
+  assert.deepEqual(cl.releaseEntries([], "desktop", null, { pending: true }), []);
 });
 
 test("first containing tags: one walk per tag, version order, an untagged commit absent", () => {

@@ -181,15 +181,17 @@ The panel reconnects after the machine wakes.
 ```
 
 - **No fragment is ever assembled into a committed file.** A fragment's release, per stream, is
-  the first tag *of that stream's prefix* containing the commit that added it, and its PR number
-  is the `(#N)` the squash merge appended to that commit. `cli.js changelog release <tag>`
+  the first tag *of that stream's prefix* containing the commit that authored the add (merges
+  left out), and its PR number is the first `(#N)` or `Merge pull request #N` on the way in:
+  the first-parent commit that brought it, the authoring commit, then the merges on the ancestry
+  path from it, so a branch that merged `main` still credits `main`'s PR. `cli.js changelog release <tag>`
   renders one release's body (a tag not cut yet renders what would ship); `cli.js changelog
   print` prints the whole changelog. A release with no fragments warns and exits 0.
 - **A stable release's notes list everything since the previous stable tag of its stream**,
   including what its pre-releases shipped first: `v1.1.0` lists all that is new since `v1.0.0`,
-  not only what changed after `v1.1.0-rc.1`. A pre-release lists only what it shipped first.
-  Versions sort by semver precedence, so `rc.2` comes before `rc.10`. In a repo that merges with
-  merge commits, a fragment is credited to the `Merge pull request #N` commit that brought it in.
+  not only what changed after `v1.1.0-rc.1`. Only tags the release's own history contains count,
+  so a pre-release cut on a maintenance branch never lands in `main`'s notes. A pre-release lists
+  only what it shipped first. Versions sort by semver precedence, so `rc.2` comes before `rc.10`.
 - **The opt-out is a line in the PR body**, `Changelog: none — <why>`, for a change no user of
   the repo can see. The reason is required, and a literal `<why>` (a PR template's hint line) is
   not one. Docs-only PRs (every path under `docs/` or ending `.md`) and PRs opened by a

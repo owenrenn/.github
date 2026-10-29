@@ -235,3 +235,45 @@ test("a written baseline is deterministic, so regenerating an unchanged tree is 
   assert.equal(a, b);
   assert.equal(a, '{\n  "a.md": [\n    "x.md"\n  ],\n  "z.ts": [\n    "src/a.ts",\n    "src/b.ts"\n  ]\n}\n');
 });
+
+test("front matter needs a key on its first line: a doc opening with a rule keeps its headings", () => {
+  assert.deepEqual([...dp.anchorsInSource("---\n\nIntro\n\n## A\n\nText\n\n---\n\n## B\n")], ["a", "b"]);
+  assert.deepEqual([...dp.anchorsInSource("---\ntitle: x\n---\n## A\n")], ["a"]);
+});
+
+test("a setext heading may hold a pipe or open with inline HTML; continuations and indented code are no heading", () => {
+  assert.deepEqual([...dp.anchorsInSource("Use a | b\n---\n")], ["use-a--b"]);
+  assert.deepEqual([...dp.anchorsInSource("<kbd>Ctrl</kbd> keys\n===\n")], ["ctrl-keys"]);
+  for (const src of [
+    "- item\n  continued\n---\n",
+    "> q\nlazy\n---\n",
+    "Para\n\n    code\n---\n",
+    "a | b\n--- | ---\n1 | 2\n---\n",
+    "<div>\nblock\n</div>\n---\n",
+  ]) assert.deepEqual([...dp.anchorsInSource(src)], [], src);
+});
+
+test("a regex after a keyword or a closing brace is a regex: its quote opens no string", () => {
+  const src = [
+    "function f(x) { return /\"/.test(x); } // see src/i.ts",
+    "switch (x) { case 1: break; } /x'/.test(y) // src/q.ts",
+    "const t = typeof /'/; // src/t.ts",
+  ].join("\n");
+  assert.deepEqual(dp.slashComments(src).map((c) => [c.line, c.text.trim()]), [
+    [1, "see src/i.ts"], [2, "src/q.ts"], [3, "src/t.ts"],
+  ]);
+});
+
+test("in JSX, an apostrophe inside a word is text, not a string", () => {
+  const src = "const a = <p>Don't</p>; // see src/j.ts\n";
+  assert.deepEqual(dp.commentsOf("src/a.tsx", src).map((c) => c.text.trim()), ["see src/j.ts"]);
+  // Outside JSX files the rule is off: C's L'x' is a wide char literal.
+  assert.deepEqual(dp.commentsOf("src/a.c", "char c = L'/'; // src/c.h\n").map((c) => c.text.trim()), ["src/c.h"]);
+});
+
+test("an @ drops a token only as a pinned ref: a file name holding @ is still a path", () => {
+  assert.deepEqual(dp.pathCandidates("see assets/icon@2x.png and docs/a.md"), ["assets/icon@2x.png", "docs/a.md"]);
+  for (const ref of ["actions/checkout@v7", "pkg/name@1.2.3", "org/action@0123abcd", "org/action@main"]) {
+    assert.deepEqual(dp.pathCandidates(`uses ${ref} here`), [], ref);
+  }
+});
