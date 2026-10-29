@@ -40,6 +40,10 @@ jobs:
         run: node --test scripts/card-shark-sync/*.test.js
       - name: Run autoclose-guard module tests
         run: node --test scripts/autoclose-guard/*.test.js
+      # The fleet checks are published here from the operations repo (#1561) and
+      # their suites run here too, against the copy that actually executes.
+      - name: Run fleet-checks module tests
+        run: node --test scripts/fleet-checks/*.test.js
       - name: Every workflow parses, and every job is bounded
         # Two assertions over one walk, both of which the node suite structurally
         # cannot make:
@@ -93,6 +97,44 @@ jobs:
           for p in problems:
               print(p, file=sys.stderr)
           sys.exit(1 if problems else 0)
+          PY
+      - name: Every reusable workflow with a logic_ref has an own-PR caller passing github.sha
+        # A body whose scripts are read at `logic_ref` must be run on this
+        # repo's own PRs at the PR's commit, or a change to it reaches every
+        # caller from `main` without ever having run (#911, #1561). Asserted
+        # rather than remembered: the fleet-checks body shipped without one.
+        run: |
+          python3 - <<'PY'
+          import glob, os, sys, yaml
+
+          # Built from parts: the expression's opening characters written
+          # literally in a `run:` block are evaluated by Actions before Python
+          # ever sees them, which first made this whole file fail to load.
+          SHA_EXPR = "$" + "{{github.sha}}"
+
+          bodies = []
+          for f in sorted(glob.glob(".github/workflows/*.yml")):
+              doc = yaml.safe_load(open(f)) or {}
+              on = doc.get("on", doc.get(True)) or {}
+              call = on.get("workflow_call") if isinstance(on, dict) else None
+              if isinstance(call, dict) and "logic_ref" in (call.get("inputs") or {}):
+                  bodies.append(os.path.basename(f))
+          callers = {}
+          for f in sorted(glob.glob(".github/workflows/*.yml")):
+              doc = yaml.safe_load(open(f)) or {}
+              for job in (doc.get("jobs") or {}).values():
+                  uses = (job or {}).get("uses", "") if isinstance(job, dict) else ""
+                  if uses.startswith("./.github/workflows/") and \
+                     str((job.get("with") or {}).get("logic_ref", "")).replace(" ", "") == SHA_EXPR:
+                      callers.setdefault(uses.rsplit("/", 1)[1], []).append(f)
+          if not bodies:
+              print("no reusable workflow declares logic_ref -- this check looked at nothing", file=sys.stderr)
+              sys.exit(1)
+          missing = [b for b in bodies if b not in callers]
+          print(f"== own-PR callers: {len(bodies) - len(missing)} of {len(bodies)} logic_ref bodies covered ==")
+          for b in missing:
+              print(f"{b} reads its logic at logic_ref but no workflow here calls it with logic_ref: {SHA_EXPR}", file=sys.stderr)
+          sys.exit(1 if missing else 0)
           PY
       - name: Every composite action parses, and every run step names its shell
         # WHY a separate assertion: a composite action's `run` step with no

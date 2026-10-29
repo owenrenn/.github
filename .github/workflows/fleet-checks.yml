@@ -1,0 +1,101 @@
+# Reusable fleet checks: the changelog fragment check and the dead-path
+# ratchet (#1561). Callers add a short stub; the logic, its suites and this
+# body live here, once, so a change reaches every caller in one merge.
+#
+# The code in scripts/fleet-checks/ is written and tested in the operations
+# repo and published here byte for byte by its publish.sh: never hand-edit it
+# here, or the next publish erases the edit. Its suites run in tests.yml, where
+# the code executes.
+#
+# WHAT EACH CHECK HOLDS (the D7 and D8 rulings, #1555):
+#
+#   changelog   A PR that changes code adds a fragment, changelog.d/<issue>-<slug>.md,
+#               or opts out with a line `Changelog: none — <why>` in its body. A
+#               fragment's `ships:` must name a stream the PR's paths reach.
+#               Docs-only PRs and bot-authored PRs are not asked for one.
+#   dead-paths  Each file's paths in docs and code comments that resolve to nothing,
+#               against the caller's committed .github/dead-paths-baseline.json, keyed
+#               by target. A new one fails; so does a fixed one, until the baseline is
+#               regenerated in the same PR. Existing dead paths are never swept (#1555, D7).
+#
+# Node is installed here, so a caller in any language needs nothing of its own.
+#
+# ⚠️ CALLER CONTRACT: `edited` must be in the stub's pull_request types, or a
+# `Changelog: none` line added to the body never re-runs the check. The stub
+# is in AGENTS.md.
+
+name: fleet checks
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        # The caller's to choose, as for the other reusable workflows here: a
+        # self-hosted runner belongs to one repo or org, and the choice must be
+        # visible in the caller's file.
+        description: "Runner label for this job. Omit for a GitHub-hosted runner."
+        required: false
+        default: "ubuntu-latest"
+        type: string
+      logic_ref:
+        # The commit of THIS repo the checks are read from. Only this repo's own
+        # caller would pass anything but `main`: a stub resolving this file at
+        # @main while reading the logic elsewhere is the skew autoclose-guard.yml
+        # describes.
+        description: "Commit of this repo to read the checks from. Only this repo's own caller sets it."
+        required: false
+        default: "main"
+        type: string
+
+jobs:
+  checks:
+    # Pull requests only: both checks judge a change, and a push to the default
+    # branch has already been judged as its PR (#918).
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ inputs.runner }}
+    # The fleet's bound lives here: a caller job using `uses:` cannot carry one (#587).
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    concurrency:
+      group: fleet-checks-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      # Full history: the changelog check diffs the PR against its merge base,
+      # which a depth-1 checkout does not have.
+      - name: Check out the caller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # ⚠️ `repository:` is load-bearing: a reusable workflow does not bring its
+      # own repo's files, and without it this checks out the caller again. The
+      # path starts with a dot and is untracked in the caller, so `git ls-files`
+      # never lists it and the dead-path check never judges it.
+      - name: Check out the checks
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: owenrenn/.github
+          ref: ${{ inputs.logic_ref }}
+          path: .fleet-checks
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      # The body and author reach the script through env, never `${{ }}` inside
+      # `run:`, so a PR body cannot inject shell.
+      - name: Changelog fragment
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node .fleet-checks/scripts/fleet-checks/cli.js changelog check --base "$BASE_SHA" --head "$HEAD_SHA" --author "$PR_AUTHOR"
+
+      # Runs even when the changelog step failed, so one run reports both.
+      - name: Dead paths
+        if: success() || failure()
+        run: node .fleet-checks/scripts/fleet-checks/cli.js dead-paths
