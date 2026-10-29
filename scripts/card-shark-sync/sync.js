@@ -170,16 +170,24 @@ function datesOf(boardNode) {
  *
  * The attempts stay FEW and the waits grow LONG, because only an attempt costs
  * requests. Every attempt is a full paged read: at 100 items a page, a board
- * of a thousand-plus items is a dozen-plus GraphQL requests, one rate-limit
- * point each. A batch sweep starts a few dozen valve runs inside a few
- * minutes, all on one token, and that token's 5,000-point hourly budget is
- * shared with the operations repo's scanners. So the worst case is
+ * of a thousand-plus items is a dozen-plus GraphQL requests, measured at one
+ * rate-limit point each. The 5,000-point hourly budget belongs to the token's
+ * USER, so every token that user holds spends from it: this workflow, the
+ * operations repo's scanners, the dashboard and local agents. The busiest hour
+ * runs a few dozen valve runs, so
  *
  *   a few dozen runs x 5 attempts x a dozen-plus pages = a few thousand points,
  *
- * inside the hourly budget with room for the scanners. Ten attempts would be
- * several thousand and exhaust it, and a run that hits the limit throws, which
- * is itself retried. Waiting costs nothing.
+ * most of the budget at today's board size, and all of it once the board grows
+ * toward the page cap. Waiting costs nothing; attempts are what spend it.
+ *
+ * So `minRemaining` is a floor under the retries: a retry is scheduled only
+ * while the latest response reports at least that many points left. That bounds
+ * the valve's spend whatever the board size: under the floor a run makes its
+ * one read and stops. The check is per run and not atomic, so concurrent runs
+ * can each pass it and overshoot by up to one read apiece -- a few dozen runs
+ * times a dozen-plus pages is several hundred points, and 1,000 sits above that.
+ * The FIRST attempt is never skipped for budget: the floor only stops retries.
  *
  * The waits exist to outlast a sweep: a few dozen removals take about three
  * minutes, and every read that overlaps one of them mismatches. The base waits
@@ -188,7 +196,7 @@ function datesOf(boardNode) {
  * the sweep has ended. The worst case, every draw at the top of its jitter, is
  * 1.5 x that, about five minutes; the job's timeout-minutes is sized against it.
  */
-const RETRY_BUDGET = Object.freeze({ maxAttempts: 5, backoffMs: 15000, maxBackoffMs: 90000 });
+const RETRY_BUDGET = Object.freeze({ maxAttempts: 5, backoffMs: 15000, maxBackoffMs: 90000, minRemaining: 1000 });
 
 /**
  * The wait after failed attempt `attempt` (1-based): the capped base, scaled
@@ -213,9 +221,15 @@ async function readBoard({
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   backoffMs = RETRY_BUDGET.backoffMs,
   maxBackoffMs = RETRY_BUDGET.maxBackoffMs,
+  minRemaining = RETRY_BUDGET.minRemaining,
   random = Math.random,
 }) {
   let last = null;
+  // The hourly budget as the LATEST response reported it, or null when that
+  // response carried no rateLimit or no response has arrived yet. Null reads as
+  // spent: an unmeasured budget is not a spendable one. A throw carries no
+  // response, so it leaves the previous measurement standing.
+  let budget = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let cursor = null;
@@ -227,6 +241,10 @@ async function readBoard({
     try {
       do {
         const res = await runQuery(cursor);
+        const rl = res?.rateLimit;
+        budget = rl && typeof rl.remaining === "number"
+          ? { remaining: rl.remaining, resetAt: rl.resetAt ?? null }
+          : null;
         const project = res?.user?.projectV2;
         if (!project) {
           // Two different faults wearing one shape, and only the first is
@@ -292,6 +310,16 @@ async function readBoard({
 
     last = { received: nodes.length, declared, reason: retry };
     if (attempt < maxAttempts) {
+      // The floor stops a RETRY, never the first read, and it refuses exactly
+      // as `inconsistent` does: the read is still unsettled, so absence is
+      // still unknown. Checked before the wait, on the freshest measurement.
+      if (!budget || budget.remaining < minRemaining) {
+        return {
+          status: "budget-low", ...last, attempts: attempt, minRemaining,
+          remaining: budget ? budget.remaining : null,
+          resetAt: budget ? budget.resetAt : null,
+        };
+      }
       // JITTERED, and that is the point rather than a refinement. The trigger
       // for these retries is CORRELATED -- a batch de-escalation fires many runs
       // at once, they collide on the same board, and they all mismatch within a
