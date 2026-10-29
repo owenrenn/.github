@@ -147,7 +147,8 @@ function datesOf(boardNode) {
  * pair on ONE issue) and is deliberately left alone.
  *
  * `runQuery(cursor)` returns the raw GraphQL response; `sleep` and the bounds
- * are injected so the suite can exercise the retry without waiting on it.
+ * are injected so the suite can exercise the retry without waiting on it. The
+ * retry budget's defaults are RETRY_BUDGET, below.
  *
  * ⚠️ THERE IS A SECOND IMPLEMENTATION OF THIS READ, and it is not in this repo.
  * The operations repo's escalation reconciler pages the same board and applies
@@ -163,13 +164,55 @@ function datesOf(boardNode) {
  * next person needs to be told. Fixing anything below WITHOUT checking the port
  * is how #491 happened.
  */
+
+/**
+ * The retry budget for a count-mismatched or thrown board read (#1571).
+ *
+ * The attempts stay FEW and the waits grow LONG, because only an attempt costs
+ * requests. Every attempt is a full paged read: at 100 items a page, a board
+ * of a thousand-plus items is a dozen-plus GraphQL requests, one rate-limit
+ * point each. A batch sweep starts a few dozen valve runs inside a few
+ * minutes, all on one token, and that token's 5,000-point hourly budget is
+ * shared with the operations repo's scanners. So the worst case is
+ *
+ *   a few dozen runs x 5 attempts x a dozen-plus pages = a few thousand points,
+ *
+ * inside the hourly budget with room for the scanners. Ten attempts would be
+ * several thousand and exhaust it, and a run that hits the limit throws, which
+ * is itself retried. Waiting costs nothing.
+ *
+ * The waits exist to outlast a sweep: a few dozen removals take about three
+ * minutes, and every read that overlaps one of them mismatches. The base waits
+ * double from `backoffMs` to `maxBackoffMs` (15s, 30s, 60s, 90s), so the four
+ * waits sum to about three and a quarter minutes and the fifth read lands after
+ * the sweep has ended. The worst case, every draw at the top of its jitter, is
+ * 1.5 x that, about five minutes; the job's timeout-minutes is sized against it.
+ */
+const RETRY_BUDGET = Object.freeze({ maxAttempts: 5, backoffMs: 15000, maxBackoffMs: 90000 });
+
+/**
+ * The wait after failed attempt `attempt` (1-based): the capped base, scaled
+ * by a jitter draw in [0.5, 1.5).
+ *
+ * The cap applies to the BASE, never to the jittered delay. Capping the delay
+ * would pin every draw above the cap to exactly the cap, and the runs a sweep
+ * started together would wake together on the last wait, the one most likely to
+ * succeed. The spread on each wait is as wide as the wait itself, as full jitter's
+ * is, and the 0.5 floor keeps a run from retrying straight back into the sweep.
+ */
+function retryDelay(attempt, { backoffMs, maxBackoffMs, random }) {
+  const base = Math.min(maxBackoffMs, backoffMs * 2 ** (attempt - 1));
+  return Math.round(base * (0.5 + random()));
+}
+
 async function readBoard({
   runQuery,
   projectId,
   maxPages = 20,
-  maxAttempts = 3,
+  maxAttempts = RETRY_BUDGET.maxAttempts,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-  backoffMs = 2000,
+  backoffMs = RETRY_BUDGET.backoffMs,
+  maxBackoffMs = RETRY_BUDGET.maxBackoffMs,
   random = Math.random,
 }) {
   let last = null;
@@ -223,7 +266,7 @@ async function readBoard({
         // advancing, and telling those apart is the entire job of this guard.
         //
         // Returns rather than setting `retry`: a stuck cursor loops the same way
-        // on a re-read, so retrying only spends two more full board reads to
+        // on a re-read, so retrying only spends every remaining full board read to
         // reach the same answer. Returning HERE also makes falling through to
         // the retry structurally impossible rather than merely absent.
         if (cursor && page >= maxPages) {
@@ -253,10 +296,10 @@ async function readBoard({
       // for these retries is CORRELATED -- a batch de-escalation fires many runs
       // at once, they collide on the same board, and they all mismatch within a
       // second of each other. A fixed delay marches every one of them back into
-      // the API in lockstep, re-reading the whole board (~7 pages) each time, at
-      // exactly the moment the board is busiest. Spreading them is what keeps
-      // the fix from amplifying the load it was written to survive.
-      await sleep(Math.round(backoffMs * attempt * (0.5 + random())));
+      // the API in lockstep, re-reading the whole board each time, at exactly
+      // the moment the board is busiest. Spreading them is what keeps the fix
+      // from amplifying the load it was written to survive.
+      await sleep(retryDelay(attempt, { backoffMs, maxBackoffMs, random }));
     }
   }
 
@@ -368,4 +411,4 @@ function preservationComment({ dates, itemId }) {
   ].join("\n");
 }
 
-module.exports = { isPmLabel, decideAction, shouldSync, datesOf, readBoard, resolveRemoval, preservationComment };
+module.exports = { isPmLabel, decideAction, shouldSync, datesOf, readBoard, RETRY_BUDGET, retryDelay, resolveRemoval, preservationComment };

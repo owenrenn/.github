@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const { decideAction, isPmLabel } = require("./sync.js");
-const { resolveRemoval, datesOf, preservationComment, readBoard } = require("./sync.js");
+const { resolveRemoval, datesOf, preservationComment, readBoard, RETRY_BUDGET, retryDelay } = require("./sync.js");
 
 test("any pm:-prefixed label counts, including one not yet in canon", () => {
   // WHY prefix rather than a derived set: reconcile.js derives the pm:* set from
@@ -594,7 +594,7 @@ test("a cursor that stops advancing is truncated, not retried forever", async ()
   assert.equal(r.status, "truncated");
   // Pins the BYPASS, not just the status. Letting truncation fall into the retry
   // loop would still yield status "truncated" (from the final attempt) with this
-  // assertion absent -- green, while spending two extra full board reads and the
+  // assertion absent -- green, while spending every remaining full board read and the
   // backoff on a cursor that is never going to advance.
   assert.equal(r.attempts, 1);
 });
@@ -715,6 +715,90 @@ test("retry backoff is jittered, so correlated runs do not re-read in lockstep",
   });
   assert.notDeepEqual(lo, delays);
   assert.ok(lo.every((d, i) => d < delays[i]));
+});
+
+// --- The retry budget (#1571) -----------------------------------------------
+//
+// A batch sweep lasts minutes, and every read overlapping it mismatches, so a
+// budget of a few seconds' spread failed those runs and stranded their cards
+// until the daily reconcile. The budget is few attempts (each is a full paged
+// read against a shared hourly request budget) and long waits (free). These
+// pin both halves, and the timeout the worst case has to fit inside.
+
+const persistentMismatch = () => {
+  let calls = 0;
+  return {
+    calls: () => calls,
+    run: async () => {
+      calls++;
+      return { user: { projectV2: { id: "PVT_test", items: {
+        totalCount: 9, nodes: [], pageInfo: { hasNextPage: false },
+      }}}};
+    },
+  };
+};
+
+async function delaysAt(randomValue) {
+  const delays = [];
+  const q = persistentMismatch();
+  await readBoard({
+    runQuery: q.run, projectId: "PVT_test",
+    sleep: async (ms) => { delays.push(ms); }, random: () => randomValue,
+  });
+  return delays;
+}
+
+test("the retry budget is five attempts, a 15s base doubling to a 90s cap", () => {
+  assert.deepEqual({ ...RETRY_BUDGET }, { maxAttempts: 5, backoffMs: 15000, maxBackoffMs: 90000 });
+});
+
+test("by default a read that never settles makes exactly five attempts, and no more requests", async () => {
+  // Attempts are the cost: each is a full paged read. Ten would put a sweep's
+  // worth of concurrent runs over the token's hourly budget.
+  const q = persistentMismatch();
+  const r = await readBoard({ runQuery: q.run, projectId: "PVT_test", sleep: async () => {} });
+  assert.equal(r.status, "inconsistent");
+  assert.equal(r.attempts, 5);
+  assert.equal(q.calls(), 5);
+});
+
+test("the default waits are 15s, 30s, 60s and 90s at the jitter midpoint", async () => {
+  // About three and a quarter minutes in all: long enough that the last read
+  // lands after a sweep of a few dozen removals has ended.
+  assert.deepEqual(await delaysAt(0.5), [15000, 30000, 60000, 90000]);
+});
+
+test("jitter spans half to one-and-a-half of the base, and the cap binds the BASE, not the delay", async () => {
+  // The top of the last wait is 135s, above the 90s cap. Capping the delay
+  // instead would pin every high draw to exactly 90s, and the runs a sweep
+  // started together would wake together on the retry most likely to succeed.
+  assert.deepEqual(await delaysAt(0), [7500, 15000, 30000, 45000]);
+  assert.deepEqual(await delaysAt(1), [22500, 45000, 90000, 135000]);
+});
+
+test("retryDelay doubles until the cap and then holds the base there", () => {
+  const opts = { backoffMs: 15000, maxBackoffMs: 90000, random: () => 0.5 };
+  assert.deepEqual([1, 2, 3, 4, 5, 6].map((a) => retryDelay(a, opts)), [15000, 30000, 60000, 90000, 90000, 90000]);
+});
+
+test("the workflow leaves the retry budget to the module", () => {
+  // An override in the call would make every assertion above describe a
+  // budget production does not use.
+  assert.ok(!/maxAttempts|backoffMs|maxBackoffMs/.test(WORKFLOW_CODE));
+});
+
+test("the worst-case retry path fits inside the job's timeout with margin", async () => {
+  // Every jitter draw at the top, plus a full read per attempt at a generous
+  // minute each (a read is about half a minute at the board's current size, and
+  // slower under the load that causes the retries), must leave a quarter of the
+  // timeout spare. A run killed mid-retry strands its card exactly as a failed
+  // read does.
+  const timeouts = [...WORKFLOW_CODE.matchAll(/timeout-minutes:\s*(\d+)/g)].map((m) => Number(m[1]));
+  assert.equal(timeouts.length, 1, "expected exactly one job timeout in the sync workflow");
+  const worstWaitMs = (await delaysAt(1)).reduce((a, b) => a + b, 0);
+  const worstMs = worstWaitMs + RETRY_BUDGET.maxAttempts * 60000;
+  assert.ok(worstMs <= timeouts[0] * 60000 * 0.75,
+    `worst case ${worstMs / 1000}s does not leave a quarter of ${timeouts[0]} minutes spare`);
 });
 
 test("the workflow proceeds ONLY on an explicit ok status", () => {
