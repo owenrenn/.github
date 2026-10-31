@@ -1,7 +1,7 @@
 # AGENTS.md — owenrenn/.github
 
-GitHub's user-level default community-health repo, and — since #469 — the home of
-the fleet's **reusable workflows**.
+GitHub's user-level default community-health repo, and the home of the fleet's
+**reusable workflows** (#469).
 
 ## What lives here and why
 
@@ -12,12 +12,47 @@ the fleet's **reusable workflows**.
 | `scripts/card-shark-sync/` | Pure decision logic for the above (`sync.js` = membership, `fields.js` = field derivation), plus their `node --test` suites. |
 | `.github/workflows/autoclose-guard.yml` | **Reusable**. **Fails** when what a PR *declares* it closes differs from what GitHub *registered* — in either direction (#942). A close is declared by a closing keyword on a line of its own (`Closes #N`, `Closes owner/repo#N`) and by nothing else; write nothing and the PR declares it closes nothing. Red, and **never a required check**: it does not block a merge. |
 | `scripts/autoclose-guard/` | Pure decision logic for the above, plus its `node --test` suite. |
-| `.github/workflows/guard-own-prs.yml` | **This repo's own caller** of the guard above (#911). It uses `uses: ./…` **and passes `logic_ref: github.sha`**, so a PR that changes the guard runs its own version of both halves on itself: the workflow file and the predicate it loads come from the same commit (on `pull_request`, the test-merge commit). ⚠️ Until #942 only the workflow half was the PR's; the predicate still came from `main`, so a PR changing both crashed on itself. No other caller passes `logic_ref`. Until this caller existed, the repo where guard changes land was the one fleet repo the guard never checked. |
+| `.github/workflows/guard-own-prs.yml` | **This repo's own caller** of the guard above (#911). It uses `uses: ./…` **and passes `logic_ref: github.sha`**, so a PR that changes the guard runs its own version of both halves on itself: the workflow file and the predicate it loads come from the same commit (on `pull_request`, the test-merge commit). Only this repo's two own-PR callers pass `logic_ref`; a fleet caller omits it and runs `main`. |
 | `.github/workflows/fleet-checks.yml` | **Reusable**. On a pull request, the **changelog fragment check** and the **dead-path ratchet** (#1561, the D7 and D8 rulings on #1555). |
 | `.github/workflows/fleet-checks-own-prs.yml` | **This repo's own caller** of the fleet checks (#1561), the `guard-own-prs.yml` pattern: `uses: ./…` plus `logic_ref: github.sha`, so a PR changing the workflow or its scripts runs both on itself. ⚠️ **So this repo is held to the checks it hosts**: a code PR here adds a fragment or says `Changelog: none — <why>`, and dead paths ratchet against `.github/dead-paths-baseline.json`. `tests.yml` fails if a body with a `logic_ref` input has no such caller. |
 | `scripts/fleet-checks/` | The two checks, the changelog generator and their CLI, plus `node --test` suites. ⚠️ **Published here byte for byte from the operations repo's `scripts/fleet-checks/` by its `publish.sh` — never hand-edit them here**: the next publish erases the edit. They live here because this is where they execute. |
 | `actions/publish-update-feed/` | **Composite action.** Uploads release payloads + an optional manifest to S3-compatible object storage, then verifies the feed from the public URL a client reads. |
 | `.github/workflows/tests.yml` | This repo's CI: the `node --test` suite, plus the structural check that every workflow here parses and every job carries `timeout-minutes` (#587). |
+
+## Universal rules — one hop up
+
+Every rule that applies to all of the fleet's repos (Role, Partnership model, Git,
+Multi-Agent Coordination, Code Style, Testing, Security, GitHub Issues, Documentation,
+Session Handoff) lives in **one** file, loaded by Claude Code as `~/.claude/CLAUDE.md` and tracked for every other agent in the operations repo at `config/claude/global-CLAUDE.md`.
+Read it before working here; this file never restates it. An agent that does not load it
+automatically (Codex, Copilot, Cursor) fetches it with its own authenticated `gh`:
+
+```bash
+gh api repos/<the operations repo>/contents/config/claude/global-CLAUDE.md --jq .content | base64 -d
+```
+
+⚠️ **The operations repo is named by role here, never by slug** — § The content rule. A
+reader with access resolves it; an anonymous reader learns nothing. Do not paste the fleet
+template's linked form of this section: it carries the private slug.
+
+Fleet standards (changelog, release doc, CI gate, security baseline, git flow) live in the
+engineering knowledge base's `conventions/`, starting at `repo-engineering-standards.md`.
+
+## Audience
+
+**`agent-zone`**, as this repo's row in the operations repo's fleet manifest declares, and
+**escalation-exempt**: the repo carries no Card Shark stub and has never had an issue, so
+none of the audience semantics in the global file § Audience model + Card Shark routing run
+against it.
+
+- Issues are filed in **the operations repo**, not here.
+- ⚠️ **One fleet scanner reads this repo, and it reads files only.** The conformance scan
+  walks the fleet manifest, so it covers this repo, with the stub, `pm:*` label and PAT
+  checks skipped for the exemption (#519): its green row says the files are in order and
+  nothing more. The fleet-state producer drops the user- and org-level community-health repos
+  from its derived roster as infrastructure, so no workflow-health signal watches this repo.
+  It would read nothing if one did: a reusable-workflow run is attributed to its **caller**,
+  so this repo records no Card Shark sync runs however the fleet's board sync behaves (#473).
 
 ## Calling the Card Shark sync
 
@@ -89,18 +124,16 @@ self-hosted runner of its own.
 every structural check, merge green and never run correctly. The PR that adds the
 stub is itself a `pull_request` event, so it exercises the guard on arrival —
 check that run before assuming the wiring holds. ⚠️ That arrival run is an
-`opened` event, and **before #916 it could read OK over a real problem**:
-`closingIssuesReferences` lags a body write, and on `opened` it read empty. The
-guard now waits and re-reads (up to 4 × 5s) until the registered set settles, so an
-arrival run that says OK can be believed. It can also take ~20s longer than you'd
-expect when the body really does disagree.
+`opened` event, and `closingIssuesReferences` lags a body write, so on `opened` it can
+read empty. The guard waits and re-reads (up to 4 × 5s) until the registered set
+settles (#916), so an arrival run that says OK can be believed. It takes ~20s longer
+than you'd expect when the body really does disagree.
 
 ### What a red guard means, and what a caller must not do with it
 
-⚠️ **The guard fails the job when declared and registered disagree (#942).** It used to be
-advisory: it reached the right verdict, wrote it in a PR comment, and exited `pass`. The check
-row read green beside a finding nobody opened, again and again. The finding now sits on the
-status surface, and the comment explains it.
+⚠️ **The guard fails the job when declared and registered disagree (#942)**, so the finding
+sits on the status surface, where it is seen, and the PR comment explains it. A verdict that
+lived only in a comment beside a green row would go unread.
 
 | The body declares | GitHub registered | Result |
 |---|---|---|
@@ -137,11 +170,10 @@ status surface, and the comment explains it.
   declares nothing. `GH-5` is `#5`. Forms the guard does not read as a declaration (a markdown
   link around the ref, a URL in angle brackets, a ref in parentheses) fail as *undeclared* if
   GitHub registers them, which is the safe direction. An **HTML comment** is an example too and
-  declares nothing. **Measured (#1167): GitHub registers nothing for a closing keyword inside
-  one**, and the guard used to read it as a declaration, so a template hiding an example line
-  with a real number in a comment failed every PR as "unregistered so far". Only a comment that
-  ends counts: an unclosed `<!--` is read as written, and what GitHub does with one was not
-  measured.
+  declares nothing: **measured (#1167), GitHub registers nothing for a closing keyword inside
+  one**, so a PR template may hide an example line with a real number in a comment. Only a
+  comment that ends counts: an unclosed `<!--` is read as written, and what GitHub does with one
+  is not measured.
 - **Not covered:** a closing keyword that arrives in a commit message folded into a squash
   merge. It registers at merge time, after every check has run.
 
@@ -211,8 +243,8 @@ argument, a bad config, a git failure). A release script reads them the same way
 
 A self-updating client's healthy idle state is **silence**, so a feed that was never
 published looks exactly like a feed with nothing new — indefinitely. This action exists
-to convert each of those silences into a red run. One product in this fleet shipped a
-completely dead updater through eight releases before anyone asked.
+to convert each of those silences into a red run: a dead updater otherwise ships release
+after release with no symptom.
 
 ⚠️ **It is a composite action, not a reusable workflow — a `steps:` entry, not a
 `jobs:` entry.** That is deliberate and not stylistic: the files being published live in
@@ -246,9 +278,8 @@ inventory of private surfaces to anonymous readers. Do not add one.
 ⚠️ **Serialize your release runs.** This action cannot protect a feed from a *second
 run of itself*. Two release runs that overlap will both upload, and a loser finishing its
 manifest after a winner's payload leaves the manifest naming a payload-hash no stored
-object has — clients then reject every update while the feed looks fully populated. That
-is not theoretical: a tag delete + re-push produced two runs seconds apart on the rollout
-that motivated this action. Callers need:
+object has — clients then reject every update while the feed looks fully populated. A tag
+delete + re-push is enough to start two runs seconds apart. Callers need:
 
 ```yaml
 concurrency:
@@ -301,14 +332,11 @@ repositories here does better than that, and defeats it. So:
 
 **The publish surface is not only the files.** The repo **description**, commit messages,
 branch names and PR titles are all served to an anonymous visitor, and a scrub of file
-contents cannot see any of them — which is exactly how they were missed. PR #3 cleaned
-every tracked file and held; a 2026-08-15 sweep still found the operations repo named in
-both `.github` repos' descriptions and in eleven of sixteen commit messages — two of them
-being the scrub commits themselves, which name it while describing why it should not be
-named. That is the trap in miniature: the pass was scoped to files, and a commit message
-is not a file. So the rules above apply to a commit subject and a PR title verbatim, and
-**when you rename what this repo is, check the description too** — it is the surface a
-visitor reads first and the one no diff will ever show you.
+contents cannot see any of them. A commit message is not a file, and a scrub commit that
+names what it scrubs while explaining why discloses it again. So the rules above apply to a
+commit subject and a PR title verbatim, and **when you rename what
+this repo is, check the description too** — it is the surface a visitor reads first and the
+one no diff will ever show you.
 
 Commit history is the one place the rule is applied going *forward* only: rewriting it
 means force-pushing `main`, which every fleet caller resolves `card-shark-sync.yml@main`
@@ -316,9 +344,8 @@ against. Not worth it to scrub a name already disclosed elsewhere. Write the nex
 correctly instead.
 
 **The one deliberate exception** is the project ID in `card-shark-sync.yml`. It is a
-handle, not a key — verified 2026-08-13: an unauthenticated GraphQL request carrying it
-returns `403`, and an authenticated one still requires authorization on the project
-itself. It stays because the workflow cannot resolve the board without it. If that ever
+handle, not a key: an unauthenticated GraphQL request carrying it returns `403`, and an
+authenticated one still requires authorization on the project itself. It stays because the workflow cannot resolve the board without it. If that ever
 becomes removable at reasonable cost, remove it: it is the last thing here that confirms
 a private surface exists.
 
@@ -328,15 +355,6 @@ stub comment for why.
 ## Working here
 
 - Branch `feat/issue-NNN-*` / `fix/issue-NNN-*`; PR to `main`; never commit to `main`.
-- Issues are filed in **the operations repo**, not here — this repo is not on the Card
-  Shark roster.
-- ⚠️ **No fleet scanner watches this repo.** ⚠️ **Not because it is absent from the
-  operations repo's fleet manifest — it is listed there.** The manifest is *declared*; what
-  scanners walk is *derived* from it, and the derivation drops the user- and org-level
-  community-health repos as infrastructure before anything else is read. So the manifest row
-  exists and is inert, including the audience it declares: none of the audience semantics
-  described above ever run against this repo. Adding or editing that row changes nothing —
-  the filter is a layer below it. Tracked as #473.
 - Run `node --test scripts/*/*.test.js` before pushing — every suite `tests.yml` runs.
 - ⚠️ **A bound set here is the fleet's only bound.** A caller job that invokes a
   reusable workflow with `uses:` cannot carry `timeout-minutes` — GitHub permits only
