@@ -57,8 +57,9 @@ jobs:
         #      .github/workflows and cannot reach this repo -- yet this is
         #      exactly where the fleet's bound has to live, because a job calling
         #      a reusable workflow cannot carry the key itself. Left unwatched,
-        #      that bound is one revert from gone, in the one repo no fleet
-        #      scanner covers (#473).
+        #      that bound is one revert from gone: the conformance scan reads
+        #      this repo's files but not this invariant, and no workflow-health
+        #      signal watches it (#473).
         #
         # Structural, not a text regex: `timeout-minutes` appearing somewhere in
         # the file proves nothing about which job carries it, and the whole
