@@ -187,6 +187,8 @@ function datesOf(boardNode) {
  * one read and stops. The check is per run and not atomic, so concurrent runs
  * can each pass it and overshoot by up to one read apiece -- a few dozen runs
  * times a dozen-plus pages is several hundred points, and 1,000 sits above that.
+ * Past about 3,000 items that overshoot can pass 1,000, and the floor no longer
+ * covers all of it.
  * The FIRST attempt is never skipped for budget: the floor only stops retries.
  *
  * The waits exist to outlast a sweep: a few dozen removals take about three
@@ -216,7 +218,7 @@ function retryDelay(attempt, { backoffMs, maxBackoffMs, random }) {
 async function readBoard({
   runQuery,
   projectId,
-  maxPages = 20,
+  maxPages = 50,
   maxAttempts = RETRY_BUDGET.maxAttempts,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   backoffMs = RETRY_BUDGET.backoffMs,

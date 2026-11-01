@@ -585,6 +585,22 @@ test("reading the wrong project fails loudly rather than concluding absence", as
   assert.equal(r.got, "PVT_other");
 });
 
+test("the page cap is 50, as the default and in the workflow's call (#1574)", async () => {
+  // This read counts archived items, so it grows with the board's whole history.
+  let calls = 0;
+  const runQuery = async () => {
+    calls += 1;
+    return { user: { projectV2: { id: "PVT_test", items: {
+      totalCount: 9999, nodes: [item(1)],
+      pageInfo: { hasNextPage: true, endCursor: "stuck" },
+    }}}};
+  };
+  const r = await readBoard({ runQuery, projectId: "PVT_test", sleep: async () => {} });
+  assert.equal(r.status, "truncated");
+  assert.equal(calls, 50);
+  assert.match(WORKFLOW_CODE, /maxPages:\s*50\b/);
+});
+
 test("a cursor that stops advancing is truncated, not retried forever", async () => {
   // Distinct from `inconsistent`: the page cap means the cursor never terminated,
   // so re-reading would loop the same way. Gated on there still being a cursor,
