@@ -24,6 +24,11 @@ on:
 permissions:
   contents: read
 
+# The same run-level cancel as the stub in AGENTS.md § Calling the fleet checks (#1666).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   checks:
     uses: ./.github/workflows/fleet-checks.yml

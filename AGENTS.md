@@ -189,10 +189,21 @@ on:
     types: [opened, edited, synchronize, reopened, ready_for_review]
 permissions:
   contents: read
+# A newer run for the same PR cancels this whole run, not only its `checks` job (#1666).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 jobs:
   checks:
     uses: owenrenn/.github/.github/workflows/fleet-checks.yml@main
 ```
+
+⚠️ **Keep the stub's `concurrency:` block, above all in a caller that adds its own gate job** (one
+that reads `needs.checks.result` under `if: always()`, so the required check's name is the caller's).
+Opening a PR and editing its body at once starts two runs on one SHA. The shared job's own group
+cancels only the older run's `checks`, so an `always()` gate in that run reads `cancelled` and fails
+red next to the newer green one (#1666). The stub's group name must differ from the shared job's
+(`fleet-checks-<repo>-<PR>`): the same name at the workflow and the job level deadlocks the run.
 
 Node is installed by the shared body, so a repo in any language needs nothing else in CI. Two
 files in the caller shape what the checks do, both optional:
