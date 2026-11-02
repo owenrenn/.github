@@ -433,10 +433,12 @@ jobs:
             // the suite can execute them. They were inline here, which is how
             // #490 shipped: a defect nothing could reach.
             //
-            // Cap, not a guess: several hundred items at 100/page is a
-            // single-digit number of pages. Hitting 20 means the cursor stopped
-            // advancing, on a workflow that fires on every label event across
-            // the whole fleet -- left unbounded this loops to the job timeout.
+            // Cap, not a guess: this read counts archived items, which never
+            // leave the board, so it grows with the board's whole history
+            // (#1574). 50 pages is 5,000 items. Past that a read
+            // reports `truncated`, on a workflow that fires on every label event
+            // across the whole fleet -- left unbounded a cursor that stopped
+            // advancing loops to the job timeout.
             //
             // The retry budget is NOT passed here: sync.js's RETRY_BUDGET is the
             // one place it is set, its request arithmetic is written there, and
@@ -445,7 +447,7 @@ jobs:
             const board = await readBoard({
               runQuery: (cursor) => github.graphql(BOARD_QUERY, { cursor }),
               projectId: PROJECT_ID,
-              maxPages: 20,
+              maxPages: 50,
             });
 
             // ⚠️ ALLOWLIST, NOT A BLOCKLIST, and the distinction is the whole
