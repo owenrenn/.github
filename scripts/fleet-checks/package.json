@@ -1,0 +1,4 @@
+{
+  "//": "Pins these files to CommonJS wherever they are checked out: the shared workflow puts them inside the calling repo, whose own package.json may say type: module (#1563).",
+  "type": "commonjs"
+}
