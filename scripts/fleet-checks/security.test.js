@@ -194,7 +194,9 @@ function capture(fn) {
   const o = process.stdout.write; const e = console.error;
   process.stdout.write = (s) => { out.push(String(s)); return true; };
   console.error = (...a) => { err.push(a.join(" ")); };
-  try { return { code: fn(), out: out.join(""), err: err.join("\n") }; } finally { process.stdout.write = o; console.error = e; }
+  // Under Actions the CLI also prints `::warning::` workflow commands to stdout; they are not the release body.
+  const body = () => out.join("").split("\n").filter((l) => !l.startsWith("::")).join("\n");
+  try { return { code: fn(), out: body(), err: err.join("\n") }; } finally { process.stdout.write = o; console.error = e; }
 }
 
 test("changelog release appends the Security section after the fragments", () => {
