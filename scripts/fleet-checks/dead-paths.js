@@ -603,11 +603,12 @@ function findDeadPaths({ root, tracked, docs = [], code = [], linksResolveElsewh
           }
           continue;
         }
-        pending.push({ file, line, target: token, resolved: norm[0] });
+        // Every reading is probed for ignore, as every reading was tried for existence (#1695).
+        pending.push({ file, line, target: token, resolved: norm[0], readings: norm });
       }
     }
   }
-  const probes = [...new Set(pending.flatMap((p) => [p.resolved, `${p.resolved}/`]))];
+  const probes = [...new Set(pending.flatMap((p) => p.readings.flatMap((r) => [r, `${r}/`])))];
   const ignored = ignoredPaths(root, probes);
   // Git decides, not a parser of .gitignore here: a path is skipped only when
   // git ignores it (as a file, or as a directory), never because something
@@ -616,7 +617,7 @@ function findDeadPaths({ root, tracked, docs = [], code = [], linksResolveElsewh
   const isIgnored = (p) => ignored.has(p) || ignored.has(`${p}/`);
   let skippedIgnored = 0;
   for (const p of pending) {
-    if (isIgnored(p.resolved)) { skippedIgnored++; continue; }
+    if (p.readings.some(isIgnored)) { skippedIgnored++; continue; }
     findings.push({ file: p.file, line: p.line, target: p.target, resolved: p.resolved, kind: "comment-path", reason: "names a path that does not exist in the repository" });
   }
   return { findings, skippedIgnored };

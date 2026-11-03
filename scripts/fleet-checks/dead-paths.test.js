@@ -127,6 +127,28 @@ test("a gitignored output, file or directory, is not a finding", () => {
   assert.equal(skippedIgnored, 2);
 });
 
+test("a ./ path gitignored from the repo root is not a finding, read from any directory (#1695)", () => {
+  // `./x` is read both file-relative and root-relative for existence, so the ignore
+  // probe must take both readings too: a script's comment naming its cwd's cache dir
+  // was reported dead because only the file-relative reading was probed.
+  const { findings, skippedIgnored } = judge({
+    ".gitignore": "supabase/.temp/\n",
+    "supabase/keep.sql": "",
+    "config/foyer/dump.sh": "# the CLI finds its link in ./supabase/.temp relative to the working directory\n",
+  });
+  assert.deepEqual(findings, []);
+  assert.equal(skippedIgnored, 1);
+});
+
+test("a ./ path ignored under NEITHER reading is still a finding", () => {
+  const { findings } = judge({
+    ".gitignore": "/elsewhere/\n",
+    "supabase/keep.sql": "",
+    "config/foyer/dump.sh": "# reads ./supabase/gone.sql\n",
+  });
+  assert.deepEqual(findings.map((f) => f.target), ["./supabase/gone.sql"]);
+});
+
 test("a doc link and a comment anchor are judged against headings", () => {
   const { findings } = judge({
     "docs/a.md": "# Title\n\n[ok](#title) [bad](#nope) [gone](missing.md)\n",
