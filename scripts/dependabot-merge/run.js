@@ -12,6 +12,8 @@
 const { holdMatcher, judgeHeldFiles, judgePr, judgeRules, judgeChecks, codeChecks } = require("./decide.js");
 const { readSwitch } = require("./switch.js");
 
+// ⚠️ PAIRED: the operations repo's autonomy metrics count these merges by this line, matched up to
+// "workflow". Reword it there in the same change, or the count reads 0 while merges continue.
 const TRAILER = "Merged on green by the fleet's Dependabot merge workflow (#1685).";
 
 async function decideOne({ github, owner, repo, number, runHeadSha, defaultBranch, held = holdMatcher(""), log }) {
