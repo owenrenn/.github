@@ -27,9 +27,9 @@
 // signature) and reads the same block. Dependabot leaves `update-type` out of a security update's
 // block (and of a version update it cannot classify), so a one-dependency block without one takes
 // its step from the old and new versions the message names, as the action infers a step from
-// version strings, but stricter: the subject and the body's `Bumps` line must both name the
-// block's own dependency and version and agree on the old one, and both versions must be plain
-// `x.y.z`.
+// version strings, but stricter: every `from A to B` pair the message writes for it must name the
+// block's own dependency and version and agree on the old one, and both versions must be
+// `x.y.z` with no pre-release (updateTypeFromMessage).
 
 const DEPENDABOT = "dependabot[bot]";
 const MERGEABLE_UPDATES = new Set(["version-update:semver-patch", "version-update:semver-minor"]);
@@ -83,38 +83,49 @@ function parseUpdates(message) {
   return deps.map((d) => ({ name: d["dependency-name"] ?? null, version: d["dependency-version"] ?? null, updateType: d["update-type"] ?? null, dependencyType: d["dependency-type"] ?? null }));
 }
 
-/** `{ parts: [major, minor, patch], pre }` from `1.2.3`, `v1.2.3` or `1.2.3-rc.1+build`, or null. */
+/**
+ * `{ parts: [major, minor, patch], plain }` from a version that opens with `[v]x.y.z`, or null.
+ * `plain` is true when nothing follows but `+build` metadata: no pre-release, no fourth part.
+ */
 function parseVersion(v) {
-  const m = String(v ?? "").match(/^v?(\d+)\.(\d+)\.(\d+)([-+]\S*)?$/);
-  return m ? { parts: m.slice(1, 4).map(Number), pre: m[4] != null } : null;
+  const m = String(v ?? "").match(/^v?(\d+)\.(\d+)\.(\d+)(.*)$/);
+  return m ? { parts: m.slice(1, 4).map(Number), plain: /^(\+\S*)?$/.test(m[4]) } : null;
 }
 
-// Dependabot's subject, after whatever prefix the repo configures (`chore(deps): `, `[deps] `):
-// `bump <name> from <old> to <new>[ in <dir>]`.
-const SUBJECT = /(?:^|\s)[Bb]ump (\S+) from (\S+) to (\S+)(?: in \S+)?$/;
-// Dependabot's first body line, which no prefix changes: `Bumps [<name>](<url>) from <old> to <new>.`
-const BUMPS = /^Bumps (?:\[([^\]\n]+)\]\([^)\n]*\)|(\S+)) from (\S+) to (\S+)\.$/gm;
+// Where Dependabot writes an update's old and new versions. The subject, after whatever prefix the
+// repo configures: `bump <name> from <old> to <new>[ in <dir>]`; it drops the versions from a long
+// subject, so it is checked when it carries them and never required. The body, which no prefix or
+// length rule changes: `Bumps [<name>](<url>) from <old> to <new>.`, and per copy or group member
+// ``Updates `<name>` from <old> to <new>``.
+const SUBJECT = /(?:^|\s)[Bb]ump (\S+) from (\S+) to (\S+)(?: in .+)?$/;
+const BODY_PAIRS = [
+  /^Bumps (?:\[([^\]\n]+)\]\([^)\n]*\)|(\S+)) from (\S+) to (\S+)\.$/gm,
+  /^Updates `([^`\n]+)`()() from (\S+) to (\S+)$/gm,
+];
 
 /**
  * The semver step of a one-dependency update whose block has no `update-type`, read from the
- * versions its commit message names: `{ type }`, or `{ type: null, why }`, which is refused. The
- * subject and every `Bumps` line must name the block's own dependency and version and agree on
- * the old version, so a lockfile holding the dependency at two versions refuses; both versions
- * must be plain `x.y.z`, and the step must go up.
+ * versions its commit message names: `{ type }`, or `{ type: null, why }`, which is refused.
+ * The body must write at least one `from A to B` pair, and every pair, the subject's included,
+ * must name the block's own dependency and version and agree on the old version, so a lockfile
+ * holding the dependency at two versions refuses. Both versions must be `x.y.z` with no
+ * pre-release, and the step must go up.
  */
 function updateTypeFromMessage(message, { name, version }) {
+  if (!name || !version) return { type: null, why: "the block names no dependency-name or no dependency-version" };
   const text = String(message ?? "").replace(/\r\n/g, "\n");
+  const pairs = BODY_PAIRS.flatMap((re) => [...text.matchAll(re)].map((m) => ({ name: m[1] ?? m[2], from: m.at(-2), to: m.at(-1) })));
+  if (!pairs.length) return { type: null, why: "the body writes no from-to versions" };
   const s = text.split("\n", 1)[0].match(SUBJECT);
-  if (!s || s[1] !== name || s[3] !== version) return { type: null, why: `the subject does not name ${name} ${version}` };
-  const bumps = [...text.matchAll(BUMPS)];
-  if (!bumps.length) return { type: null, why: "the body has no Bumps line" };
-  if (bumps.some((b) => (b[1] ?? b[2]) !== name || b[3] !== s[2] || b[4] !== version)) {
-    return { type: null, why: "the body's Bumps line disagrees with the subject" };
+  if (s) pairs.push({ name: s[1], from: s[2], to: s[3] });
+  const from = pairs[0].from;
+  if (pairs.some((p) => p.name !== name || p.to !== version || p.from !== from)) {
+    return { type: null, why: `the message's from-to versions do not all name ${name} from ${from} to ${version}` };
   }
-  const [from, to] = [parseVersion(s[2]), parseVersion(version)];
-  if (!from || !to || from.pre || to.pre) return { type: null, why: `${s[2]} to ${version} is not a plain x.y.z step` };
-  const i = from.parts.findIndex((n, k) => n !== to.parts[k]);
-  if (i < 0 || to.parts[i] < from.parts[i]) return { type: null, why: `${s[2]} to ${version} is not a step up` };
+  const [a, b] = [parseVersion(from), parseVersion(version)];
+  if (!a?.plain || !b?.plain) return { type: null, why: `${from} to ${version} is not an x.y.z step` };
+  const i = a.parts.findIndex((n, k) => n !== b.parts[k]);
+  if (i < 0 || b.parts[i] < a.parts[i]) return { type: null, why: `${from} to ${version} is not a step up` };
   return { type: `version-update:semver-${["major", "minor", "patch"][i]}` };
 }
 
@@ -272,30 +283,29 @@ function judgePr({ repo, defaultBranch, pr, commits, runHeadSha, held = () => fa
 
   const parsed = parseUpdates(head.commit?.message);
   if (!parsed) return no("the head commit carries no readable Dependabot metadata");
-  // A subject names one dependency, so the message fills in only a one-dependency block.
-  const updates = parsed.length === 1 && parsed[0].updateType == null
-    ? parsed.map((u) => {
-      const read = updateTypeFromMessage(head.commit.message, u);
-      return { ...u, updateType: read.type, inferred: read.why ?? "read from the message" };
-    })
-    : parsed;
+  // The message's versions describe one dependency, so they fill in only a one-dependency block.
+  let updates = parsed;
+  if (parsed.length === 1 && parsed[0].updateType == null) {
+    const read = updateTypeFromMessage(head.commit.message, parsed[0]);
+    updates = [{ ...parsed[0], updateType: read.type, readFromMessage: true, unread: read.why ?? null }];
+  }
   const holding = [...new Set(updates.filter((u) => held(u.name)).map((u) => u.name))];
   if (holding.length) return no(`held by this repo's stub, merged in a session: ${holding.join(", ")}`);
   const blocked = updates.filter((u) => !MERGEABLE_UPDATES.has(u.updateType));
   if (blocked.length) {
-    return no(`not patch or minor: ${blocked.map((u) => `${u.name ?? "?"} (${u.updateType ?? "no update-type"}${u.inferred ? `; ${u.inferred}` : ""})`).join(", ")}`);
+    return no(`not patch or minor: ${blocked.map((u) => `${u.name ?? "?"} (${u.updateType ?? "no update-type"}${u.unread ? `; ${u.unread}` : u.readFromMessage ? "; read from the message" : ""})`).join(", ")}`);
   }
   // Below 1.0 the leftmost non-zero part is the breaking one (Cargo's and npm's caret ranges): a
   // 0.y minor and a 0.0.z patch are judged as majors. An update with no version to read is refused.
   const breaking = (u) => {
-    const v = parseVersion(u.version);
-    if (!v) return true;
-    if (v.parts[0] !== 0) return false;
-    return u.updateType === "version-update:semver-minor" || v.parts[1] === 0;
+    const m = String(u.version ?? "").match(/^v?(\d+)\.(\d+)\./);
+    if (!m) return true;
+    if (m[1] !== "0") return false;
+    return u.updateType === "version-update:semver-minor" || m[2] === "0";
   };
   const preOne = updates.filter(breaking);
   if (preOne.length) return no(`a breaking bump below 1.0, or no version to read: ${preOne.map((u) => `${u.name ?? "?"} ${u.version ?? "?"}`).join(", ")}`);
-  return { merge: true, reason: `${ecosystem}: ${updates.map((u) => `${u.name} ${u.updateType.replace("version-update:", "")}${u.inferred ? " (read from the message)" : ""}`).join(", ")}` };
+  return { merge: true, reason: `${ecosystem}: ${updates.map((u) => `${u.name} ${u.updateType.replace("version-update:", "")}${u.readFromMessage ? " (read from the message)" : ""}`).join(", ")}` };
 }
 
 /**
