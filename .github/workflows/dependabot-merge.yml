@@ -1,0 +1,67 @@
+# Reusable Dependabot merge on green (#1685, track F). A caller's stub runs it when one of a
+# Dependabot PR's workflows finishes; it merges a patch or minor update once every required check
+# has passed and the autonomy switch reads clear. The rules and their reasons are in
+# scripts/dependabot-merge/decide.js; this file is I/O only.
+#
+# WHY a direct merge and not GitHub's native auto-merge: nothing is ever armed. The switch is read
+# at the moment of each merge, so pulling it stops the next one with no disarm step and no
+# fleet-wide credential, and `allow_auto_merge` stays off in every repo.
+#
+# ⚠️ CALLER CONTRACT, all three in the stub in AGENTS.md:
+#   - `workflows:` names EVERY workflow that produces a required check. This runs when a listed
+#     workflow finishes; if the last required check to finish comes from an unlisted one, nothing
+#     runs after it and the PR waits for a session.
+#   - The stub's `permissions:` grants what the job below asks for. A called workflow cannot
+#     exceed its caller's token, so without it the merge dies on a 403.
+#   - The stub is never added to a control-plane repo. This file refuses only its own repo: the
+#     others are private, and the content rule keeps their names out of a public file.
+#
+# ⚠️ A merge made with the job's token starts no workflow on the default branch. Fleet CI runs on
+# pull requests only, so that matches every other merge there.
+
+name: dependabot merge
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        # The caller's to choose, as for the other reusable workflows here.
+        description: "Runner label for this job. Omit for a GitHub-hosted runner."
+        required: false
+        default: "ubuntu-latest"
+        type: string
+
+jobs:
+  merge:
+    # Dependabot's runs only: anything else is skipped before a runner starts.
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.actor.login == 'dependabot[bot]'
+    runs-on: ${{ inputs.runner }}
+    # The fleet's bound lives here: a caller job using `uses:` cannot carry one (#587).
+    timeout-minutes: 5
+    permissions:
+      contents: write        # the merge
+      pull-requests: write   # the merge
+      checks: read           # the head's check runs
+      statuses: read         # the head's commit statuses
+    # One decision per PR branch at a time: two workflows finishing together would otherwise both
+    # try the merge. Not cancelled: the later run must still read what the earlier one left.
+    concurrency:
+      group: dependabot-merge-${{ github.repository }}-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    steps:
+      # ⚠️ `repository:` is load-bearing: a reusable workflow does not bring its own files, and
+      # without it this checks out the caller. `main`, the ref every stub resolves this file at.
+      # No caller code is checked out: this job never runs anything from the PR.
+      - name: Check out the merge logic
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: owenrenn/.github
+          ref: main
+          path: .dependabot-merge
+          persist-credentials: false
+
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { run } = require(`${process.env.GITHUB_WORKSPACE}/.dependabot-merge/scripts/dependabot-merge/run.js`);
+            await run({ github, context, core });

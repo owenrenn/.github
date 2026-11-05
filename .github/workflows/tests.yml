@@ -44,6 +44,8 @@ jobs:
       # their suites run here too, against the copy that actually executes.
       - name: Run fleet-checks module tests
         run: node --test scripts/fleet-checks/*.test.js
+      - name: Run dependabot-merge module tests
+        run: node --test scripts/dependabot-merge/*.test.js
       - name: Every workflow parses, and every job is bounded
         # Two assertions over one walk, both of which the node suite structurally
         # cannot make:
