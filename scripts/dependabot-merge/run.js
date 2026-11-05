@@ -9,18 +9,23 @@
 //   switch unreadable the job FAILS: the switch is gone or renamed, and someone should see that.
 //   merge refused     the job FAILS with GitHub's answer, unless the PR was merged meanwhile.
 
-const { judgePr, judgeRules, judgeChecks, codeChecks } = require("./decide.js");
+const { holdMatcher, judgeHeldFiles, judgePr, judgeRules, judgeChecks, codeChecks } = require("./decide.js");
 const { readSwitch } = require("./switch.js");
 
 const TRAILER = "Merged on green by the fleet's Dependabot merge workflow (#1685).";
 
-async function decideOne({ github, owner, repo, number, runHeadSha, defaultBranch, log }) {
+async function decideOne({ github, owner, repo, number, runHeadSha, defaultBranch, held, log }) {
   const slug = `${owner}/${repo}`;
   const { data: pr } = await github.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", { owner, repo, pull_number: number });
   const commits = await github.paginate("GET /repos/{owner}/{repo}/pulls/{pull_number}/commits", { owner, repo, pull_number: number, per_page: 100 });
 
-  const verdict = judgePr({ repo: slug, defaultBranch, pr, commits, runHeadSha });
+  const verdict = judgePr({ repo: slug, defaultBranch, pr, commits, runHeadSha, held });
   if (!verdict.merge) return log.notice(`#${number}: not merged: ${verdict.reason}`);
+  if (held.globs.length) {
+    const files = await github.paginate("GET /repos/{owner}/{repo}/pulls/{pull_number}/files", { owner, repo, pull_number: number, per_page: 100 });
+    const inDiff = judgeHeldFiles({ files, held });
+    if (!inDiff.merge) return log.notice(`#${number}: not merged: ${inDiff.reason}`);
+  }
 
   const { data: rules } = await github.request("GET /repos/{owner}/{repo}/rules/branches/{branch}", { owner, repo, branch: defaultBranch, per_page: 100 });
   const gates = judgeRules(rules, { upToDate: ["clean", "unstable", "has_hooks"].includes(pr.mergeable_state) });
@@ -68,8 +73,8 @@ async function decideOne({ github, owner, repo, number, runHeadSha, defaultBranc
   return log.notice(`#${number}: merged: ${verdict.reason}`);
 }
 
-/** The github-script entry point: `run({ github, context, core })`. */
-async function run({ github, context, core }) {
+/** The github-script entry point: `run({ github, context, core, hold })`; `hold` is the caller's input. */
+async function run({ github, context, core, hold }) {
   const wr = context.payload?.workflow_run;
   const log = { notice: (m) => core.notice(m), fail: (m) => core.setFailed(m) };
   if (!wr) return log.notice("not a workflow_run event; nothing to decide");
@@ -81,9 +86,12 @@ async function run({ github, context, core }) {
   // Same-repo PRs only: GitHub leaves this list empty for a branch from a fork.
   const prs = (wr.pull_requests ?? []).filter((p) => p.base?.repo?.id === context.payload.repository?.id);
   if (!prs.length) return log.notice("the run belongs to no PR in this repo");
+  let held;
+  try { held = holdMatcher(hold); } catch (err) { return log.fail(err.message); }
+  if (held.globs.length) log.notice(`holding: ${held.globs.join(", ")}`);
   for (const p of prs) {
     try {
-      await decideOne({ github, owner, repo, number: p.number, runHeadSha: wr.head_sha, defaultBranch, log });
+      await decideOne({ github, owner, repo, number: p.number, runHeadSha: wr.head_sha, defaultBranch, held, log });
     } catch (err) {
       log.fail(`#${p.number}: could not decide: ${err?.status ?? ""} ${err?.message ?? String(err)}`);
     }

@@ -63,10 +63,10 @@ const context = (wr = {}) => ({
   },
 });
 
-async function go(over, wr) {
+async function go(over, wr, hold) {
   const github = fakeGithub(over);
   const notices = []; const failures = [];
-  await run({ github, context: context(wr), core: { notice: (m) => notices.push(m), setFailed: (m) => failures.push(m) } });
+  await run({ github, context: context(wr), core: { notice: (m) => notices.push(m), setFailed: (m) => failures.push(m) }, hold });
   const merge = github.calls.find((c) => c.route.startsWith("PUT"));
   return { github, notices, failures, merge };
 }
@@ -232,4 +232,26 @@ test("strict checks with an uncomputed mergeability wait for GitHub instead of t
   const r = await go({ "GET /repos/{owner}/{repo}/rules/branches/{branch}": rules, "GET /repos/{owner}/{repo}/pulls/{pull_number}": pr });
   assert.strictEqual(r.merge, undefined);
   assert.match(r.notices.at(-1), /up to date/);
+});
+
+test("the caller's hold input reaches the decision, and the run says what it holds", async () => {
+  const r = await go({ "GET /repos/{owner}/{repo}/pulls/{pull_number}/files": [] }, {}, "lodash");
+  assert.strictEqual(r.merge, undefined);
+  assert.strictEqual(r.notices[0], "holding: lodash");
+  assert.match(r.notices.at(-1), /held by this repo's stub, merged in a session: lodash/);
+  assert.ok((await go({}, {}, undefined)).merge, "no hold merges as before, and never reads the files");
+});
+
+test("a held package moved only in the diff stops the merge", async () => {
+  const files = [{ filename: "package-lock.json", patch: '+    "node_modules/example-pkg-core": {' }];
+  const r = await go({ "GET /repos/{owner}/{repo}/pulls/{pull_number}/files": files }, {}, "example-pkg-*");
+  assert.strictEqual(r.merge, undefined);
+  assert.match(r.notices.at(-1), /the diff moves held example-pkg-core/);
+});
+
+test("a malformed hold input fails the job before anything is read", async () => {
+  const r = await go({}, {}, "- example-pkg");
+  assert.strictEqual(r.merge, undefined);
+  assert.match(r.failures[0], /not name globs/);
+  assert.strictEqual(r.github.calls.length, 0);
 });

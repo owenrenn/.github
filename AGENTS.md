@@ -236,6 +236,13 @@ How each outcome shows on the run: the header of `run.js`.
   its merges with no other change.
 - ⚠️ **The autonomy switch is read immediately before each merge**, and an unreadable switch
   fails the job. Add `autonomy:paused` to issue #40 and the next merge anywhere does not happen.
+- **`hold` keeps a repo's own dependency rules in its stub**, under `with:` as
+  `hold: "example-pkg, example-pkg-*"`. Globs, `*` only, separated by commas or newlines, matched
+  against whole names, case-blind, with `-`, `_` and `.` alike. A Maven or Gradle name is
+  `group:artifact`. A PR whose metadata or diff names a match is never merged here, whatever its
+  update type, and a session merges it. ⚠️ **Quote the value**: a plain YAML scalar starting with
+  `*` or `@` breaks the caller's file. An entry that is not a name glob fails the job. ⚠️ The list
+  is as public as the caller: in a public repo, it is published.
 - ⚠️ **A required check from outside Actions can strand a PR.** The stub runs when a listed
   workflow finishes; if the last required check to finish is an external status or another app's
   check run, nothing runs after it, and the PR waits for a session.
