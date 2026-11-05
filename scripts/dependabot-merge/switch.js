@@ -23,6 +23,9 @@ const SWITCH = Object.freeze({
 
 const unreadable = (reason) => ({ state: "unreadable", reason });
 
+// A public issue's read needs no grant from the caller: the job token's `issues` scope covers the
+// caller's repo only, so no stub is asked for it.
+
 /**
  * `clear`, `paused`, or `unreadable` with a reason. Never throws. `request` is an Octokit
  * `request` function (`github.request` in github-script); `def` is overridable for the suite.

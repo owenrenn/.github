@@ -23,7 +23,7 @@ async function decideOne({ github, owner, repo, number, runHeadSha, defaultBranc
   if (!verdict.merge) return log.notice(`#${number}: not merged: ${verdict.reason}`);
 
   const { data: rules } = await github.request("GET /repos/{owner}/{repo}/rules/branches/{branch}", { owner, repo, branch: defaultBranch, per_page: 100 });
-  const gates = judgeRules(rules, { behind: pr.mergeable_state === "behind" });
+  const gates = judgeRules(rules, { upToDate: ["clean", "unstable", "has_hooks"].includes(pr.mergeable_state) });
   if (!gates.merge) return log.notice(`#${number}: not merged: ${gates.reason}`);
   const required = rules
     .filter((r) => r.type === "required_status_checks")
@@ -31,12 +31,15 @@ async function decideOne({ github, owner, repo, number, runHeadSha, defaultBranc
   if (!codeChecks(required).length) return log.notice(`#${number}: not merged: ${defaultBranch} requires no check that tests code`);
 
   const sha = pr.head.sha;
-  // `filter: latest` (the API's default, stated) leaves one run per name per suite; Octokit's
-  // paginate unwraps the `check_runs` key itself.
-  const checkRuns = await github.paginate("GET /repos/{owner}/{repo}/commits/{ref}/check-runs", { owner, repo, ref: sha, filter: "latest", per_page: 100 });
-  // The combined status holds the latest status per context.
-  const { data: combined } = await github.request("GET /repos/{owner}/{repo}/commits/{ref}/status", { owner, repo, ref: sha, per_page: 100 });
-  const checks = judgeChecks({ required, checkRuns, statuses: combined?.statuses });
+  // Both lists in full: Octokit's paginate unwraps the `check_runs` key itself. `filter: latest` is
+  // the API's default, stated; judgeChecks still takes the latest per name, which it does not promise.
+  const [checkRuns, statuses] = await Promise.all([
+    github.paginate("GET /repos/{owner}/{repo}/commits/{ref}/check-runs", { owner, repo, ref: sha, filter: "latest", per_page: 100 }),
+    github.paginate("GET /repos/{owner}/{repo}/commits/{ref}/statuses", { owner, repo, ref: sha, per_page: 100 }),
+  ]);
+  // Newest first: the first status per context is its current one.
+  const current = [...new Map(statuses.slice().reverse().map((st) => [st.context, st])).values()];
+  const checks = judgeChecks({ required, checkRuns, statuses: current });
   if (checks.state !== "pass") return log.notice(`#${number}: not merged (${checks.state}): ${checks.detail}`);
 
   // Read last, immediately before the merge, so a pull of the switch stops the next merge.

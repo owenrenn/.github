@@ -220,7 +220,6 @@ permissions:
   pull-requests: write
   checks: read
   statuses: read
-  issues: read
 jobs:
   merge:
     uses: owenrenn/.github/.github/workflows/dependabot-merge.yml@main

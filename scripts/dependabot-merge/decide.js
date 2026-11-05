@@ -4,7 +4,8 @@
 // A Dependabot PR is merged only when EVERY one of these holds, and anything this file cannot
 // read answers "no merge":
 //   - the PR is open, not a draft, from `dependabot[bot]`, on a `dependabot/` branch of the
-//     same repo, against the default branch, and its head is the commit the triggering run tested;
+//     same repo, against the default branch, free of conflicts, and its head is the commit the
+//     triggering run tested;
 //   - every commit on it is authored by `dependabot[bot]` with a verified signature, so a commit
 //     pushed onto the branch by anyone else stops the merge;
 //   - every dependency it updates is `version-update:semver-patch` or `-minor`, read from the
@@ -13,9 +14,9 @@
 //   - the default branch requires at least one status check besides `fleet-checks-gate`: that
 //     one judges changelog and paths, not code, so a repo requiring nothing else is out;
 //   - the branch rules ask for nothing this job cannot give (an approval, a non-squash merge, a
-//     merge queue): those read as "no merge" here, not as a refused merge on every run;
+//     merge queue, a rule type it does not know): those read as "no merge", not a refused merge;
 //   - every required check's latest run on the head passed, and no other check or status failed;
-//   - no minor bump lands below 1.0, where semver makes a minor a breaking change;
+//   - no breaking bump lands below 1.0 (a 0.y minor, a 0.0.z patch), and every update names its version;
 //   - the kill switch reads clear (switch.js), read last, immediately before the merge.
 //
 // WHY the metadata is parsed here rather than by `dependabot/fetch-metadata`: that action reads
@@ -47,18 +48,23 @@ function scalar(raw) {
 
 /**
  * The `updated-dependencies` list from a Dependabot commit message, as
- * [{ name, updateType, dependencyType }], or null when the block is missing or malformed.
- * The block sits between a `---` line and a `...` line.
+ * [{ name, version, updateType, dependencyType }] (a field Dependabot left out is null), or null
+ * when the block is missing or malformed. The block sits between a `---` line and a `...` line.
  */
 function parseUpdates(message) {
   if (typeof message !== "string") return null;
-  // Anchored on the key, and the LAST such block: Dependabot writes its own at the end, and text
-  // above it, copied from the dependency's release notes, could carry a block of its own.
-  const blocks = [...message.replace(/\r\n/g, "\n").matchAll(/^---\nupdated-dependencies:\n([\s\S]*?)\n\.\.\.$/gm)];
-  const block = blocks.at(-1);
-  if (!block) return null;
+  // Anchored on the key, and the LAST such opening: Dependabot writes its own block at the end, and
+  // text above it, copied from the dependency's release notes, could carry one of its own,
+  // terminated or not.
+  const text = `\n${message.replace(/\r\n/g, "\n")}`;
+  const OPEN = "\n---\nupdated-dependencies:\n";
+  const start = text.lastIndexOf(OPEN);
+  if (start < 0) return null;
+  const body = text.slice(start + OPEN.length);
+  const end = body.search(/^\.\.\.$/m);
+  if (end < 0) return null;
   const deps = [];
-  for (const line of block[1].split("\n")) {
+  for (const line of body.slice(0, end).split("\n")) {
     if (!line.trim()) continue;
     const item = line.match(/^- ([a-z-]+):(.*)$/);
     const field = line.match(/^ {2}([a-z-]+):(.*)$/);
@@ -87,11 +93,12 @@ function judgeChecks({ required, checkRuns, statuses }) {
   if (!Array.isArray(required) || !Array.isArray(checkRuns) || !Array.isArray(statuses)) {
     return { state: "fail", detail: "the checks could not be read" };
   }
-  // Latest run per (name, app, check suite): a re-run supersedes the run it repeats, and two
-  // workflows with a same-named job stay two checks.
+  // Latest run per (name, app), the identity GitHub's own required-check gate uses: a re-run, even
+  // in a new check suite, supersedes the run it repeats. Two workflows with a same-named job are one
+  // check to GitHub as well, so the fleet keeps job names unique.
   const latest = new Map();
   for (const run of checkRuns) {
-    const key = `${run.name}\u0000${run.app?.id ?? ""}\u0000${run.check_suite?.id ?? ""}`;
+    const key = `${run.name}\u0000${run.app?.id ?? ""}`;
     const prev = latest.get(key);
     if (!prev || (run.id ?? 0) > (prev.id ?? 0)) latest.set(key, run);
   }
@@ -138,6 +145,8 @@ function judgePr({ repo, defaultBranch, pr, commits, runHeadSha }) {
   if (String(pr.head?.repo?.full_name).toLowerCase() !== String(repo).toLowerCase()) return no("the PR's branch is not in this repo");
   if (pr.base?.ref !== defaultBranch) return no(`the PR targets ${JSON.stringify(pr.base?.ref)}, not the default branch`);
   if (pr.head?.sha !== runHeadSha) return no("the PR's head moved after this run's commit; the newer run decides");
+  if (pr.mergeable === false || pr.mergeable_state === "dirty") return no("the PR has merge conflicts; Dependabot rebases it");
+  if (pr.base?.repo?.allow_squash_merge === false) return no("the repo does not allow a squash merge");
 
   const ecosystem = ecosystemFromBranch(pr.head?.ref);
   if (!ecosystem) return no(`the branch ${JSON.stringify(pr.head?.ref)} is not a Dependabot branch`);
@@ -157,32 +166,42 @@ function judgePr({ repo, defaultBranch, pr, commits, runHeadSha }) {
   if (blocked.length) {
     return no(`not patch or minor: ${blocked.map((u) => `${u.name ?? "?"} (${u.updateType ?? "no update-type"})`).join(", ")}`);
   }
-  // Below 1.0 a minor bump is a breaking one by semver's own rule, so it is judged as a major. A
-  // minor with no version to read is refused the same way.
-  const preOne = updates.filter((u) => u.updateType === "version-update:semver-minor" && !/^v?[1-9]\d*\./.test(u.version ?? ""));
-  if (preOne.length) return no(`a minor bump below 1.0, or with no version: ${preOne.map((u) => `${u.name ?? "?"} ${u.version ?? "?"}`).join(", ")}`);
+  // Below 1.0 the leftmost non-zero part is the breaking one (Cargo's and npm's caret ranges): a
+  // 0.y minor and a 0.0.z patch are judged as majors. An update with no version to read is refused.
+  const breaking = (u) => {
+    const m = String(u.version ?? "").match(/^v?(\d+)\.(\d+)\./);
+    if (!m) return true;
+    if (m[1] !== "0") return false;
+    return u.updateType === "version-update:semver-minor" || m[2] === "0";
+  };
+  const preOne = updates.filter(breaking);
+  if (preOne.length) return no(`a breaking bump below 1.0, or no version to read: ${preOne.map((u) => `${u.name ?? "?"} ${u.version ?? "?"}`).join(", ")}`);
   return { merge: true, reason: `${ecosystem}: ${updates.map((u) => `${u.name} ${u.updateType.replace("version-update:", "")}`).join(", ")}` };
 }
 
 /**
  * The branch rules' gates beyond required checks, judged before the merge is tried so a gate this
  * workflow can never meet reads as a notice, not as a refused merge on every run. `rules` is the
- * REST answer for the default branch; `behind` whether the PR's base is behind that branch.
+ * REST answer for the default branch; `upToDate` whether GitHub has computed the PR as current
+ * with it. An allowlist: a rule type not named here may ask for something this job cannot give.
  */
-function judgeRules(rules, { behind = false } = {}) {
+const KNOWN_RULES = new Set(["deletion", "non_fast_forward", "creation", "required_linear_history", "required_signatures", "pull_request", "required_status_checks"]);
+
+function judgeRules(rules, { upToDate = false } = {}) {
   if (!Array.isArray(rules)) return no("the branch rules could not be read");
   for (const r of rules) {
     const p = r.parameters ?? {};
+    if (!KNOWN_RULES.has(r.type)) return no(`the branch has a ${r.type} rule this workflow does not judge`);
     if (r.type === "pull_request") {
       if ((p.required_approving_review_count ?? 0) > 0) return no("the branch requires an approving review");
       if (p.require_code_owner_review) return no("the branch requires a code owner's review");
       if (Array.isArray(p.required_reviewers) && p.required_reviewers.length) return no("the branch requires named reviewers");
       if (Array.isArray(p.allowed_merge_methods) && !p.allowed_merge_methods.includes("squash")) return no("the branch does not allow a squash merge");
     }
-    if (r.type === "required_status_checks" && p.strict_required_status_checks_policy && behind) {
-      return no("the branch requires the PR to be up to date, and it is behind");
+    // GitHub computes mergeability lazily, so `unknown` right after the base moves is not "current".
+    if (r.type === "required_status_checks" && p.strict_required_status_checks_policy && !upToDate) {
+      return no("the branch requires the PR to be up to date, and GitHub does not yet say it is");
     }
-    if (["merge_queue", "required_deployments", "workflows", "code_scanning"].includes(r.type)) return no(`the branch has a ${r.type} rule this workflow does not judge`);
   }
   return { merge: true };
 }

@@ -9,7 +9,7 @@ const SHA = "a".repeat(40);
 const ACTIONS = 15368;
 const MESSAGE = [
   "Bump lodash from 4.17.20 to 4.17.21", "", "---", "updated-dependencies:",
-  "- dependency-name: lodash", "  dependency-type: direct:production", "  update-type: version-update:semver-patch",
+  "- dependency-name: lodash", "  dependency-version: 4.17.21", "  dependency-type: direct:production", "  update-type: version-update:semver-patch",
   "...", "", "Signed-off-by: dependabot[bot] <support@github.com>", "",
 ].join("\n");
 
@@ -37,7 +37,7 @@ function fakeGithub(over = {}) {
       { id: 1, name: "ci", status: "completed", conclusion: "success", app: { id: ACTIONS } },
       { id: 2, name: "fleet-checks-gate", status: "completed", conclusion: "success", app: { id: ACTIONS } },
     ],
-    "GET /repos/{owner}/{repo}/commits/{ref}/status": { state: "pending", statuses: [] },
+    "GET /repos/{owner}/{repo}/commits/{ref}/statuses": [],
     "GET /repos/{owner}/{repo}/issues/{issue_number}": switchIssue(),
     "PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge": { merged: true },
     ...over,
@@ -206,7 +206,7 @@ test("a branch rule this job cannot meet is a notice, and the merge is never tri
 });
 
 test("a failing status on the head stops the merge", async () => {
-  const r = await go({ "GET /repos/{owner}/{repo}/commits/{ref}/status": { state: "failure", statuses: [{ context: "deploy", state: "failure" }] } });
+  const r = await go({ "GET /repos/{owner}/{repo}/commits/{ref}/statuses": [{ context: "deploy", state: "failure" }, { context: "deploy", state: "pending" }] });
   assert.strictEqual(r.merge, undefined);
   assert.match(r.notices.at(-1), /failed: deploy/);
 });
@@ -224,4 +224,12 @@ test("a refused merge keeps GitHub's answer even when the re-read fails too", as
 test("the check runs are asked for with filter latest", async () => {
   const r = await go();
   assert.strictEqual(r.github.calls.find((c) => c.route.includes("check-runs")).params.filter, "latest");
+});
+
+test("strict checks with an uncomputed mergeability wait for GitHub instead of trying the merge", async () => {
+  const rules = [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: "ci", integration_id: ACTIONS }] } }];
+  const pr = { ...fakeGithubPr(), mergeable_state: "unknown" };
+  const r = await go({ "GET /repos/{owner}/{repo}/rules/branches/{branch}": rules, "GET /repos/{owner}/{repo}/pulls/{pull_number}": pr });
+  assert.strictEqual(r.merge, undefined);
+  assert.match(r.notices.at(-1), /up to date/);
 });

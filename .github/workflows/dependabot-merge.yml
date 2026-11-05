@@ -43,7 +43,6 @@ jobs:
       pull-requests: write   # the merge
       checks: read           # the head's check runs
       statuses: read         # the head's commit statuses
-      issues: read           # the autonomy switch, an issue in this repo
     # One decision per PR branch at a time: two workflows finishing together would otherwise both
     # try the merge. Not cancelled: the later run must still read what the earlier one left.
     concurrency:
