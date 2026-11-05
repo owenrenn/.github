@@ -1,6 +1,6 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { holdMatcher, judgeHeldFiles, parseUpdates, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks } = require("./decide.js");
+const { holdMatcher, judgeHeldFiles, parseUpdates, updateTypeFromMessage, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks } = require("./decide.js");
 
 // The shape Dependabot writes, from its message builder: subject, links, the metadata block, sign-off.
 const message = (deps, { group } = {}) => [
@@ -171,12 +171,112 @@ test("judgePr merges a verified Dependabot patch or minor update", () => {
   assert.strictEqual(judge({ commits: [minor] }).merge, true);
 });
 
-test("judgePr refuses a major, a missing update-type, or a group with one major in it", () => {
+test("judgePr refuses a major, a missing update-type the message does not name, or a group with one major in it", () => {
+  // `a` is not the dependency the helper's subject names, so the message cannot fill its step in.
   for (const deps of [[{ name: "a", type: MAJOR }], [{ name: "a" }], [{ name: "a", type: PATCH }, { name: "b", type: MAJOR }]]) {
     const c = commit({ commit: { message: message(deps), verification: { verified: true } } });
     const r = judge({ commits: [c] });
     assert.strictEqual(r.merge, false, JSON.stringify(deps));
     assert.match(r.reason, /not patch or minor/);
+  }
+});
+
+// A security update's message, as Dependabot writes it: no `update-type` in the block, the versions
+// in the subject and in the body's `Bumps` line.
+const security = ({ name = "node-forge", from = "1.4.0", version = "1.4.3", subject, bumps, extra = [] } = {}) => [
+  subject ?? `chore(deps): bump ${name} from ${from} to ${version}`, "",
+  ...(bumps ?? [`Bumps [${name}](https://example.com/forge) from ${from} to ${version}.`]), "- [Commits](https://example.com/compare)", "",
+  "---", "updated-dependencies:", `- dependency-name: ${name}`, `  dependency-version: ${version}`, "  dependency-type: indirect", ...extra, "...", "",
+  "Signed-off-by: dependabot[bot] <support@github.com>",
+].join("\n");
+const securityCommit = (o) => commit({ commit: { message: security(o), verification: { verified: true } } });
+const dep = (name = "node-forge", version = "1.4.3") => ({ name, version });
+
+test("updateTypeFromMessage reads the semver step from a Dependabot message", () => {
+  assert.deepStrictEqual(updateTypeFromMessage(security(), dep()), { type: PATCH });
+  assert.deepStrictEqual(updateTypeFromMessage(security({ name: "setuptools", from: "84.0.0", version: "84.1.0", subject: "chore(deps-dev): bump setuptools from 84.0.0 to 84.1.0" }), dep("setuptools", "84.1.0")), { type: MINOR });
+  assert.deepStrictEqual(updateTypeFromMessage(security({ from: "1.4.0", version: "2.0.0", subject: "Bump node-forge from 1.4.0 to 2.0.0 in /web" }), dep("node-forge", "2.0.0")), { type: MAJOR });
+  assert.deepStrictEqual(updateTypeFromMessage(security({ name: "@scope/pkg", from: "v2.3.4", version: "v2.3.9" }), dep("@scope/pkg", "v2.3.9")), { type: PATCH });
+  assert.deepStrictEqual(updateTypeFromMessage(security().replace(/\n/g, "\r\n"), dep()), { type: PATCH });
+});
+
+test("updateTypeFromMessage reads past any subject prefix, a directory with a space, and a Bumps line with no link", () => {
+  for (const subject of ["[deps] Bump node-forge from 1.4.0 to 1.4.3", ":arrow_up: Bump node-forge from 1.4.0 to 1.4.3", "Bump node-forge from 1.4.0 to 1.4.3 in /a dir"]) {
+    assert.deepStrictEqual(updateTypeFromMessage(security({ subject }), dep()), { type: PATCH }, subject);
+  }
+  assert.deepStrictEqual(updateTypeFromMessage(security({ bumps: ["Bumps node-forge from 1.4.0 to 1.4.3."] }), dep()), { type: PATCH });
+});
+
+test("updateTypeFromMessage reads a subject Dependabot shortened, from the body alone", () => {
+  const long = "org.springframework.boot:spring-boot-starter-web";
+  const m = security({ name: long, from: "3.1.4", version: "3.1.5", subject: `chore(deps): bump ${long}` });
+  assert.deepStrictEqual(updateTypeFromMessage(m, dep(long, "3.1.5")), { type: PATCH });
+});
+
+test("updateTypeFromMessage allows build metadata, and refuses a pre-release or a fourth part", () => {
+  assert.deepStrictEqual(updateTypeFromMessage(security({ from: "1.0.0", version: "1.0.1+build.5" }), dep("node-forge", "1.0.1+build.5")), { type: PATCH });
+  for (const [from, version] of [["1.4.0", "1.4.3-rc.1"], ["1.4.0", "1.4.3.1"], ["2.31.0", "2.31.0.post1"]]) {
+    assert.match(updateTypeFromMessage(security({ from, version }), dep("node-forge", version)).why, /not an x.y.z step/, version);
+  }
+});
+
+test("updateTypeFromMessage refuses, with a reason, anything it cannot read exactly", () => {
+  const cases = [
+    [security({ subject: "chore(deps): bump lodash from 1.4.0 to 1.4.3" }), /do not all name node-forge/],
+    [security({ subject: "chore(deps): bump node-forge from 1.4.0 to 1.4.5" }), /do not all name/],
+    [security({ bumps: ["Bumps [node-forge](https://x) from 0.10.0 to 1.4.3."] }), /do not all name/],
+    [security({ bumps: [] }), /writes no from-to versions/],
+    [security({ bumps: [], subject: "chore(deps): bump node-forge from 1.4.0 to 1.4.3" }), /writes no from-to versions/],
+    // A lockfile holding the dependency at two versions, written either way.
+    [security({ bumps: ["Bumps [node-forge](https://x) from 1.4.0 to 1.4.3.", "Bumps [node-forge](https://x) from 0.10.0 to 1.4.3."] }), /do not all name/],
+    [security({ bumps: ["Bumps [node-forge](https://x) from 1.4.0 to 1.4.3.", "Updates `node-forge` from 0.10.0 to 1.4.3"] }), /do not all name/],
+    [security({ bumps: ["Bumps [node-forge](https://x) from 1.4.0 to 1.4.3.", "Updates `lodash` from 4.17.20 to 4.17.21"] }), /do not all name/],
+    [security({ from: "1.4.5" }), /not a step up/],
+    [security({ from: "1.4.3" }), /not a step up/],
+    [security({ from: "1.4" }), /not an x.y.z step/],
+    [security({ from: "1.4.3-rc.1", version: "1.4.3" }), /not an x.y.z step/],
+  ];
+  for (const [m, why] of cases) {
+    const r = updateTypeFromMessage(m, dep());
+    assert.strictEqual(r.type, null, m.split("\n", 3).join(" | "));
+    assert.match(r.why, why, m.split("\n", 3).join(" | "));
+  }
+  assert.strictEqual(updateTypeFromMessage(undefined, dep()).type, null);
+  assert.match(updateTypeFromMessage(security(), { name: "node-forge", version: null }).why, /no dependency-version/);
+  assert.match(updateTypeFromMessage(security(), { name: null, version: "1.4.3" }).why, /no dependency-name/);
+});
+
+test("judgePr merges a security update, whose block has no update-type, by reading the message", () => {
+  assert.deepStrictEqual(judge({ commits: [securityCommit()] }), { merge: true, reason: "npm_and_yarn: node-forge semver-patch (read from the message)" });
+  assert.strictEqual(judge({ commits: [securityCommit({ name: "setuptools", from: "84.0.0", version: "84.1.0" })] }).merge, true);
+});
+
+test("judgePr merges a one-dependency version update with no update-type the same way", () => {
+  // Dependabot also leaves update-type out of a version update it cannot classify; the message decides.
+  const c = commit({ commit: { message: message([{ name: "lodash", version: "4.17.21" }]), verification: { verified: true } } });
+  assert.deepStrictEqual(judge({ commits: [c] }), { merge: true, reason: "npm_and_yarn: lodash semver-patch (read from the message)" });
+});
+
+test("judgePr refuses a message-read major, and says why a read failed", () => {
+  const major = securityCommit({ from: "1.4.0", version: "2.0.0" });
+  assert.match(judge({ commits: [major] }).reason, /not patch or minor: node-forge \(version-update:semver-major; read from the message\)/);
+  const other = securityCommit({ subject: "chore(deps): bump lodash from 1.4.0 to 1.4.3" });
+  assert.match(judge({ commits: [other] }).reason, /node-forge \(no update-type; the message's from-to versions do not all name node-forge from 1.4.0 to 1.4.3\)/);
+});
+
+test("judgePr never reads the message for a block with two or more dependencies", () => {
+  const two = securityCommit({ extra: ["- dependency-name: other", "  dependency-version: 1.4.3", "  dependency-type: indirect"] });
+  assert.match(judge({ commits: [two] }).reason, /not patch or minor: node-forge \(no update-type\), other \(no update-type\)/);
+});
+
+test("judgePr judges a message-read 0.y step as breaking, as it does a written one", () => {
+  assert.match(judge({ commits: [securityCommit({ name: "a", from: "0.3.9", version: "0.4.0" })] }).reason, /below 1.0/);
+});
+
+test("judgePr merges a written patch or minor on a version with a fourth part or a suffix, as before", () => {
+  for (const version of ["6.4.1.Final", "1.2.3.4", "2.31.0.post1", "1.2.3rc1"]) {
+    const c = commit({ commit: { message: message([{ name: "lodash", version, type: PATCH }]), verification: { verified: true } } });
+    assert.strictEqual(judge({ commits: [c] }).merge, true, version);
   }
 });
 
