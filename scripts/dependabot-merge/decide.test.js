@@ -1,6 +1,6 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { holdMatcher, judgeHeldFiles, parseUpdates, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks } = require("./decide.js");
+const { holdMatcher, judgeHeldFiles, parseUpdates, updateTypeFromSubject, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks } = require("./decide.js");
 
 // The shape Dependabot writes, from its message builder: subject, links, the metadata block, sign-off.
 const message = (deps, { group } = {}) => [
@@ -178,6 +178,61 @@ test("judgePr refuses a major, a missing update-type, or a group with one major 
     assert.strictEqual(r.merge, false, JSON.stringify(deps));
     assert.match(r.reason, /not patch or minor/);
   }
+});
+
+// A security update's block, as Dependabot writes it: no `update-type`, the versions in the subject.
+const security = ({ subject = "chore(deps): bump node-forge from 1.4.0 to 1.4.3", name = "node-forge", version = "1.4.3", extra = [] } = {}) => [
+  subject, "", "Bumps [node-forge](https://example.com/forge) from 1.4.0 to 1.4.3.", "",
+  "---", "updated-dependencies:", `- dependency-name: ${name}`, `  dependency-version: ${version}`, "  dependency-type: indirect", ...extra, "...", "",
+  "Signed-off-by: dependabot[bot] <support@github.com>",
+].join("\n");
+const securityCommit = (o) => commit({ commit: { message: security(o), verification: { verified: true } } });
+
+test("updateTypeFromSubject reads the semver step from a Dependabot subject line", () => {
+  const dep = (name, version) => ({ name, version });
+  assert.strictEqual(updateTypeFromSubject("chore(deps): bump node-forge from 1.4.0 to 1.4.3", dep("node-forge", "1.4.3")), PATCH);
+  assert.strictEqual(updateTypeFromSubject("chore(deps-dev): bump setuptools from 84.0.0 to 84.1.0", dep("setuptools", "84.1.0")), MINOR);
+  assert.strictEqual(updateTypeFromSubject("Bump lodash from 4.17.20 to 5.0.0 in /web", dep("lodash", "5.0.0")), MAJOR);
+  assert.strictEqual(updateTypeFromSubject("Bump @scope/pkg from v2.3.4 to v2.3.9", dep("@scope/pkg", "v2.3.9")), PATCH);
+});
+
+test("updateTypeFromSubject answers null for anything it cannot read exactly", () => {
+  const d = { name: "a", version: "1.2.4" };
+  for (const subject of [
+    "chore(deps): bump b from 1.2.3 to 1.2.4",          // another dependency's name
+    "chore(deps): bump a from 1.2.3 to 1.2.5",          // a version the block does not name
+    "chore(deps): bump a from 1.2.5 to 1.2.4",          // a downgrade
+    "chore(deps): bump a from 1.2.4 to 1.2.4",          // no step at all
+    "chore(deps): bump a from 1.2 to 1.2.4",            // a version with fewer than three parts
+    "chore(deps): bump a from 1.2.3-rc.1 to 1.2.4",     // a pre-release on either side
+    "chore(deps): bump the npm group with 2 updates",   // a group names no versions
+    "Update a to 1.2.4",
+    undefined,
+  ]) assert.strictEqual(updateTypeFromSubject(subject, d), null, String(subject));
+  assert.strictEqual(updateTypeFromSubject("bump a from 1.2.3 to 1.2.4-rc.1", { name: "a", version: "1.2.4-rc.1" }), null);
+});
+
+test("judgePr merges a security update, whose block has no update-type, by reading the subject", () => {
+  assert.deepStrictEqual(judge({ commits: [securityCommit()] }), { merge: true, reason: "npm_and_yarn: node-forge semver-patch (from the subject)" });
+  const minor = securityCommit({ subject: "chore(deps-dev): bump setuptools from 84.0.0 to 84.1.0", name: "setuptools", version: "84.1.0" });
+  assert.strictEqual(judge({ commits: [minor] }).merge, true);
+});
+
+test("judgePr refuses a security update the subject shows as a major, or names differently", () => {
+  const major = securityCommit({ subject: "chore(deps): bump node-forge from 1.4.0 to 2.0.0", version: "2.0.0" });
+  assert.match(judge({ commits: [major] }).reason, /not patch or minor: node-forge \(version-update:semver-major\)/);
+  const other = securityCommit({ subject: "chore(deps): bump lodash from 1.4.0 to 1.4.3" });
+  assert.match(judge({ commits: [other] }).reason, /not patch or minor: node-forge \(no update-type\)/);
+});
+
+test("judgePr never reads the subject for a block with two or more dependencies", () => {
+  const two = securityCommit({ extra: ["- dependency-name: other", "  dependency-version: 1.4.3", "  dependency-type: indirect"] });
+  assert.match(judge({ commits: [two] }).reason, /not patch or minor/);
+});
+
+test("judgePr judges a subject-read 0.y step as breaking, as it does a written one", () => {
+  const c = securityCommit({ subject: "chore(deps): bump a from 0.3.9 to 0.4.0", name: "a", version: "0.4.0" });
+  assert.match(judge({ commits: [c] }).reason, /below 1.0/);
 });
 
 test("judgePr refuses a breaking bump below 1.0 (a 0.y minor, a 0.0.z patch) or one with no version; a 0.y patch merges", () => {

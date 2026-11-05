@@ -9,7 +9,8 @@
 //   - every commit on it is authored by `dependabot[bot]` with a verified signature, so a commit
 //     pushed onto the branch by anyone else stops the merge;
 //   - every dependency it updates is `version-update:semver-patch` or `-minor`, read from the
-//     metadata block Dependabot writes into its commit message;
+//     metadata block Dependabot writes into its commit message, or, for a one-dependency block
+//     with no `update-type` (a security update), from the versions its subject line names;
 //   - the ecosystem is not `github_actions`, and neither its metadata nor its diff names a
 //     dependency the caller's `hold` globs match;
 //   - the default branch requires at least one status check besides `fleet-checks-gate`: that
@@ -23,8 +24,9 @@
 // WHY the metadata is parsed here rather than by `dependabot/fetch-metadata`: that action reads
 // the PR from a `pull_request` event payload, and this workflow runs on `workflow_run`, whose
 // payload has none. It applies the same checks as that action (author, commit author, verified
-// signature) and reads the same block, but stricter: a dependency with no `update-type` is not
-// merged, where the action would infer one from the version strings.
+// signature) and reads the same block. Dependabot writes `update-type` on a version update only,
+// so a security update's step is read from the subject (updateTypeFromSubject), as the action
+// reads it, but stricter: one dependency, the block's name and version, three-part versions.
 
 const DEPENDABOT = "dependabot[bot]";
 const MERGEABLE_UPDATES = new Set(["version-update:semver-patch", "version-update:semver-minor"]);
@@ -76,6 +78,25 @@ function parseUpdates(message) {
   }
   if (!deps.length) return null;
   return deps.map((d) => ({ name: d["dependency-name"] ?? null, version: d["dependency-version"] ?? null, updateType: d["update-type"] ?? null, dependencyType: d["dependency-type"] ?? null }));
+}
+
+const SEMVER = /^v?(\d+)\.(\d+)\.(\d+)$/;
+// Dependabot's subject, after any configured prefix: `bump <name> from <old> to <new>[ in <dir>]`.
+const SUBJECT = /(?:^|: )[Bb]ump (\S+) from (\S+) to (\S+)(?: in \S+)?$/;
+
+/**
+ * The semver step of one update, read from its commit's subject line, or null. The subject must
+ * name the block's own dependency and version; a pre-release, a version with fewer than three
+ * parts, a downgrade or no step at all answers null, which is refused.
+ */
+function updateTypeFromSubject(subject, { name, version }) {
+  const m = typeof subject === "string" ? subject.match(SUBJECT) : null;
+  if (!m || m[1] !== name || m[3] !== version) return null;
+  const [from, to] = [m[2], m[3]].map((v) => v.match(SEMVER)?.slice(1).map(Number));
+  if (!from || !to) return null;
+  const i = from.findIndex((n, k) => n !== to[k]);
+  if (i < 0 || to[i] < from[i]) return null;
+  return `version-update:semver-${["major", "minor", "patch"][i]}`;
 }
 
 // Name globs, not path globs: `*` crosses `/` (an npm scope) and `:` (a Maven group), which the
@@ -230,8 +251,13 @@ function judgePr({ repo, defaultBranch, pr, commits, runHeadSha, held = () => fa
   const head = commits.find((c) => c.sha === pr.head.sha);
   if (!head) return no("the PR's head commit is not in its commit list");
 
-  const updates = parseUpdates(head.commit?.message);
-  if (!updates) return no("the head commit carries no readable Dependabot metadata");
+  const parsed = parseUpdates(head.commit?.message);
+  if (!parsed) return no("the head commit carries no readable Dependabot metadata");
+  // A subject names one dependency, so it fills in only a one-dependency block.
+  const subject = String(head.commit.message).split(/\r?\n/, 1)[0];
+  const updates = parsed.length === 1 && parsed[0].updateType == null
+    ? parsed.map((u) => ({ ...u, updateType: updateTypeFromSubject(subject, u), fromSubject: true }))
+    : parsed;
   const holding = [...new Set(updates.filter((u) => held(u.name)).map((u) => u.name))];
   if (holding.length) return no(`held by this repo's stub, merged in a session: ${holding.join(", ")}`);
   const blocked = updates.filter((u) => !MERGEABLE_UPDATES.has(u.updateType));
@@ -248,7 +274,7 @@ function judgePr({ repo, defaultBranch, pr, commits, runHeadSha, held = () => fa
   };
   const preOne = updates.filter(breaking);
   if (preOne.length) return no(`a breaking bump below 1.0, or no version to read: ${preOne.map((u) => `${u.name ?? "?"} ${u.version ?? "?"}`).join(", ")}`);
-  return { merge: true, reason: `${ecosystem}: ${updates.map((u) => `${u.name} ${u.updateType.replace("version-update:", "")}`).join(", ")}` };
+  return { merge: true, reason: `${ecosystem}: ${updates.map((u) => `${u.name} ${u.updateType.replace("version-update:", "")}${u.fromSubject ? " (from the subject)" : ""}`).join(", ")}` };
 }
 
 /**
@@ -283,4 +309,4 @@ function codeChecks(required) {
   return (required ?? []).filter((r) => r.context !== NOT_A_CODE_CHECK);
 }
 
-module.exports = { holdMatcher, judgeHeldFiles, parseUpdates, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks, DEPENDABOT, SELF };
+module.exports = { holdMatcher, judgeHeldFiles, parseUpdates, updateTypeFromSubject, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks, DEPENDABOT, SELF };
