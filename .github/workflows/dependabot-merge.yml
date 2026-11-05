@@ -32,7 +32,7 @@ on:
         type: string
       hold:
         # A repo's own rule, kept in its stub: a dependency that moves only in a session. Globs,
-        # `*` only, separated by commas or newlines. A PR whose metadata or diff names a match is
+        # `*` only, separated by commas or newlines. A PR whose metadata or changed lines name a match is
         # never merged here. Rules: holdMatcher in scripts/dependabot-merge/decide.js.
         description: "Dependency names never merged here, as globs. Omit to hold nothing."
         required: false

@@ -255,3 +255,15 @@ test("a malformed hold input fails the job before anything is read", async () =>
   assert.match(r.failures[0], /not name globs/);
   assert.strictEqual(r.github.calls.length, 0);
 });
+
+test("a malformed hold fails even a run that decides nothing", async () => {
+  const r = await go({}, { conclusion: "failure" }, "- example-pkg");
+  assert.match(r.failures[0], /not name globs/);
+});
+
+test("a set hold with a clean diff still merges", async () => {
+  const files = [{ filename: "package-lock.json", patch: '-    "lodash": "4.17.20"\n+    "lodash": "4.17.21"' }];
+  const r = await go({ "GET /repos/{owner}/{repo}/pulls/{pull_number}/files": files }, {}, "example-pkg-*");
+  assert.ok(r.merge, r.notices.join("\n"));
+  assert.deepStrictEqual(r.failures, []);
+});

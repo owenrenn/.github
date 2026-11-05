@@ -14,7 +14,7 @@ const { readSwitch } = require("./switch.js");
 
 const TRAILER = "Merged on green by the fleet's Dependabot merge workflow (#1685).";
 
-async function decideOne({ github, owner, repo, number, runHeadSha, defaultBranch, held, log }) {
+async function decideOne({ github, owner, repo, number, runHeadSha, defaultBranch, held = holdMatcher(""), log }) {
   const slug = `${owner}/${repo}`;
   const { data: pr } = await github.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", { owner, repo, pull_number: number });
   const commits = await github.paginate("GET /repos/{owner}/{repo}/pulls/{pull_number}/commits", { owner, repo, pull_number: number, per_page: 100 });
@@ -77,6 +77,10 @@ async function decideOne({ github, owner, repo, number, runHeadSha, defaultBranc
 async function run({ github, context, core, hold }) {
   const wr = context.payload?.workflow_run;
   const log = { notice: (m) => core.notice(m), fail: (m) => core.setFailed(m) };
+  // Read first, so a malformed hold fails every run, not only the first green Dependabot PR's.
+  let held;
+  try { held = holdMatcher(hold); } catch (err) { return log.fail(err.message); }
+  if (held.globs.length) log.notice(`holding: ${held.globs.join(", ")}`);
   if (!wr) return log.notice("not a workflow_run event; nothing to decide");
   if (wr.event !== "pull_request") return log.notice(`the run was a ${wr.event} run; nothing to decide`);
   if (wr.conclusion !== "success") return log.notice(`the run concluded ${wr.conclusion}; nothing to merge`);
@@ -86,9 +90,6 @@ async function run({ github, context, core, hold }) {
   // Same-repo PRs only: GitHub leaves this list empty for a branch from a fork.
   const prs = (wr.pull_requests ?? []).filter((p) => p.base?.repo?.id === context.payload.repository?.id);
   if (!prs.length) return log.notice("the run belongs to no PR in this repo");
-  let held;
-  try { held = holdMatcher(hold); } catch (err) { return log.fail(err.message); }
-  if (held.globs.length) log.notice(`holding: ${held.globs.join(", ")}`);
   for (const p of prs) {
     try {
       await decideOne({ github, owner, repo, number: p.number, runHeadSha: wr.head_sha, defaultBranch, held, log });

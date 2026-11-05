@@ -239,8 +239,9 @@ How each outcome shows on the run: the header of `run.js`.
 - **`hold` keeps a repo's own dependency rules in its stub**, under `with:` as
   `hold: "example-pkg, example-pkg-*"`. Globs, `*` only, separated by commas or newlines, matched
   against whole names, case-blind, with `-`, `_` and `.` alike. A Maven or Gradle name is
-  `group:artifact`. A PR whose metadata or diff names a match is never merged here, whatever its
-  update type, and a session merges it. ⚠️ **Quote the value**: a plain YAML scalar starting with
+  `group:artifact`. A PR is never merged here, whatever its update type, when its metadata or any
+  changed line of its diff names a match (npm, yarn, pnpm, Cargo, pip, Bundler and Gradle lockfile
+  shapes); a session merges it. ⚠️ **Quote the value**: a plain YAML scalar starting with
   `*` or `@` breaks the caller's file. An entry that is not a name glob fails the job. ⚠️ The list
   is as public as the caller: in a public repo, it is published.
 - ⚠️ **A required check from outside Actions can strand a PR.** The stub runs when a listed

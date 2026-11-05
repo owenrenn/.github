@@ -308,3 +308,27 @@ test("judgeHeldFiles passes a diff naming no held package, refuses an unreadable
   assert.match(judgeHeldFiles({ files: null, held }).reason, /could not be read/);
   assert.deepStrictEqual(judgeHeldFiles({ files: null, held: holdMatcher("") }), { merge: true });
 });
+
+test("judgeHeldFiles reads every lockfile shape, on added and removed lines", () => {
+  const held = holdMatcher("example-pkg, @example-scope/thing, com.example:artifact-core");
+  const lines = [
+    '-name = "example_pkg"',                    // Cargo.lock, PyPI-style spelling
+    '+    "example-pkg": "^1.0.1",',            // package.json
+    '+example-pkg==1.0.1',                      // requirements
+    '-    example-pkg (1.0.0)',                 // Gemfile.lock
+    '+example-pkg@^1.0.1:',                     // yarn v1
+    '+"example-pkg@npm:^1.0.1":',               // yarn berry
+    '+  /example-pkg@1.0.1:',                   // pnpm
+    '+"@example-scope/thing@^1.0.1":',          // a scoped name with its range
+    '+com.example:artifact-core:1.2.4',         // Gradle
+  ];
+  for (const line of lines) {
+    const r = judgeHeldFiles({ files: [{ filename: "lock", patch: line }], held });
+    assert.strictEqual(r.merge, false, line);
+  }
+});
+
+test("judgeHeldFiles refuses a file list at the API's cap", () => {
+  const files = Array.from({ length: 3000 }, (_, i) => ({ filename: `f${i}`, patch: "+x" }));
+  assert.match(judgeHeldFiles({ files, held: holdMatcher("example-pkg") }).reason, /past what GitHub lists/);
+});

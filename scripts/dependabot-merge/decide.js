@@ -94,30 +94,53 @@ function holdMatcher(input) {
   const globs = String(input ?? "").split(/[,\n]/).map((g) => g.trim()).filter(Boolean);
   const bad = globs.filter((g) => !HOLD_GLOB.test(g));
   if (bad.length) throw new Error(`the hold input has entries that are not name globs: ${bad.map((g) => JSON.stringify(g)).join(", ")}`);
-  const res = globs.map((g) => new RegExp(`^${normalName(g).split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`));
+  // HOLD_GLOB and normalName leave only letters, digits, `@ / : -` and `*`: nothing else to escape.
+  const res = globs.map((g) => new RegExp(`^${normalName(g).split("*").join(".*")}$`));
   const held = (name) => name != null && res.some((re) => re.test(normalName(name)));
   held.globs = globs;
   return held;
 }
 
+// The PR files API stops at this many files without an error; a list this long may be cut short.
+const FILES_CAP = 3000;
+
+/**
+ * The names a changed line could be naming, in every lockfile shape: the token as written, after
+ * its last `node_modules/` (npm), without a leading `/` (pnpm), cut at a version `@` (yarn, pnpm,
+ * `name@npm:range`), and each `:` prefix (`group:artifact:version`, Gradle). Over-matching only
+ * holds a PR for a session.
+ */
+function candidateNames(line) {
+  const names = new Set();
+  for (const raw of line.match(/[@A-Za-z0-9._/:-]+/g) ?? []) {
+    const token = raw.split("node_modules/").pop().replace(/^\/+/, "");
+    if (!token) continue;
+    const at = token.indexOf("@", 1);
+    for (const t of at > 0 ? [token, token.slice(0, at)] : [token]) {
+      const parts = t.split(":");
+      for (let i = 1; i <= parts.length; i++) names.add(parts.slice(0, i).join(":"));
+    }
+  }
+  return names;
+}
+
 /**
  * Held names the PR's diff moves, beyond its metadata: a bump of one package can move a held one
- * in the lockfile, and the metadata names only the first. Every changed line is read as name-like
- * tokens, the last `node_modules/` path segment stripped. A file GitHub sends without a patch (too
- * large, binary) cannot be read, and refuses. Only runs when something is held.
+ * in the lockfile, and the metadata names only the first. Every added or removed line is read for
+ * candidate names (candidateNames). A file GitHub sends without a patch (too large, binary), or a
+ * list at the API's cap, cannot be read whole, and refuses. Only runs when something is held.
  */
 function judgeHeldFiles({ files, held }) {
   if (!held?.globs?.length) return { merge: true };
   if (!Array.isArray(files)) return no("the PR's files could not be read for the hold");
+  if (files.length >= FILES_CAP) return no(`the PR changes ${files.length} files or more, past what GitHub lists, so the hold cannot be checked`);
   const found = new Set();
   for (const f of files) {
     if (typeof f.patch !== "string") return no(`${f.filename} has no readable diff, so the hold cannot be checked`);
     for (const line of f.patch.split("\n")) {
       if (!/^[+-]/.test(line) || /^(\+\+\+|---) /.test(line)) continue;
-      for (const token of line.match(/[@A-Za-z0-9._/:-]+/g) ?? []) {
-        const name = token.slice(token.lastIndexOf("node_modules/") + (token.includes("node_modules/") ? "node_modules/".length : 0));
-        if (held(name)) found.add(name);
-      }
+      // The diff's own `+` or `-` is not part of any name.
+      for (const name of candidateNames(line.slice(1))) if (held(name)) found.add(name);
     }
   }
   if (found.size) return no(`the diff moves held ${[...found].sort().join(", ")}; merged in a session`);
