@@ -1,0 +1,4 @@
+{
+  "//": "Pins these files to CommonJS wherever they are checked out, as the fleet checks do (#1563).",
+  "type": "commonjs"
+}

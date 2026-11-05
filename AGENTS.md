@@ -14,6 +14,7 @@ reasons; read it before changing the file. This table is only the map.
 | `.github/workflows/card-shark-sync.yml` + `scripts/card-shark-sync/` | **Reusable.** Keeps Card Shark membership in sync with `pm:*` labels and mirrors Track / Priority / Engagement (#849). |
 | `.github/workflows/autoclose-guard.yml` + `scripts/autoclose-guard/` | **Reusable.** Fails when what a PR *declares* it closes differs from what GitHub *registered* (#942). **Never a required check.** |
 | `.github/workflows/fleet-checks.yml` + `scripts/fleet-checks/` | **Reusable.** The changelog fragment check and the dead-path ratchet (#1561). ⚠️ **The scripts are published here byte for byte from the operations repo by its `publish.sh`. Never hand-edit them here**: the next publish erases the edit. |
+| `.github/workflows/dependabot-merge.yml` + `scripts/dependabot-merge/` | **Reusable.** Merges a Dependabot patch or minor update once its required checks pass and the autonomy switch (issue #40 here) reads clear (#1685). Nothing is armed: no repo turns on native auto-merge. |
 | `guard-own-prs.yml`, `fleet-checks-own-prs.yml` | **This repo's own callers** (#911, #1561): `uses: ./…` plus `logic_ref: github.sha`, so a PR that changes a check runs its own workflow and logic on itself. A fleet caller omits `logic_ref` and runs `main`. |
 | `actions/publish-update-feed/` | **Composite action.** Uploads release payloads and an optional manifest to S3-compatible storage, then verifies the feed from the URL a client reads. |
 | `.github/workflows/tests.yml` | This repo's CI: the suites, every workflow parses, every job is bounded (#587), every `logic_ref` body has an own-PR caller. |
@@ -200,6 +201,43 @@ The panel reconnects after the machine wakes.
 
 The CLI's exit codes are its contract: **0** clean, **1** findings, **2** could not run. A
 release script reads them the same way CI does.
+
+## Calling the Dependabot merge
+
+Drop this in a pilot repo as `.github/workflows/dependabot-merge.yml`:
+
+```yaml
+name: dependabot merge
+on:
+  workflow_run:
+    # EVERY workflow that produces a required check, by its `name:`. The PR is decided when the
+    # last of them finishes; one left out can finish after the decision, and the PR then waits.
+    workflows: [ci, fleet checks]
+    types: [completed]
+# ⚠️ REQUIRED: a called workflow cannot exceed the caller's token.
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+jobs:
+  merge:
+    uses: owenrenn/.github/.github/workflows/dependabot-merge.yml@main
+```
+
+What it merges, and everything it refuses: the header of `scripts/dependabot-merge/decide.js`.
+How each outcome shows on the run: the header of `run.js`.
+
+- ⚠️ **Never add the stub to a control-plane repo.** The body refuses this repo by name; the
+  other control-plane repos are private, so the content rule keeps them out of the code, and
+  the stub's absence is their only exclusion.
+- ⚠️ **A repo whose default branch requires no check besides `fleet-checks-gate` is never
+  merged**: that check judges changelog and paths, not code. Deleting a repo's CI ruleset stops
+  its merges with no other change.
+- ⚠️ **The autonomy switch is read immediately before each merge**, and an unreadable switch
+  fails the job. Add `autonomy:paused` to issue #40 and the next merge anywhere does not happen.
+- **Verify it live**: the first Dependabot PR after the stub lands is the first real run. Read
+  that run's notice, not the merge alone.
 
 ## Calling the update-feed publisher
 
