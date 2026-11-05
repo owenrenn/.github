@@ -10,7 +10,7 @@
 //     pushed onto the branch by anyone else stops the merge;
 //   - every dependency it updates is `version-update:semver-patch` or `-minor`, read from the
 //     metadata block Dependabot writes into its commit message, or, for a one-dependency block
-//     with no `update-type` (a security update), from the versions its subject line names;
+//     with no `update-type`, from the versions its message names (updateTypeFromMessage);
 //   - the ecosystem is not `github_actions`, and neither its metadata nor its diff names a
 //     dependency the caller's `hold` globs match;
 //   - the default branch requires at least one status check besides `fleet-checks-gate`: that
@@ -24,9 +24,12 @@
 // WHY the metadata is parsed here rather than by `dependabot/fetch-metadata`: that action reads
 // the PR from a `pull_request` event payload, and this workflow runs on `workflow_run`, whose
 // payload has none. It applies the same checks as that action (author, commit author, verified
-// signature) and reads the same block. Dependabot writes `update-type` on a version update only,
-// so a security update's step is read from the subject (updateTypeFromSubject), as the action
-// reads it, but stricter: one dependency, the block's name and version, three-part versions.
+// signature) and reads the same block. Dependabot leaves `update-type` out of a security update's
+// block (and of a version update it cannot classify), so a one-dependency block without one takes
+// its step from the old and new versions the message names, as the action infers a step from
+// version strings, but stricter: the subject and the body's `Bumps` line must both name the
+// block's own dependency and version and agree on the old one, and both versions must be plain
+// `x.y.z`.
 
 const DEPENDABOT = "dependabot[bot]";
 const MERGEABLE_UPDATES = new Set(["version-update:semver-patch", "version-update:semver-minor"]);
@@ -80,23 +83,39 @@ function parseUpdates(message) {
   return deps.map((d) => ({ name: d["dependency-name"] ?? null, version: d["dependency-version"] ?? null, updateType: d["update-type"] ?? null, dependencyType: d["dependency-type"] ?? null }));
 }
 
-const SEMVER = /^v?(\d+)\.(\d+)\.(\d+)$/;
-// Dependabot's subject, after any configured prefix: `bump <name> from <old> to <new>[ in <dir>]`.
-const SUBJECT = /(?:^|: )[Bb]ump (\S+) from (\S+) to (\S+)(?: in \S+)?$/;
+/** `{ parts: [major, minor, patch], pre }` from `1.2.3`, `v1.2.3` or `1.2.3-rc.1+build`, or null. */
+function parseVersion(v) {
+  const m = String(v ?? "").match(/^v?(\d+)\.(\d+)\.(\d+)([-+]\S*)?$/);
+  return m ? { parts: m.slice(1, 4).map(Number), pre: m[4] != null } : null;
+}
+
+// Dependabot's subject, after whatever prefix the repo configures (`chore(deps): `, `[deps] `):
+// `bump <name> from <old> to <new>[ in <dir>]`.
+const SUBJECT = /(?:^|\s)[Bb]ump (\S+) from (\S+) to (\S+)(?: in \S+)?$/;
+// Dependabot's first body line, which no prefix changes: `Bumps [<name>](<url>) from <old> to <new>.`
+const BUMPS = /^Bumps (?:\[([^\]\n]+)\]\([^)\n]*\)|(\S+)) from (\S+) to (\S+)\.$/gm;
 
 /**
- * The semver step of one update, read from its commit's subject line, or null. The subject must
- * name the block's own dependency and version; a pre-release, a version with fewer than three
- * parts, a downgrade or no step at all answers null, which is refused.
+ * The semver step of a one-dependency update whose block has no `update-type`, read from the
+ * versions its commit message names: `{ type }`, or `{ type: null, why }`, which is refused. The
+ * subject and every `Bumps` line must name the block's own dependency and version and agree on
+ * the old version, so a lockfile holding the dependency at two versions refuses; both versions
+ * must be plain `x.y.z`, and the step must go up.
  */
-function updateTypeFromSubject(subject, { name, version }) {
-  const m = typeof subject === "string" ? subject.match(SUBJECT) : null;
-  if (!m || m[1] !== name || m[3] !== version) return null;
-  const [from, to] = [m[2], m[3]].map((v) => v.match(SEMVER)?.slice(1).map(Number));
-  if (!from || !to) return null;
-  const i = from.findIndex((n, k) => n !== to[k]);
-  if (i < 0 || to[i] < from[i]) return null;
-  return `version-update:semver-${["major", "minor", "patch"][i]}`;
+function updateTypeFromMessage(message, { name, version }) {
+  const text = String(message ?? "").replace(/\r\n/g, "\n");
+  const s = text.split("\n", 1)[0].match(SUBJECT);
+  if (!s || s[1] !== name || s[3] !== version) return { type: null, why: `the subject does not name ${name} ${version}` };
+  const bumps = [...text.matchAll(BUMPS)];
+  if (!bumps.length) return { type: null, why: "the body has no Bumps line" };
+  if (bumps.some((b) => (b[1] ?? b[2]) !== name || b[3] !== s[2] || b[4] !== version)) {
+    return { type: null, why: "the body's Bumps line disagrees with the subject" };
+  }
+  const [from, to] = [parseVersion(s[2]), parseVersion(version)];
+  if (!from || !to || from.pre || to.pre) return { type: null, why: `${s[2]} to ${version} is not a plain x.y.z step` };
+  const i = from.parts.findIndex((n, k) => n !== to.parts[k]);
+  if (i < 0 || to.parts[i] < from.parts[i]) return { type: null, why: `${s[2]} to ${version} is not a step up` };
+  return { type: `version-update:semver-${["major", "minor", "patch"][i]}` };
 }
 
 // Name globs, not path globs: `*` crosses `/` (an npm scope) and `:` (a Maven group), which the
@@ -253,28 +272,30 @@ function judgePr({ repo, defaultBranch, pr, commits, runHeadSha, held = () => fa
 
   const parsed = parseUpdates(head.commit?.message);
   if (!parsed) return no("the head commit carries no readable Dependabot metadata");
-  // A subject names one dependency, so it fills in only a one-dependency block.
-  const subject = String(head.commit.message).split(/\r?\n/, 1)[0];
+  // A subject names one dependency, so the message fills in only a one-dependency block.
   const updates = parsed.length === 1 && parsed[0].updateType == null
-    ? parsed.map((u) => ({ ...u, updateType: updateTypeFromSubject(subject, u), fromSubject: true }))
+    ? parsed.map((u) => {
+      const read = updateTypeFromMessage(head.commit.message, u);
+      return { ...u, updateType: read.type, inferred: read.why ?? "read from the message" };
+    })
     : parsed;
   const holding = [...new Set(updates.filter((u) => held(u.name)).map((u) => u.name))];
   if (holding.length) return no(`held by this repo's stub, merged in a session: ${holding.join(", ")}`);
   const blocked = updates.filter((u) => !MERGEABLE_UPDATES.has(u.updateType));
   if (blocked.length) {
-    return no(`not patch or minor: ${blocked.map((u) => `${u.name ?? "?"} (${u.updateType ?? "no update-type"})`).join(", ")}`);
+    return no(`not patch or minor: ${blocked.map((u) => `${u.name ?? "?"} (${u.updateType ?? "no update-type"}${u.inferred ? `; ${u.inferred}` : ""})`).join(", ")}`);
   }
   // Below 1.0 the leftmost non-zero part is the breaking one (Cargo's and npm's caret ranges): a
   // 0.y minor and a 0.0.z patch are judged as majors. An update with no version to read is refused.
   const breaking = (u) => {
-    const m = String(u.version ?? "").match(/^v?(\d+)\.(\d+)\./);
-    if (!m) return true;
-    if (m[1] !== "0") return false;
-    return u.updateType === "version-update:semver-minor" || m[2] === "0";
+    const v = parseVersion(u.version);
+    if (!v) return true;
+    if (v.parts[0] !== 0) return false;
+    return u.updateType === "version-update:semver-minor" || v.parts[1] === 0;
   };
   const preOne = updates.filter(breaking);
   if (preOne.length) return no(`a breaking bump below 1.0, or no version to read: ${preOne.map((u) => `${u.name ?? "?"} ${u.version ?? "?"}`).join(", ")}`);
-  return { merge: true, reason: `${ecosystem}: ${updates.map((u) => `${u.name} ${u.updateType.replace("version-update:", "")}${u.fromSubject ? " (from the subject)" : ""}`).join(", ")}` };
+  return { merge: true, reason: `${ecosystem}: ${updates.map((u) => `${u.name} ${u.updateType.replace("version-update:", "")}${u.inferred ? " (read from the message)" : ""}`).join(", ")}` };
 }
 
 /**
@@ -309,4 +330,4 @@ function codeChecks(required) {
   return (required ?? []).filter((r) => r.context !== NOT_A_CODE_CHECK);
 }
 
-module.exports = { holdMatcher, judgeHeldFiles, parseUpdates, updateTypeFromSubject, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks, DEPENDABOT, SELF };
+module.exports = { holdMatcher, judgeHeldFiles, parseUpdates, updateTypeFromMessage, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks, DEPENDABOT, SELF };
