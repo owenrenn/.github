@@ -220,6 +220,7 @@ permissions:
   pull-requests: write
   checks: read
   statuses: read
+  issues: read
 jobs:
   merge:
     uses: owenrenn/.github/.github/workflows/dependabot-merge.yml@main
@@ -236,6 +237,9 @@ How each outcome shows on the run: the header of `run.js`.
   its merges with no other change.
 - ⚠️ **The autonomy switch is read immediately before each merge**, and an unreadable switch
   fails the job. Add `autonomy:paused` to issue #40 and the next merge anywhere does not happen.
+- ⚠️ **A required check from outside Actions can strand a PR.** The stub runs when a listed
+  workflow finishes; if the last required check to finish is an external status or another app's
+  check run, nothing runs after it, and the PR waits for a session.
 - **Verify it live**: the first Dependabot PR after the stub lands is the first real run. Read
   that run's notice, not the merge alone.
 

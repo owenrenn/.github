@@ -37,7 +37,7 @@ function fakeGithub(over = {}) {
       { id: 1, name: "ci", status: "completed", conclusion: "success", app: { id: ACTIONS } },
       { id: 2, name: "fleet-checks-gate", status: "completed", conclusion: "success", app: { id: ACTIONS } },
     ],
-    "GET /repos/{owner}/{repo}/commits/{ref}/statuses": [],
+    "GET /repos/{owner}/{repo}/commits/{ref}/status": { state: "pending", statuses: [] },
     "GET /repos/{owner}/{repo}/issues/{issue_number}": switchIssue(),
     "PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge": { merged: true },
     ...over,
@@ -195,4 +195,33 @@ test("readSwitch reads the switch by number, in this repo", async () => {
   let seen;
   await readSwitch({ request: async (route, params) => { seen = params; return { data: switchIssue() }; } });
   assert.deepStrictEqual(seen, { owner: "owenrenn", repo: ".github", issue_number: 40 });
+});
+
+test("a branch rule this job cannot meet is a notice, and the merge is never tried", async () => {
+  const rules = [{ type: "pull_request", parameters: { required_approving_review_count: 1 } }, { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ci" }] } }];
+  const r = await go({ "GET /repos/{owner}/{repo}/rules/branches/{branch}": rules });
+  assert.strictEqual(r.merge, undefined);
+  assert.deepStrictEqual(r.failures, []);
+  assert.match(r.notices.at(-1), /requires an approving review/);
+});
+
+test("a failing status on the head stops the merge", async () => {
+  const r = await go({ "GET /repos/{owner}/{repo}/commits/{ref}/status": { state: "failure", statuses: [{ context: "deploy", state: "failure" }] } });
+  assert.strictEqual(r.merge, undefined);
+  assert.match(r.notices.at(-1), /failed: deploy/);
+});
+
+test("a refused merge keeps GitHub's answer even when the re-read fails too", async () => {
+  let reads = 0;
+  const r = await go({
+    "PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge": () => { const e = new Error("Head branch was modified"); e.status = 409; throw e; },
+    "GET /repos/{owner}/{repo}/pulls/{pull_number}": () => { if (++reads > 1) { const e = new Error("Server Error"); e.status = 502; throw e; } return fakeGithubPr(); },
+  });
+  assert.strictEqual(r.failures.length, 1);
+  assert.match(r.failures[0], /refused the merge: 409 Head branch was modified/);
+});
+
+test("the check runs are asked for with filter latest", async () => {
+  const r = await go();
+  assert.strictEqual(r.github.calls.find((c) => c.route.includes("check-runs")).params.filter, "latest");
 });

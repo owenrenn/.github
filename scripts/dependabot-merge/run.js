@@ -9,7 +9,7 @@
 //   switch unreadable the job FAILS: the switch is gone or renamed, and someone should see that.
 //   merge refused     the job FAILS with GitHub's answer, unless the PR was merged meanwhile.
 
-const { judgePr, judgeChecks, codeChecks } = require("./decide.js");
+const { judgePr, judgeRules, judgeChecks, codeChecks } = require("./decide.js");
 const { readSwitch } = require("./switch.js");
 
 const TRAILER = "Merged on green by the fleet's Dependabot merge workflow (#1685).";
@@ -23,17 +23,20 @@ async function decideOne({ github, owner, repo, number, runHeadSha, defaultBranc
   if (!verdict.merge) return log.notice(`#${number}: not merged: ${verdict.reason}`);
 
   const { data: rules } = await github.request("GET /repos/{owner}/{repo}/rules/branches/{branch}", { owner, repo, branch: defaultBranch, per_page: 100 });
-  const required = (Array.isArray(rules) ? rules : [])
+  const gates = judgeRules(rules, { behind: pr.mergeable_state === "behind" });
+  if (!gates.merge) return log.notice(`#${number}: not merged: ${gates.reason}`);
+  const required = rules
     .filter((r) => r.type === "required_status_checks")
     .flatMap((r) => r.parameters?.required_status_checks ?? []);
   if (!codeChecks(required).length) return log.notice(`#${number}: not merged: ${defaultBranch} requires no check that tests code`);
 
   const sha = pr.head.sha;
-  const checkRuns = await github.paginate("GET /repos/{owner}/{repo}/commits/{ref}/check-runs", { owner, repo, ref: sha, filter: "all", per_page: 100 }, (r) => r.data.check_runs ?? r.data);
-  const statuses = await github.paginate("GET /repos/{owner}/{repo}/commits/{ref}/statuses", { owner, repo, ref: sha, per_page: 100 });
-  // The statuses list is newest first; the latest per context is the one that counts.
-  const latestStatus = [...new Map(statuses.slice().reverse().map((s) => [s.context, s])).values()];
-  const checks = judgeChecks({ required, checkRuns, statuses: latestStatus });
+  // `filter: latest` (the API's default, stated) leaves one run per name per suite; Octokit's
+  // paginate unwraps the `check_runs` key itself.
+  const checkRuns = await github.paginate("GET /repos/{owner}/{repo}/commits/{ref}/check-runs", { owner, repo, ref: sha, filter: "latest", per_page: 100 });
+  // The combined status holds the latest status per context.
+  const { data: combined } = await github.request("GET /repos/{owner}/{repo}/commits/{ref}/status", { owner, repo, ref: sha, per_page: 100 });
+  const checks = judgeChecks({ required, checkRuns, statuses: combined?.statuses });
   if (checks.state !== "pass") return log.notice(`#${number}: not merged (${checks.state}): ${checks.detail}`);
 
   // Read last, immediately before the merge, so a pull of the switch stops the next merge.
@@ -53,9 +56,11 @@ async function decideOne({ github, owner, repo, number, runHeadSha, defaultBranc
       commit_message: `${commits.find((c) => c.sha === sha).commit.message.trimEnd()}\n\n${checks.detail}\n${TRAILER}`,
     });
   } catch (err) {
-    const { data: after } = await github.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", { owner, repo, pull_number: number });
+    const refused = `${err?.status ?? ""} ${err?.message ?? String(err)}`;
+    let after = null;
+    try { ({ data: after } = await github.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", { owner, repo, pull_number: number })); } catch { /* the refusal below still names GitHub's answer */ }
     if (after?.merged) return log.notice(`#${number}: already merged by another run`);
-    return log.fail(`#${number}: GitHub refused the merge: ${err?.status ?? ""} ${err?.message ?? String(err)}`);
+    return log.fail(`#${number}: GitHub refused the merge: ${refused}`);
   }
   return log.notice(`#${number}: merged: ${verdict.reason}`);
 }

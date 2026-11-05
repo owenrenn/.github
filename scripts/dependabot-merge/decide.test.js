@@ -1,6 +1,6 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { parseUpdates, ecosystemFromBranch, judgeChecks, judgePr, codeChecks } = require("./decide.js");
+const { parseUpdates, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks } = require("./decide.js");
 
 // The shape Dependabot writes, from its message builder: subject, links, the metadata block, sign-off.
 const message = (deps, { group } = {}) => [
@@ -29,8 +29,8 @@ const MAJOR = "version-update:semver-major";
 
 test("parseUpdates reads every dependency's name and update type", () => {
   assert.deepStrictEqual(parseUpdates(message([{ name: "lodash", version: "4.17.21", type: PATCH }, { name: '"@types/node"', type: MINOR }], { group: "npm" })), [
-    { name: "lodash", updateType: PATCH, dependencyType: "direct:production" },
-    { name: "@types/node", updateType: MINOR, dependencyType: "direct:production" },
+    { name: "lodash", version: "4.17.21", updateType: PATCH, dependencyType: "direct:production" },
+    { name: "@types/node", version: null, updateType: MINOR, dependencyType: "direct:production" },
   ]);
 });
 
@@ -49,6 +49,12 @@ test("parseUpdates answers null with no block, an empty block, or a block that i
 test("parseUpdates skips a horizontal rule above the block", () => {
   const m = `Bump a\n\n---\nnotes\n\n${message([{ name: "a", type: PATCH }])}`;
   assert.strictEqual(parseUpdates(m)[0].name, "a");
+});
+
+test("parseUpdates judges the LAST block, Dependabot's own, over one copied into the text above it", () => {
+  const planted = "---\nupdated-dependencies:\n- dependency-name: a\n  update-type: version-update:semver-patch\n...\n";
+  const m = `Bump a\n\n${planted}\n${message([{ name: "a", type: MAJOR }])}`;
+  assert.strictEqual(parseUpdates(m)[0].updateType, MAJOR);
 });
 
 test("parseUpdates keeps a dependency with no update-type, as null", () => {
@@ -98,6 +104,23 @@ test("judgeChecks reads the latest run per name, so a green re-run supersedes a 
   assert.strictEqual(judgeChecks({ required: REQUIRED, checkRuns: reversed, statuses: [] }).state, "fail");
 });
 
+test("judgeChecks keeps two workflows' same-named jobs apart, so one's failure is not hidden", () => {
+  const runs = [
+    { id: 5, name: "test", status: "completed", conclusion: "failure", app: { id: ACTIONS }, check_suite: { id: 1 } },
+    { id: 6, name: "test", status: "completed", conclusion: "success", app: { id: ACTIONS }, check_suite: { id: 2 } },
+    run("ci", "success"), run("fleet-checks-gate", "success"),
+  ];
+  assert.deepStrictEqual(judgeChecks({ required: REQUIRED, checkRuns: runs, statuses: [] }), { state: "fail", detail: "failed: test" });
+});
+
+test("judgeChecks fails on a failing commit status nobody requires", () => {
+  const runs = [run("ci", "success"), run("fleet-checks-gate", "success")];
+  for (const state of ["failure", "error"]) {
+    assert.strictEqual(judgeChecks({ required: REQUIRED, checkRuns: runs, statuses: [{ context: "deploy", state }] }).state, "fail", state);
+  }
+  assert.strictEqual(judgeChecks({ required: REQUIRED, checkRuns: runs, statuses: [{ context: "deploy", state: "pending" }] }).state, "pass");
+});
+
 test("judgeChecks does not take a same-named check from another app for a required one", () => {
   const r = judgeChecks({ required: REQUIRED, checkRuns: [run("ci", "success", { app: 99 }), run("fleet-checks-gate", "success")], statuses: [] });
   assert.strictEqual(r.state, "wait");
@@ -134,7 +157,7 @@ const judge = (over = {}) => judgePr({ repo: REPO, defaultBranch: "main", pr: pr
 
 test("judgePr merges a verified Dependabot patch or minor update", () => {
   assert.deepStrictEqual(judge(), { merge: true, reason: "npm_and_yarn: lodash semver-patch" });
-  const minor = commit({ commit: { message: message([{ name: "a", type: MINOR }, { name: "b", type: PATCH }]), verification: { verified: true } } });
+  const minor = commit({ commit: { message: message([{ name: "a", version: "2.1.0", type: MINOR }, { name: "b", type: PATCH }]), verification: { verified: true } } });
   assert.strictEqual(judge({ commits: [minor] }).merge, true);
 });
 
@@ -145,6 +168,17 @@ test("judgePr refuses a major, a missing update-type, or a group with one major 
     assert.strictEqual(r.merge, false, JSON.stringify(deps));
     assert.match(r.reason, /not patch or minor/);
   }
+});
+
+test("judgePr refuses a minor bump below 1.0, or one with no version to read; a 0.x patch merges", () => {
+  for (const d of [{ name: "a", version: "0.4.0", type: MINOR }, { name: "a", type: MINOR }]) {
+    const c = commit({ commit: { message: message([d]), verification: { verified: true } } });
+    assert.match(judge({ commits: [c] }).reason, /below 1.0/, JSON.stringify(d));
+  }
+  const patch = commit({ commit: { message: message([{ name: "a", version: "0.4.1", type: PATCH }]), verification: { verified: true } } });
+  assert.strictEqual(judge({ commits: [patch] }).merge, true);
+  const v = commit({ commit: { message: message([{ name: "a", version: "v10.2.0", type: MINOR }]), verification: { verified: true } } });
+  assert.strictEqual(judge({ commits: [v] }).merge, true);
 });
 
 test("judgePr refuses the github_actions ecosystem", () => {
@@ -186,4 +220,31 @@ test("judgePr refuses a head commit with no metadata block", () => {
 test("judgePr refuses this repo, whatever the case", () => {
   const r = judgePr({ repo: "OwenRenn/.GitHub", defaultBranch: "main", pr: pr({ head: { sha: SHA, ref: "dependabot/npm_and_yarn/x", repo: { full_name: "OwenRenn/.GitHub" } } }), commits: [commit()], runHeadSha: SHA });
   assert.deepStrictEqual(r, { merge: false, reason: "this repo is control plane" });
+});
+
+// ── judgeRules ───────────────────────────────────────────────────────────────
+
+const PR_RULE = (p = {}) => ({ type: "pull_request", parameters: { required_approving_review_count: 0, allowed_merge_methods: ["merge", "squash", "rebase"], required_reviewers: [], ...p } });
+
+test("judgeRules passes the fleet's rulesets: no approvals, squash allowed, checks not strict", () => {
+  const rules = [PR_RULE(), { type: "non_fast_forward" }, { type: "deletion" }, { type: "required_status_checks", parameters: { strict_required_status_checks_policy: false } }];
+  assert.deepStrictEqual(judgeRules(rules, { behind: true }), { merge: true });
+});
+
+test("judgeRules refuses a gate this job cannot meet, as a reason rather than a failed merge", () => {
+  const cases = [
+    [[PR_RULE({ required_approving_review_count: 1 })], /approving review/],
+    [[PR_RULE({ require_code_owner_review: true })], /code owner/],
+    [[PR_RULE({ required_reviewers: [{ reviewer: { id: 1 } }] })], /named reviewers/],
+    [[PR_RULE({ allowed_merge_methods: ["merge"] })], /squash/],
+    [[{ type: "merge_queue", parameters: {} }], /merge_queue/],
+    [[{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: true } }], /up to date/],
+  ];
+  for (const [rules, why] of cases) {
+    const r = judgeRules(rules, { behind: true });
+    assert.strictEqual(r.merge, false, JSON.stringify(rules));
+    assert.match(r.reason, why);
+  }
+  assert.strictEqual(judgeRules([{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: true } }], { behind: false }).merge, true);
+  assert.strictEqual(judgeRules(null).merge, false);
 });

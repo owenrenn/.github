@@ -12,7 +12,10 @@
 //   - the ecosystem is not `github_actions`;
 //   - the default branch requires at least one status check besides `fleet-checks-gate`: that
 //     one judges changelog and paths, not code, so a repo requiring nothing else is out;
-//   - every required check's latest run on the head passed, and no other check's latest run failed;
+//   - the branch rules ask for nothing this job cannot give (an approval, a non-squash merge, a
+//     merge queue): those read as "no merge" here, not as a refused merge on every run;
+//   - every required check's latest run on the head passed, and no other check or status failed;
+//   - no minor bump lands below 1.0, where semver makes a minor a breaking change;
 //   - the kill switch reads clear (switch.js), read last, immediately before the merge.
 //
 // WHY the metadata is parsed here rather than by `dependabot/fetch-metadata`: that action reads
@@ -49,8 +52,10 @@ function scalar(raw) {
  */
 function parseUpdates(message) {
   if (typeof message !== "string") return null;
-  // Anchored on the key, not the `---` alone: release notes above the block can carry rules of their own.
-  const block = message.replace(/\r\n/g, "\n").match(/^---\nupdated-dependencies:\n([\s\S]*?)\n\.\.\.$/m);
+  // Anchored on the key, and the LAST such block: Dependabot writes its own at the end, and text
+  // above it, copied from the dependency's release notes, could carry a block of its own.
+  const blocks = [...message.replace(/\r\n/g, "\n").matchAll(/^---\nupdated-dependencies:\n([\s\S]*?)\n\.\.\.$/gm)];
+  const block = blocks.at(-1);
   if (!block) return null;
   const deps = [];
   for (const line of block[1].split("\n")) {
@@ -63,7 +68,7 @@ function parseUpdates(message) {
     else if (!/^[a-z-]+:/.test(line)) return null;
   }
   if (!deps.length) return null;
-  return deps.map((d) => ({ name: d["dependency-name"] ?? null, updateType: d["update-type"] ?? null, dependencyType: d["dependency-type"] ?? null }));
+  return deps.map((d) => ({ name: d["dependency-name"] ?? null, version: d["dependency-version"] ?? null, updateType: d["update-type"] ?? null, dependencyType: d["dependency-type"] ?? null }));
 }
 
 /** `npm_and_yarn` from `dependabot/npm_and_yarn/lodash-4.17.21`, or null. Dependabot picks the delimiter. */
@@ -82,17 +87,22 @@ function judgeChecks({ required, checkRuns, statuses }) {
   if (!Array.isArray(required) || !Array.isArray(checkRuns) || !Array.isArray(statuses)) {
     return { state: "fail", detail: "the checks could not be read" };
   }
-  // Latest run per (name, app): a re-run supersedes the run it repeats.
+  // Latest run per (name, app, check suite): a re-run supersedes the run it repeats, and two
+  // workflows with a same-named job stay two checks.
   const latest = new Map();
   for (const run of checkRuns) {
-    const key = `${run.name}\u0000${run.app?.id ?? ""}`;
+    const key = `${run.name}\u0000${run.app?.id ?? ""}\u0000${run.check_suite?.id ?? ""}`;
     const prev = latest.get(key);
     if (!prev || (run.id ?? 0) > (prev.id ?? 0)) latest.set(key, run);
   }
   const runs = [...latest.values()];
 
-  const failedOther = runs.filter((r) => r.status === "completed" && FAILED.has(r.conclusion));
-  if (failedOther.length) return { state: "fail", detail: `failed: ${failedOther.map((r) => r.name).sort().join(", ")}` };
+  // Any failed check or status, required or not, stops the merge.
+  const failedOther = [
+    ...runs.filter((r) => r.status === "completed" && FAILED.has(r.conclusion)).map((r) => r.name),
+    ...statuses.filter((s) => s.state === "failure" || s.state === "error").map((s) => s.context),
+  ];
+  if (failedOther.length) return { state: "fail", detail: `failed: ${failedOther.sort().join(", ")}` };
 
   const waiting = [];
   for (const { context, integration_id: app } of required) {
@@ -147,7 +157,34 @@ function judgePr({ repo, defaultBranch, pr, commits, runHeadSha }) {
   if (blocked.length) {
     return no(`not patch or minor: ${blocked.map((u) => `${u.name ?? "?"} (${u.updateType ?? "no update-type"})`).join(", ")}`);
   }
+  // Below 1.0 a minor bump is a breaking one by semver's own rule, so it is judged as a major. A
+  // minor with no version to read is refused the same way.
+  const preOne = updates.filter((u) => u.updateType === "version-update:semver-minor" && !/^v?[1-9]\d*\./.test(u.version ?? ""));
+  if (preOne.length) return no(`a minor bump below 1.0, or with no version: ${preOne.map((u) => `${u.name ?? "?"} ${u.version ?? "?"}`).join(", ")}`);
   return { merge: true, reason: `${ecosystem}: ${updates.map((u) => `${u.name} ${u.updateType.replace("version-update:", "")}`).join(", ")}` };
+}
+
+/**
+ * The branch rules' gates beyond required checks, judged before the merge is tried so a gate this
+ * workflow can never meet reads as a notice, not as a refused merge on every run. `rules` is the
+ * REST answer for the default branch; `behind` whether the PR's base is behind that branch.
+ */
+function judgeRules(rules, { behind = false } = {}) {
+  if (!Array.isArray(rules)) return no("the branch rules could not be read");
+  for (const r of rules) {
+    const p = r.parameters ?? {};
+    if (r.type === "pull_request") {
+      if ((p.required_approving_review_count ?? 0) > 0) return no("the branch requires an approving review");
+      if (p.require_code_owner_review) return no("the branch requires a code owner's review");
+      if (Array.isArray(p.required_reviewers) && p.required_reviewers.length) return no("the branch requires named reviewers");
+      if (Array.isArray(p.allowed_merge_methods) && !p.allowed_merge_methods.includes("squash")) return no("the branch does not allow a squash merge");
+    }
+    if (r.type === "required_status_checks" && p.strict_required_status_checks_policy && behind) {
+      return no("the branch requires the PR to be up to date, and it is behind");
+    }
+    if (["merge_queue", "required_deployments", "workflows", "code_scanning"].includes(r.type)) return no(`the branch has a ${r.type} rule this workflow does not judge`);
+  }
+  return { merge: true };
 }
 
 /** The required contexts that judge code: the gate's set minus the fleet checks. */
@@ -155,4 +192,4 @@ function codeChecks(required) {
   return (required ?? []).filter((r) => r.context !== NOT_A_CODE_CHECK);
 }
 
-module.exports = { parseUpdates, ecosystemFromBranch, judgeChecks, judgePr, codeChecks, DEPENDABOT, SELF };
+module.exports = { parseUpdates, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks, DEPENDABOT, SELF };
