@@ -30,6 +30,14 @@ on:
         required: false
         default: "ubuntu-latest"
         type: string
+      hold:
+        # A repo's own rule, kept in its stub: a dependency that moves only in a session. Globs,
+        # `*` only, separated by commas or newlines. A PR whose metadata or changed lines name a match is
+        # never merged here. Rules: holdMatcher in scripts/dependabot-merge/decide.js.
+        description: "Dependency names never merged here, as globs. Omit to hold nothing."
+        required: false
+        default: ""
+        type: string
 
 jobs:
   merge:
@@ -61,7 +69,10 @@ jobs:
           persist-credentials: false
 
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        # Through env, never `${{ }}` inside the script, so the input stays data.
+        env:
+          HOLD: ${{ inputs.hold }}
         with:
           script: |
             const { run } = require(`${process.env.GITHUB_WORKSPACE}/.dependabot-merge/scripts/dependabot-merge/run.js`);
-            await run({ github, context, core });
+            await run({ github, context, core, hold: process.env.HOLD });

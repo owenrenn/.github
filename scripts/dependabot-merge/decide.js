@@ -10,7 +10,8 @@
 //     pushed onto the branch by anyone else stops the merge;
 //   - every dependency it updates is `version-update:semver-patch` or `-minor`, read from the
 //     metadata block Dependabot writes into its commit message;
-//   - the ecosystem is not `github_actions`;
+//   - the ecosystem is not `github_actions`, and neither its metadata nor its diff names a
+//     dependency the caller's `hold` globs match;
 //   - the default branch requires at least one status check besides `fleet-checks-gate`: that
 //     one judges changelog and paths, not code, so a repo requiring nothing else is out;
 //   - the branch rules ask for nothing this job cannot give (an approval, a non-squash merge, a
@@ -77,6 +78,75 @@ function parseUpdates(message) {
   return deps.map((d) => ({ name: d["dependency-name"] ?? null, version: d["dependency-version"] ?? null, updateType: d["update-type"] ?? null, dependencyType: d["dependency-type"] ?? null }));
 }
 
+// Name globs, not path globs: `*` crosses `/` (an npm scope) and `:` (a Maven group), which the
+// fleet checks' path globs do not, so the two compilers stay separate.
+const HOLD_GLOB = /^[A-Za-z0-9@._/:*-]+$/;
+// Case-blind, with `-`, `_` and `.` one character, as PyPI compares names: any error is toward holding.
+const normalName = (name) => String(name).toLowerCase().replace(/[-_.]+/g, "-");
+
+/**
+ * The caller's `hold` input as a matcher: globs separated by commas or newlines, `*` the only
+ * wildcard, matched against whole names. Empty holds nothing. An entry that is not a name glob
+ * (a YAML list dash, a quote) THROWS: a hold that silently matches nothing fails open.
+ * The matcher carries its globs, so the run can say what it holds.
+ */
+function holdMatcher(input) {
+  const globs = String(input ?? "").split(/[,\n]/).map((g) => g.trim()).filter(Boolean);
+  const bad = globs.filter((g) => !HOLD_GLOB.test(g));
+  if (bad.length) throw new Error(`the hold input has entries that are not name globs: ${bad.map((g) => JSON.stringify(g)).join(", ")}`);
+  // HOLD_GLOB and normalName leave only letters, digits, `@ / : -` and `*`: nothing else to escape.
+  const res = globs.map((g) => new RegExp(`^${normalName(g).split("*").join(".*")}$`));
+  const held = (name) => name != null && res.some((re) => re.test(normalName(name)));
+  held.globs = globs;
+  return held;
+}
+
+// The PR files API stops at this many files without an error; a list this long may be cut short.
+const FILES_CAP = 3000;
+
+/**
+ * The names a changed line could be naming, in every lockfile shape: the token as written, after
+ * its last `node_modules/` (npm), without a leading `/` (pnpm), cut at a version `@` (yarn, pnpm,
+ * `name@npm:range`), and each `:` prefix (`group:artifact:version`, Gradle). Over-matching only
+ * holds a PR for a session.
+ */
+function candidateNames(line) {
+  const names = new Set();
+  for (const raw of line.match(/[@A-Za-z0-9._/:-]+/g) ?? []) {
+    const token = raw.split("node_modules/").pop().replace(/^\/+/, "");
+    if (!token) continue;
+    const at = token.indexOf("@", 1);
+    for (const t of at > 0 ? [token, token.slice(0, at)] : [token]) {
+      const parts = t.split(":");
+      for (let i = 1; i <= parts.length; i++) names.add(parts.slice(0, i).join(":"));
+    }
+  }
+  return names;
+}
+
+/**
+ * Held names the PR's diff moves, beyond its metadata: a bump of one package can move a held one
+ * in the lockfile, and the metadata names only the first. Every added or removed line is read for
+ * candidate names (candidateNames). A file GitHub sends without a patch (too large, binary), or a
+ * list at the API's cap, cannot be read whole, and refuses. Only runs when something is held.
+ */
+function judgeHeldFiles({ files, held }) {
+  if (!held?.globs?.length) return { merge: true };
+  if (!Array.isArray(files)) return no("the PR's files could not be read for the hold");
+  if (files.length >= FILES_CAP) return no(`the PR changes ${files.length} files or more, past what GitHub lists, so the hold cannot be checked`);
+  const found = new Set();
+  for (const f of files) {
+    if (typeof f.patch !== "string") return no(`${f.filename} has no readable diff, so the hold cannot be checked`);
+    for (const line of f.patch.split("\n")) {
+      if (!/^[+-]/.test(line) || /^(\+\+\+|---) /.test(line)) continue;
+      // The diff's own `+` or `-` is not part of any name.
+      for (const name of candidateNames(line.slice(1))) if (held(name)) found.add(name);
+    }
+  }
+  if (found.size) return no(`the diff moves held ${[...found].sort().join(", ")}; merged in a session`);
+  return { merge: true };
+}
+
 /** `npm_and_yarn` from `dependabot/npm_and_yarn/lodash-4.17.21`, or null. Dependabot picks the delimiter. */
 function ecosystemFromBranch(ref) {
   if (typeof ref !== "string" || !ref.startsWith("dependabot") || ref.length < 12) return null;
@@ -137,7 +207,7 @@ const no = (reason) => ({ merge: false, reason });
  * and the switch are read. `pr` is the REST pull request; `commits` its REST commit list;
  * `runHeadSha` the commit the triggering run tested.
  */
-function judgePr({ repo, defaultBranch, pr, commits, runHeadSha }) {
+function judgePr({ repo, defaultBranch, pr, commits, runHeadSha, held = () => false }) {
   if (String(repo).toLowerCase() === SELF.toLowerCase()) return no("this repo is control plane");
   if (!pr || pr.state !== "open") return no("the PR is not open");
   if (pr.draft) return no("the PR is a draft");
@@ -162,6 +232,8 @@ function judgePr({ repo, defaultBranch, pr, commits, runHeadSha }) {
 
   const updates = parseUpdates(head.commit?.message);
   if (!updates) return no("the head commit carries no readable Dependabot metadata");
+  const holding = [...new Set(updates.filter((u) => held(u.name)).map((u) => u.name))];
+  if (holding.length) return no(`held by this repo's stub, merged in a session: ${holding.join(", ")}`);
   const blocked = updates.filter((u) => !MERGEABLE_UPDATES.has(u.updateType));
   if (blocked.length) {
     return no(`not patch or minor: ${blocked.map((u) => `${u.name ?? "?"} (${u.updateType ?? "no update-type"})`).join(", ")}`);
@@ -211,4 +283,4 @@ function codeChecks(required) {
   return (required ?? []).filter((r) => r.context !== NOT_A_CODE_CHECK);
 }
 
-module.exports = { parseUpdates, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks, DEPENDABOT, SELF };
+module.exports = { holdMatcher, judgeHeldFiles, parseUpdates, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks, DEPENDABOT, SELF };

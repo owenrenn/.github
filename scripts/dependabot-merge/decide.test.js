@@ -1,6 +1,6 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { parseUpdates, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks } = require("./decide.js");
+const { holdMatcher, judgeHeldFiles, parseUpdates, ecosystemFromBranch, judgeChecks, judgePr, judgeRules, codeChecks } = require("./decide.js");
 
 // The shape Dependabot writes, from its message builder: subject, links, the metadata block, sign-off.
 const message = (deps, { group } = {}) => [
@@ -266,4 +266,69 @@ test("judgeRules refuses a gate this job cannot meet, as a reason rather than a 
   }
   assert.strictEqual(judgeRules([{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: true } }], { upToDate: true }).merge, true);
   assert.strictEqual(judgeRules(null).merge, false);
+});
+
+// ── hold ─────────────────────────────────────────────────────────────────────
+
+test("holdMatcher matches whole names by glob, across commas and newlines", () => {
+  const held = holdMatcher("example-pkg, example-pkg-*\n@example-*\n  @example-scope/*  ,");
+  for (const n of ["example-pkg", "example-pkg-extra", "@example-native/storage", "@example-scope/core"]) assert.ok(held(n), n);
+  for (const n of ["example", "example-pkg2", "x-example-pkg", "@other/example-pkg", "lodash", null, undefined]) assert.ok(!held(n), String(n));
+  assert.deepStrictEqual(held.globs, ["example-pkg", "example-pkg-*", "@example-*", "@example-scope/*"]);
+});
+
+test("holdMatcher is case-blind and treats - _ . alike, as PyPI does; regex characters stay literal", () => {
+  const held = holdMatcher("Example_Pkg, a.b, com.example:artifact-*");
+  for (const n of ["example-pkg", "EXAMPLE.PKG", "a-b", "com-example:artifact-core"]) assert.ok(held(n), n);
+  assert.ok(!held("axb"));
+});
+
+test("holdMatcher holds nothing when empty, and throws on an entry that is not a name glob", () => {
+  for (const empty of ["", "  ", ",\n", undefined, null]) assert.deepStrictEqual(holdMatcher(empty).globs, [], JSON.stringify(empty));
+  for (const bad of ["- example-pkg", '"example-pkg"', "a b", "a?b"]) assert.throws(() => holdMatcher(bad), /not name globs/, bad);
+});
+
+test("judgePr refuses a PR updating a held dependency, even a patch, and names it once", () => {
+  const deps = [{ name: "example-pkg-extra", version: "4.5.1", type: PATCH }, { name: "example-pkg-extra", version: "4.5.1", type: PATCH }, { name: "lodash", version: "4.17.21", type: PATCH }];
+  const c = commit({ commit: { message: message(deps), verification: { verified: true } } });
+  const r = judgePr({ repo: REPO, defaultBranch: "main", pr: pr(), commits: [c], runHeadSha: SHA, held: holdMatcher("example-pkg-*") });
+  assert.deepStrictEqual(r, { merge: false, reason: "held by this repo's stub, merged in a session: example-pkg-extra" });
+});
+
+test("judgeHeldFiles finds a held package the lockfile moves though the metadata never names it", () => {
+  const held = holdMatcher("example-pkg-*");
+  const files = [{ filename: "package-lock.json", patch: '@@ -1,3 +1,3 @@\n     "node_modules/example-pkg-codegen": {\n-      "version": "0.1.0",\n+      "version": "0.1.1",\n-    "node_modules/@x/y/node_modules/example-pkg-core": {' }];
+  assert.deepStrictEqual(judgeHeldFiles({ files, held }), { merge: false, reason: "the diff moves held example-pkg-core; merged in a session" });
+});
+
+test("judgeHeldFiles passes a diff naming no held package, refuses an unreadable one, and is skipped with no hold", () => {
+  const held = holdMatcher("example-pkg-*");
+  assert.deepStrictEqual(judgeHeldFiles({ files: [{ filename: "package-lock.json", patch: '-    "lodash": "4.17.20"\n+    "lodash": "4.17.21"' }], held }), { merge: true });
+  assert.match(judgeHeldFiles({ files: [{ filename: "package-lock.json" }], held }).reason, /no readable diff/);
+  assert.match(judgeHeldFiles({ files: null, held }).reason, /could not be read/);
+  assert.deepStrictEqual(judgeHeldFiles({ files: null, held: holdMatcher("") }), { merge: true });
+});
+
+test("judgeHeldFiles reads every lockfile shape, on added and removed lines", () => {
+  const held = holdMatcher("example-pkg, @example-scope/thing, com.example:artifact-core");
+  const lines = [
+    '-name = "example_pkg"',                    // Cargo.lock, PyPI-style spelling
+    '+    "example-pkg": "^1.0.1",',            // package.json
+    '+example-pkg==1.0.1',                      // requirements
+    '-    example-pkg (1.0.0)',                 // Gemfile.lock
+    '+example-pkg@^1.0.1:',                     // yarn v1
+    '+"example-pkg@npm:^1.0.1":',               // yarn berry
+    '+  /example-pkg@1.0.1:',                   // pnpm
+    '+"@example-scope/thing@^1.0.1":',          // a scoped name with its range
+    '+com.example:artifact-core:1.2.4',         // Gradle
+  ];
+  for (const line of lines) {
+    const r = judgeHeldFiles({ files: [{ filename: "lock", patch: line }], held });
+    assert.strictEqual(r.merge, false, line);
+  }
+});
+
+test("judgeHeldFiles refuses a file list at the API's cap", () => {
+  const files = Array.from({ length: 3000 }, (_, i) => ({ filename: `f${i}`, patch: "+x" }));
+  assert.match(judgeHeldFiles({ files, held: holdMatcher("example-pkg") }).reason, /past what GitHub lists/);
 });
