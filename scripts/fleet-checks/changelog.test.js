@@ -12,7 +12,7 @@ const assert = require("node:assert/strict");
 
 const cl = require("./changelog.js");
 const { normalize } = require("./config.js");
-const { makeRepo } = require("./fixture.js");
+const { makeRepo, buildRepo } = require("./fixture.js");
 
 const ONE = normalize({}).streams;
 const TWO = normalize({ changelog: { streams: {
@@ -149,15 +149,15 @@ test("a fragment-only PR, and a deleted fragment, pass with a note", () => {
 // ── the generator, over real tags ───────────────────────────────────────────
 
 function history() {
-  const r = makeRepo();
-  r.commit("init", { "src/a.ts": "", "desktop/main.rs": "" });
-  r.git("tag", "v1.0.0");
-  r.commit("fix(#10): panel wakes (#20)", { "desktop/main.rs": "1", "changelog.d/10-panel-wakes.md": frag("fixed", "The panel wakes.", "desktop") });
-  r.git("tag", "desktop-v0.1.0");
-  r.commit("feat(#11): shared shortcut (#21)", { "src/a.ts": "1", "changelog.d/11-shortcut.md": frag("added", "A shortcut.", "both") });
-  r.git("tag", "v1.1.0");
-  r.commit("feat(#12): web only (#22)", { "src/a.ts": "2", "changelog.d/12-web-only.md": frag("changed", "The site changed.", "web") });
-  return r;
+  return buildRepo((r) => {
+    r.commit("init", { "src/a.ts": "", "desktop/main.rs": "" });
+    r.git("tag", "v1.0.0");
+    r.commit("fix(#10): panel wakes (#20)", { "desktop/main.rs": "1", "changelog.d/10-panel-wakes.md": frag("fixed", "The panel wakes.", "desktop") });
+    r.git("tag", "desktop-v0.1.0");
+    r.commit("feat(#11): shared shortcut (#21)", { "src/a.ts": "1", "changelog.d/11-shortcut.md": frag("added", "A shortcut.", "both") });
+    r.git("tag", "v1.1.0");
+    r.commit("feat(#12): web only (#22)", { "src/a.ts": "2", "changelog.d/12-web-only.md": frag("changed", "The site changed.", "web") });
+  });
 }
 
 test("a fragment ships in the first tag of each of ITS streams that contains it", () => {

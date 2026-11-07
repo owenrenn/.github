@@ -340,13 +340,34 @@ const REGEX_KEYWORD = /(?:^|[^\w$.])(?:return|typeof|case|do|else|in|of|new|dele
  * literal, and `r#"…"#` is a raw string. `jsx` makes an apostrophe inside a
  * word (`Don't` in JSX text) plain text, which in JS proper is a syntax error
  * anyway; it stays off elsewhere, where C's `L'x'` is a char literal.
+ *
+ * `templates` (JS and TS): a template literal's `${…}` is code, lexed by the
+ * same rules as the rest (strings, regex literals, comments, further
+ * templates), so its backticks nest. A flat scan to the next backtick would
+ * close on the first inner one and hide every comment after it (#1801).
+ * Off elsewhere: a Go raw string's `${` is text.
  */
-function slashComments(src, { rust = false, jsx = false } = {}) {
+function slashComments(src, { rust = false, jsx = false, templates = false } = {}) {
   const out = [];
   let line = 1;
   let i = 0;
   let lastSig = "\n";
   const push = (text, at) => { if (text.trim()) out.push({ line: at, text }); };
+  // `templates`: one brace depth per open `${…}`, innermost last.
+  const depths = [];
+  // A template's literal text from `j`: to its closing backtick, or into a `${`, which the main loop lexes
+  // as code. Counts the lines it crosses and returns the index to resume at.
+  const literal = (j) => {
+    while (j < src.length && src[j] !== "`" && !(src[j] === "$" && src[j + 1] === "{")) {
+      // An escaped newline (a line continuation) is still a line.
+      if (src[j] === "\\") { if (src[j + 1] === "\n") line++; j++; }
+      else if (src[j] === "\n") line++;
+      j++;
+    }
+    if (src[j] === "$") { depths.push(0); lastSig = "{"; return j + 2; }
+    lastSig = "`";
+    return j + 1;
+  };
   while (i < src.length) {
     const c = src[i];
     const n = src[i + 1];
@@ -379,6 +400,20 @@ function slashComments(src, { rust = false, jsx = false } = {}) {
       continue;
     }
     if (jsx && c === "'" && /\p{L}/u.test(src[i - 1] ?? "") && /\p{L}/u.test(n ?? "")) { i++; lastSig = c; continue; }
+    if (templates && c === "`") {
+      i = literal(i + 1);
+      continue;
+    }
+    // Inside a template's `${…}`: braces are counted, and the `}` that closes the substitution resumes the
+    // template's literal text. Everything else in the substitution is code, lexed by the rules above.
+    if (templates && depths.length > 0 && (c === "{" || c === "}")) {
+      if (c === "{") depths[depths.length - 1]++;
+      else if (depths[depths.length - 1] > 0) depths[depths.length - 1]--;
+      else { depths.pop(); i = literal(i + 1); continue; }
+      lastSig = c;
+      i++;
+      continue;
+    }
     if (c === '"' || c === "`" || (c === "'" && !rust) || (c === "'" && rust && /^'(?:\\.[^']{0,8}|[^\\'])'/.test(src.slice(i, i + 12)))) {
       let j = i + 1;
       while (j < src.length && src[j] !== c) {
@@ -407,8 +442,11 @@ function slashComments(src, { rust = false, jsx = false } = {}) {
       }
       // No closing `/` on the line: it was a division (or a JSX tag), not a
       // regex, so lex on from the next character. The newline stays for the
-      // top of the loop, which is what counts lines.
-      if (src[j] !== "/") { i++; lastSig = "/"; continue; }
+      // top of the loop, which is what counts lines. Inside a substitution, a
+      // "regex" that would take a backtick or a `}` is a division read as a
+      // regex (`${n++ / 2}`): taking it would leave the substitution open and
+      // flip code and string for the rest of the file.
+      if (src[j] !== "/" || (depths.length > 0 && /[`}]/.test(src.slice(i + 1, j)))) { i++; lastSig = "/"; continue; }
       i = j + 1;
       lastSig = "/";
       continue;
@@ -422,7 +460,7 @@ function slashComments(src, { rust = false, jsx = false } = {}) {
 function commentsOf(file, src) {
   const syntax = commentSyntax(file);
   if (syntax === "hash") return hashComments(src);
-  if (syntax === "slash") return slashComments(src, { rust: file.endsWith(".rs"), jsx: /\.[jt]sx$/.test(file) });
+  if (syntax === "slash") return slashComments(src, { rust: file.endsWith(".rs"), jsx: /\.[jt]sx$/.test(file), templates: /\.[cm]?[jt]sx?$/.test(file) });
   return [];
 }
 

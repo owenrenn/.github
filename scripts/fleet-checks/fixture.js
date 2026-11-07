@@ -21,10 +21,16 @@ const ENV = {
   GIT_CONFIG_GLOBAL: os.devNull, GIT_CONFIG_NOSYSTEM: "1",
 };
 
+/** Removes a folder without letting a removal error replace the error that made the caller clean up. */
+function removeQuietly(dir) {
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* the caller rethrows its own error */ }
+}
+
 function makeRepo() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-checks-"));
   const git = (...args) => execFileSync("git", args, { cwd: root, env: ENV, encoding: "utf8" });
-  git("init", "-q", "-b", "main");
+  // The folder exists before any caller's finally does, so a failed init must remove it here.
+  try { git("init", "-q", "-b", "main"); } catch (e) { removeQuietly(root); throw e; }
   const write = (files) => {
     for (const [p, text] of Object.entries(files)) {
       fs.mkdirSync(path.dirname(path.join(root, p)), { recursive: true });
@@ -41,4 +47,14 @@ function makeRepo() {
   return { root, git, write, commit, cleanup, env: ENV };
 }
 
-module.exports = { makeRepo, ENV };
+/**
+ * A repo built by `build(r)` before it is returned. The folder exists before any caller's `finally` does, so a build
+ * that throws removes it here and rethrows the build's own error.
+ */
+function buildRepo(build) {
+  const r = makeRepo();
+  try { build(r); } catch (e) { removeQuietly(r.root); throw e; }
+  return r;
+}
+
+module.exports = { makeRepo, buildRepo, ENV };
