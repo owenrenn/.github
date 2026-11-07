@@ -13,7 +13,7 @@ const { execFileSync } = require("node:child_process");
 
 const sec = require("./security.js");
 const { normalize } = require("./config.js");
-const { makeRepo, ENV } = require("./fixture.js");
+const { makeRepo, buildRepo, ENV } = require("./fixture.js");
 const cli = require("./cli.js");
 
 const ONE = normalize({}).streams;
@@ -37,14 +37,14 @@ function botCommit(r, message, files) {
 }
 
 function repoWithRelease() {
-  const r = makeRepo();
-  r.commit("init", { "package.json": "{}\n", "src/a.ts": "a\n" });
-  r.git("tag", "v1.0.0");
-  botCommit(r, "chore(deps): bump vite from 7.3.6 to 7.3.7 (#213)\n\nBumps [vite](https://example.test) from 7.3.6 to 7.3.7.", { "package.json": '{"vite":"7.3.7"}\n' });
-  botCommit(r, "chore(deps): bump sharp from 0.35.4 to 0.35.5 (#214)", { "package.json": '{"vite":"7.3.7","sharp":"0.35.5"}\n' });
-  r.commit("feat: a thing (#215)", { "src/a.ts": "b\n" });
-  r.git("tag", "v1.1.0");
-  return r;
+  return buildRepo((r) => {
+    r.commit("init", { "package.json": "{}\n", "src/a.ts": "a\n" });
+    r.git("tag", "v1.0.0");
+    botCommit(r, "chore(deps): bump vite from 7.3.6 to 7.3.7 (#213)\n\nBumps [vite](https://example.test) from 7.3.6 to 7.3.7.", { "package.json": '{"vite":"7.3.7"}\n' });
+    botCommit(r, "chore(deps): bump sharp from 0.35.4 to 0.35.5 (#214)", { "package.json": '{"vite":"7.3.7","sharp":"0.35.5"}\n' });
+    r.commit("feat: a thing (#215)", { "src/a.ts": "b\n" });
+    r.git("tag", "v1.1.0");
+  });
 }
 
 // ── parsing ─────────────────────────────────────────────────────────────────

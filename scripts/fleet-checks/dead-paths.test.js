@@ -53,6 +53,44 @@ test("slash comments: an unterminated apostrophe does not swallow later lines, a
   assert.deepEqual(dp.slashComments(src).map((c) => c.line), [2]);
 });
 
+test("⚠️ js: a template nested inside `${…}` does not close the outer one, so later comments are read (#1801)", () => {
+  // The measured shape, from the conformance scan: a template inside a template's `${…}`. Read flat,
+  // the inner backtick closed the outer template and every backtick after flipped code and string.
+  const src = [
+    "const a = `missing: ${xs.map((l) => `\\`${l}\\``).join(\", \")}`;",
+    "// one",
+    "const b = `${ { k: \"}\" }.k } ${'`'}`; // two",
+    "const c = /^(?:on|\"on\"|'on'):/.exec(s); // three",
+    "/* four */",
+  ].join("\n");
+  assert.deepEqual(dp.commentsOf("x.js", src).map((c) => [c.line, c.text.trim()]), [[2, "one"], [3, "two"], [4, "three"], [5, "four"]]);
+  // A multi-line template keeps line numbers.
+  assert.deepEqual(dp.commentsOf("x.ts", "const t = `a\n${`b\nc`}\n`;\n// on five").map((c) => c.line), [5]);
+  // Off outside JS and TS: a Go raw string's `${` is text.
+  assert.deepEqual(dp.commentsOf("x.go", "s := `${`\n// after").map((c) => c.text.trim()), ["after"]);
+});
+
+test("⚠️ js: a substitution is lexed as code, so a quote in a regex, a brace in a comment or a string ends nothing early (#1801's review)", () => {
+  // Each line holds a quote, brace or backtick that a non-lexing scan of `${…}` misreads as structure.
+  const src = [
+    "const q = `'${v.replace(/'/g, \"''\")}'`;",
+    "const h = `<a title=\"${t.replace(/\"/g, \"&quot;\")}\">`;",
+    "const a = `${x /* { */}`;",
+    "const b = `${ { k: \"}\" }.k }`;",
+    "function f() { // one",
+    "  return `${a ? `${b}` : \"`\"}`; // two",
+    "} // three",
+    "const z = `x`; /* four */",
+  ].join("\n");
+  assert.deepEqual(dp.commentsOf("x.ts", src).map((c) => [c.line, c.text.trim()]), [[3, "{"], [5, "one"], [6, "two"], [7, "three"], [8, "four"]]);
+});
+
+test("js: an escaped newline in template text is a line, and a division read as a regex cannot leave a substitution open", () => {
+  assert.deepEqual(dp.commentsOf("x.js", "const s = `a\\\nb`;\n// line3").map((c) => c.line), [3]);
+  const src = ["function f() {", "  const s = `${n++ / 2}`; const t = a / b;", "} // c", "// d", "const u = `q`; // e", "// f"].join("\n");
+  assert.deepEqual(dp.commentsOf("x.js", src).map((c) => c.text.trim()), ["c", "d", "e", "f"]);
+});
+
 test("rust: a lifetime is not a char literal and a raw string hides its //", () => {
   const src = 'fn f<\'a>(s: &\'a str) {} // lifetimes\nlet r = r#"no // comment"#; // raw\n';
   assert.deepEqual(dp.slashComments(src, { rust: true }).map((c) => c.text.trim()), ["lifetimes", "raw"]);
