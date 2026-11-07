@@ -45,6 +45,17 @@ const TYPES = ["added", "changed", "fixed", "removed"];
 const TYPE_HEADINGS = { added: "Added", changed: "Changed", fixed: "Fixed", removed: "Removed" };
 const FRAGMENT_NAME = /^changelog\.d\/(\d+)-([a-z0-9]+(?:-[a-z0-9]+)*)\.md$/;
 
+/**
+ * The keys a fragment's frontmatter may carry. ⚠️ A NEW KEY IS AN ORDERING HAZARD: the PR check runs the shared
+ * copy at its newest commit, but a release renders with the copy pinned by `FLEET_CHECKS_REF`, which refuses an
+ * unknown key. So a key is published, then every releasing repo's pin moves, and only then may a fragment use it
+ * (#1804).
+ */
+const FRONTMATTER_KEYS = ["type", "ships", "issue"];
+
+/** `issue:`'s value: a ticket in another repo, `owner/repo#N`. */
+const ISSUE_REF = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\/[A-Za-z0-9._-]+#[1-9]\d*$/;
+
 /** A file under `changelog.d/` that is not a fragment: its README explains the format. */
 const isFragmentPath = (p) => p.startsWith(`${FRAGMENT_DIR}/`) && p.endsWith(".md") && !/\/README\.md$/i.test(p);
 
@@ -99,7 +110,7 @@ function parseFragment(relPath, text, streams) {
     if (!line.trim() || line.trim().startsWith("#")) continue;
     const kv = /^([a-z]+):\s*(.*?)\s*$/.exec(line);
     if (!kv) { errors.push(`${relPath}: cannot read frontmatter line "${line}"`); continue; }
-    if (!["type", "ships"].includes(kv[1])) { errors.push(`${relPath}: unknown frontmatter key "${kv[1]}" (type, ships)`); continue; }
+    if (!FRONTMATTER_KEYS.includes(kv[1])) { errors.push(`${relPath}: unknown frontmatter key "${kv[1]}" (${FRONTMATTER_KEYS.join(", ")})`); continue; }
     fields[kv[1]] = frontmatterValue(kv[2]);
   }
   if (!fields.type) errors.push(`${relPath}: \`type:\` is required (${TYPES.join(" | ")})`);
@@ -116,13 +127,17 @@ function parseFragment(relPath, text, streams) {
     errors.push(`${relPath}: \`ships:\` is required here — this repo has streams ${streamNames.join(", ")}`);
   }
 
+  if (fields.issue !== undefined && !ISSUE_REF.test(fields.issue)) {
+    errors.push(`${relPath}: \`issue: ${fields.issue}\` is not owner/repo#N — it names the ticket in another repo, in place of the filename's number`);
+  }
+
   const body = m[2].trim();
   if (!body) errors.push(`${relPath}: the body is one line saying what changed, for a reader of the release notes`);
   else if (/\n/.test(body)) errors.push(`${relPath}: the body is ONE line; this one has ${body.split("\n").length}`);
 
   if (errors.length) return { fragment: null, errors };
   return {
-    fragment: { path: relPath, issue: Number(name[1]), slug: name[2], type: fields.type, ships, body },
+    fragment: { path: relPath, issue: Number(name[1]), ref: fields.issue ?? null, slug: name[2], type: fields.type, ships, body },
     errors,
   };
 }
@@ -148,9 +163,14 @@ function tagStream(tag, streams) {
  * numeric dotted core, then a pre-release sorts before its release, and
  * pre-release identifiers compare numerically when both are numbers and as
  * strings otherwise, a number before a word, so rc.2 sorts before rc.10 (#1561).
+ * Build metadata (`+…`) is ignored for precedence, per semver: a cargo bump to
+ * `0.9.12+spec-1.1.0` is `0.9.12` (#1744). The fleet-state advisory reader keeps
+ * its own copy, held to the same table by a test there, because this file is
+ * published and imports nothing.
  */
 function compareVersions(a, b) {
-  const parse = (v) => {
+  const parse = (whole) => {
+    const v = whole.split("+")[0];
     const cut = v.indexOf("-");
     const core = cut === -1 ? v : v.slice(0, cut);
     return { nums: core.split(".").map((n) => Number.parseInt(n, 10) || 0), pre: cut === -1 ? null : v.slice(cut + 1).split(".") };
@@ -437,7 +457,14 @@ function collect(root, { ref = "HEAD", streams }) {
 
 // ── rendering ───────────────────────────────────────────────────────────────
 
-const entryLine = (e) => `- ${e.body} (#${e.issue}${e.pr && e.pr !== e.issue ? `, PR #${e.pr}` : ""})`;
+/**
+ * `(#issue, PR #N)`. A fragment with `issue: owner/repo#N` cites that ticket instead: its filename's digits are
+ * a ticket in another repo, so `#digits` would link a ticket here that does not exist. Its PR is always named,
+ * since the PR is this repo's and the ticket is not.
+ */
+const entryLine = (e) => (e.ref
+  ? `- ${e.body} (${e.ref}${e.pr ? `, PR #${e.pr}` : ""})`
+  : `- ${e.body} (#${e.issue}${e.pr && e.pr !== e.issue ? `, PR #${e.pr}` : ""})`);
 
 /** The type sections of one release, Added → Removed, newest issue first within a type. */
 function renderSections(entries) {
