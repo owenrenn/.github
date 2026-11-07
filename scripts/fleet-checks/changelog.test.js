@@ -27,13 +27,38 @@ const frag = (type, body, ships) => `---\ntype: ${type}\n${ships ? `ships: ${shi
 test("a well-formed fragment parses; issue and slug come from the name", () => {
   const { fragment, errors } = cl.parseFragment("changelog.d/1626-view-log.md", frag("added", "The panel logs view opens."), ONE);
   assert.deepEqual(errors, []);
-  assert.deepEqual(fragment, { path: "changelog.d/1626-view-log.md", issue: 1626, slug: "view-log", type: "added", ships: ["default"], body: "The panel logs view opens." });
+  assert.deepEqual(fragment, { path: "changelog.d/1626-view-log.md", issue: 1626, ref: null, slug: "view-log", type: "added", ships: ["default"], body: "The panel logs view opens." });
 });
 
 test("every problem in a fragment is reported at once", () => {
   const { fragment, errors } = cl.parseFragment("changelog.d/Fix.md", "---\ntype: fix\nlink: x\n---\nOne\nTwo\n", TWO);
   assert.equal(fragment, null);
   assert.equal(errors.length, 5, errors.join("\n"));   // name, unknown key, type, ships, body
+});
+
+test("issue: owner/repo#N cites a ticket in another repo; the filename keeps its digits for ordering (#1804)", () => {
+  const text = "---\ntype: changed\nissue: acme/other#1635   # the wave's ticket\n---\nNode 26 is the runtime.\n";
+  const { fragment, errors } = cl.parseFragment("changelog.d/1635-node-26.md", text, ONE);
+  assert.deepEqual(errors, []);
+  assert.equal(fragment.issue, 1635);
+  assert.equal(fragment.ref, "acme/other#1635");
+  assert.equal(cl.entryLine({ ...fragment, pr: 86 }), "- Node 26 is the runtime. (acme/other#1635, PR #86)");
+  assert.equal(cl.entryLine({ ...fragment, pr: 1635 }), "- Node 26 is the runtime. (acme/other#1635, PR #1635)", "the PR is this repo's, so it is named even when the numbers match");
+  assert.equal(cl.entryLine({ ...fragment, pr: null }), "- Node 26 is the runtime. (acme/other#1635)");
+  assert.equal(cl.entryLine({ ...fragment, ref: null, pr: 86 }), "- Node 26 is the runtime. (#1635, PR #86)", "without the key, the line is unchanged");
+});
+
+test("issue: refuses anything but owner/repo#N", () => {
+  for (const bad of ["#1635", "1635", "other#1635", "acme/other", "acme/other#0", "acme/other#12a", "-acme/x#1", "https://github.com/o/r/issues/1"]) {
+    const { fragment, errors } = cl.parseFragment("changelog.d/1-x.md", `---\ntype: fixed\nissue: ${bad}\n---\nOne line.\n`, ONE);
+    assert.equal(fragment, null, bad);
+    assert.match(errors.join("\n"), /is not owner\/repo#N/, bad);
+  }
+});
+
+test("an unknown key still fails, and the error lists the keys there are", () => {
+  const { errors } = cl.parseFragment("changelog.d/1-x.md", "---\ntype: fixed\nlink: x\n---\nOne line.\n", ONE);
+  assert.match(errors.join("\n"), /unknown frontmatter key "link" \(type, ships, issue\)/);
 });
 
 test("ships: names, lists, all and both; both refuses a repo that does not have two streams", () => {
@@ -79,6 +104,12 @@ test("pre-release identifiers follow semver: numbers numerically, a number befor
   // Review finding 8 (#1561): rc.10 sorted before rc.2 as a string.
   const sorted = ["1.0.0-rc.10", "1.0.0-rc.2", "1.0.0-beta", "1.0.0-rc", "1.0.0-1", "1.0.0-rc-x.1"].sort(cl.compareVersions);
   assert.deepEqual(sorted, ["1.0.0-1", "1.0.0-beta", "1.0.0-rc", "1.0.0-rc.2", "1.0.0-rc.10", "1.0.0-rc-x.1"]);
+});
+
+test("build metadata is ignored for precedence, per semver (#1744)", () => {
+  assert.equal(cl.compareVersions("0.9.12+spec-1.1.0", "0.9.12"), 0);
+  assert.ok(cl.compareVersions("0.9.11+spec-1.1.0", "0.9.12") < 0);
+  assert.ok(cl.compareVersions("1.0.0-rc.1+b.7", "1.0.0") < 0);
 });
 
 test("the PR number is the squash suffix, or a merge commit's number, or nothing", () => {
