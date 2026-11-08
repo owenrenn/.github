@@ -133,7 +133,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Check out the sync logic
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: owenrenn/.github
           # Callers are told to reference this reusable workflow as `@main`, not
@@ -146,7 +146,7 @@ jobs:
 
       - name: Decide what this event implies
         id: decide
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         # WHY the input arrives via env rather than ${{ }} inside script:
         # interpolating an expression into a script body is the script-injection
         # shape GitHub's hardening guidance names. This particular input comes
@@ -186,7 +186,7 @@ jobs:
 
       - name: Backfill pm:awareness
         if: steps.decide.outputs.backfill != ''
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         # Same reasoning as the AUDIENCE env above: this value is a step output,
         # not attacker input, but interpolating ${{ }} into a script body is the
         # pattern this file argues against in its own comments, and it is the
@@ -208,7 +208,7 @@ jobs:
       - name: Add to Card Shark
         id: add
         if: steps.decide.outputs.kind == 'add'
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
           # WHY the raw mutation instead of actions/add-to-project@v2: that action
@@ -256,7 +256,7 @@ jobs:
         # changed while this run was a cancelled intermediate, and any item this
         # path lost. Sync-sets-fields is an ADDITION to the reconciler.
         if: steps.decide.outputs.kind == 'add' && steps.add.outputs.itemId != ''
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           TRACK: ${{ inputs.track }}
           LABELS: ${{ steps.decide.outputs.labels }}
@@ -359,7 +359,7 @@ jobs:
 
       - name: Apply product:<repo> label
         if: steps.decide.outputs.product != ''
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
           script: |
@@ -372,7 +372,7 @@ jobs:
 
       - name: Remove from Card Shark
         if: steps.decide.outputs.kind == 'remove'
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
           script: |
