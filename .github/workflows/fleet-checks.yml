@@ -12,7 +12,8 @@
 #   changelog   A PR that changes code adds a fragment, changelog.d/<issue>-<slug>.md,
 #               or opts out with a line `Changelog: none — <why>` in its body. A
 #               fragment's `ships:` must name a stream the PR's paths reach.
-#               Docs-only PRs and bot-authored PRs are not asked for one.
+#               Docs-only PRs and bot-authored PRs are not asked for one. A repo
+#               whose config says `"changelog": false` skips this check.
 #   dead-paths  Each file's paths in docs and code comments that resolve to nothing,
 #               against the caller's committed .github/dead-paths-baseline.json, keyed
 #               by target. A new one fails; so does a fixed one, until the baseline is
@@ -85,9 +86,22 @@ jobs:
         with:
           node-version: "24"
 
+      # A caller whose fleet-checks config says `"changelog": false`
+      # ships no release and keeps no fragments, so the fragment step is
+      # skipped and the dead-path ratchet runs alone. The CLI answers, so the
+      # switch passes the same validation as every check; a config it refuses
+      # fails this step, and the dead-path step below names the error again.
+      - name: Read the caller's config
+        id: config
+        run: |
+          changelog="$(node .fleet-checks/scripts/fleet-checks/cli.js changelog enabled)"
+          echo "changelog=$changelog" >> "$GITHUB_OUTPUT"
+
       # The body and author reach the script through env, never `${{ }}` inside
-      # `run:`, so a PR body cannot inject shell.
+      # `run:`, so a PR body cannot inject shell. Skipped only on an explicit
+      # `false`: any other answer runs the check, the safe direction.
       - name: Changelog fragment
+        if: steps.config.outputs.changelog != 'false'
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
@@ -95,7 +109,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: node .fleet-checks/scripts/fleet-checks/cli.js changelog check --base "$BASE_SHA" --head "$HEAD_SHA" --author "$PR_AUTHOR"
 
-      # Runs even when the changelog step failed, so one run reports both.
+      # Runs even when a step above failed, so one run reports both checks.
       - name: Dead paths
         if: success() || failure()
         run: node .fleet-checks/scripts/fleet-checks/cli.js dead-paths

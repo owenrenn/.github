@@ -26,7 +26,12 @@ function removeQuietly(dir) {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* the caller rethrows its own error */ }
 }
 
-function makeRepo() {
+/**
+ * A throwaway git repository. Pass the test's context `t` and its removal is registered with `t.after`, so the
+ * caller cannot forget it; without `t`, the caller removes it with `cleanup()` in a `finally`. The js runner fails
+ * a run that leaves a folder in TMPDIR (#1772).
+ */
+function makeRepo(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-checks-"));
   const git = (...args) => execFileSync("git", args, { cwd: root, env: ENV, encoding: "utf8" });
   // The folder exists before any caller's finally does, so a failed init must remove it here.
@@ -44,15 +49,16 @@ function makeRepo() {
     return git("rev-parse", "HEAD").trim();
   };
   const cleanup = () => fs.rmSync(root, { recursive: true, force: true });
+  if (typeof t?.after === "function") t.after(cleanup);
   return { root, git, write, commit, cleanup, env: ENV };
 }
 
 /**
  * A repo built by `build(r)` before it is returned. The folder exists before any caller's `finally` does, so a build
- * that throws removes it here and rethrows the build's own error.
+ * that throws removes it here and rethrows the build's own error. `t`, when given, is passed to `makeRepo`.
  */
-function buildRepo(build) {
-  const r = makeRepo();
+function buildRepo(build, t) {
+  const r = makeRepo(t);
   try { build(r); } catch (e) { removeQuietly(r.root); throw e; }
   return r;
 }

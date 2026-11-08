@@ -9,6 +9,7 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
 
 const cl = require("./changelog.js");
 const { normalize } = require("./config.js");
@@ -110,6 +111,13 @@ test("build metadata is ignored for precedence, per semver (#1744)", () => {
   assert.equal(cl.compareVersions("0.9.12+spec-1.1.0", "0.9.12"), 0);
   assert.ok(cl.compareVersions("0.9.11+spec-1.1.0", "0.9.12") < 0);
   assert.ok(cl.compareVersions("1.0.0-rc.1+b.7", "1.0.0") < 0);
+});
+
+test("makeRepo(t) registers its own removal, so a caller cannot leave the folder behind", (t) => {
+  const r = makeRepo(t);
+  assert.ok(fs.existsSync(r.root));
+  // Hooks run in the order they are registered, so this one runs after makeRepo's removal.
+  t.after(() => assert.equal(fs.existsSync(r.root), false, "makeRepo(t) removed its folder"));
 });
 
 test("the PR number is the squash suffix, or a merge commit's number, or nothing", () => {
