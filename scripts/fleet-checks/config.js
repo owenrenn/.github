@@ -27,6 +27,10 @@
  *     }
  *   }
  *
+ * `"changelog": false` turns the fragment check off, for a repo that ships no
+ * release and keeps no fragments: it then runs only the dead-path ratchet
+ * (PM ruling on #1694, 2026-11-08). `true`, or an object, keeps it on.
+ *
  * Validation refuses rather than defaults: an unknown key is a typo, and a
  * typo that is silently ignored reads as a check that ran (#1561).
  */
@@ -58,7 +62,12 @@ function stringList(v, where) {
 /** Validate a parsed config object and fill its defaults. */
 function normalize(raw) {
   onlyKeys(raw, ["$comment", "changelog", "deadPaths"], CONFIG_PATH);
-  const cl = raw.changelog ?? {};
+  // A boolean switches the fragment check; an object configures it and keeps it on.
+  const changelog = raw.changelog !== false;
+  const cl = typeof raw.changelog === "boolean" ? {} : raw.changelog ?? {};
+  if (typeof cl !== "object" || Array.isArray(cl)) {
+    throw new ConfigError(`${CONFIG_PATH} changelog: true, false, or an object of settings`);
+  }
   onlyKeys(cl, ["streams"], `${CONFIG_PATH} changelog`);
   let streams = DEFAULT_STREAMS;
   if (cl.streams !== undefined) {
@@ -104,6 +113,7 @@ function normalize(raw) {
   });
   if (dp.comments !== undefined && typeof dp.comments !== "boolean") throw new ConfigError(`${CONFIG_PATH} deadPaths.comments: true or false`);
   return {
+    changelog,
     streams,
     deadPaths: {
       exempt,

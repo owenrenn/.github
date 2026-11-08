@@ -175,6 +175,9 @@ files in the caller shape the checks:
 - `.github/fleet-checks.json`: release **streams** (none declared: one stream, `v*`, every
   path), dead-path **exemptions** with a `why`, and **`foreignNames`**. Unknown keys are
   refused. Schema: the header of `config.js`.
+  - **`"changelog": false`** is for a repo that ships no release and keeps no fragments: the
+    fragment step is skipped and the dead-path ratchet runs alone. Omitted, or `true`, the
+    check runs.
 - `.github/dead-paths-baseline.json`: each file's dead targets at adoption. **Write it with the
   CLI, never by hand**: `node <checkout of this repo>/scripts/fleet-checks/cli.js dead-paths --write-baseline`.
 

@@ -41,3 +41,23 @@ test("a non-list exemption, or a non-object config, is a named ConfigError, not 
   assert.throws(() => normalize(null), ConfigError);
   assert.throws(() => normalize({ deadPaths: { exempt: [null] } }), ConfigError);
 });
+
+test("the fragment check is on by default, and `changelog: true` or an object keeps it on", () => {
+  assert.equal(normalize({}).changelog, true);
+  assert.equal(normalize({ changelog: true }).changelog, true);
+  assert.deepEqual(normalize({ changelog: true }).streams, DEFAULT_STREAMS);
+  assert.equal(normalize({ changelog: { streams: { web: { tagPrefix: "v", paths: ["**"] } } } }).changelog, true);
+});
+
+test("`changelog: false` turns the fragment check off and leaves the dead-path config as declared", () => {
+  // PM ruling on #1694: a repo that ships no release runs only the dead-path ratchet.
+  const c = normalize({ changelog: false, deadPaths: { foreignNames: ["other"] } });
+  assert.equal(c.changelog, false);
+  assert.deepEqual(c.deadPaths.foreignNames, ["other"]);
+});
+
+test("a `changelog` that is neither a boolean nor an object is refused, named", () => {
+  for (const v of ["false", "no", 0, 1, [], ["streams"]]) {
+    assert.throws(() => normalize({ changelog: v }), /changelog: true, false, or an object/, JSON.stringify(v));
+  }
+});

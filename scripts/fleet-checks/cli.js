@@ -16,6 +16,9 @@
  *   cli.js changelog check --base <ref> [--head <ref>] [--author <login>]
  *                                    reads the PR body from $PR_BODY
  *   cli.js changelog lint            every fragment in the working tree
+ *   cli.js changelog enabled         prints true or false: whether the repo's config keeps
+ *                                    the fragment check on. With "changelog": false, check
+ *                                    and lint pass with a note, and release and print refuse
  *   cli.js dead-paths                the ratchet: each file's dead targets against
  *                                    the repo's .github/dead-paths-baseline.json, both ways
  *   cli.js dead-paths --write-baseline   record today's dead targets (adoption, or after a fix)
@@ -35,7 +38,7 @@ const security = require("./security.js");
 
 /** The GitHub reads `changelog release` makes; main() takes others so a suite can stand in for GitHub. */
 const DEFAULT_READERS = { alerts: security.readFixedAlerts, body: security.readPrBody };
-const { loadConfig, ConfigError } = require("./config.js");
+const { CONFIG_PATH, loadConfig, ConfigError } = require("./config.js");
 
 class UsageError extends Error {}
 
@@ -66,6 +69,16 @@ const annotate = (level, msg, file, line) => {
 
 function changelog(sub, pos, flags, root, cfg, readers = DEFAULT_READERS) {
   const { streams } = cfg;
+  // The workflow reads this to skip its fragment step, so the switch is judged by the same validation as every run.
+  if (sub === "enabled") { console.log(String(cfg.changelog)); return 0; }
+  if (!cfg.changelog && ["check", "lint"].includes(sub)) {
+    console.log(`note: ${CONFIG_PATH} says "changelog": false, so this repo is not asked for fragments`);
+    return 0;
+  }
+  // A repo that declared no changelog has no release notes to render; an empty body would read as a release with no changes.
+  if (!cfg.changelog && ["release", "print"].includes(sub)) {
+    throw new ConfigError(`changelog ${sub}: ${CONFIG_PATH} says "changelog": false, so this repo has no changelog to render`);
+  }
   if (sub === "release") {
     const tag = pos[0];
     if (!tag) throw new UsageError("changelog release <tag>");
@@ -214,7 +227,7 @@ function main(argv, readers = DEFAULT_READERS) {
   const [cmd, sub, ...rest] = pos;
   if (cmd === "changelog") return changelog(sub, rest, flags, root, cfg, readers);
   if (cmd === "dead-paths") return deadPaths(flags, root, cfg);
-  throw new UsageError("usage: cli.js changelog <release|print|check|lint> … | cli.js dead-paths …");
+  throw new UsageError("usage: cli.js changelog <release|print|check|lint|enabled> … | cli.js dead-paths …");
 }
 
 if (require.main === module) {

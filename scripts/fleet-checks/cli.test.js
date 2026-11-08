@@ -125,3 +125,48 @@ test("a tag of no stream, a bad config, or a bad argument is exit 2 — could no
     assert.match(bad.err, /unknown key "changelgo"/);
   } finally { r.cleanup(); }
 });
+
+test("changelog: false — the dead-path ratchet still runs, and still fails on a new dead path", (t) => {
+  // PM ruling on #1694: the switch skips the fragment check only.
+  const r = makeRepo(t);
+  r.commit("init", { "src/a.ts": "", ".github/fleet-checks.json": '{"changelog": false}' });
+  assert.equal(run(r, ["dead-paths", "--write-baseline"]).code, 0);
+  r.commit("baseline");
+  const clean = run(r, ["dead-paths"]);
+  assert.equal(clean.code, 0, clean.err);
+  assert.match(clean.out, /dead-paths: ok/);
+  r.write({ "src/a.ts": "// see src/gone.ts\n" });
+  const grew = run(r, ["dead-paths"]);
+  assert.equal(grew.code, 1);
+  assert.match(grew.out, /src\/a\.ts:1 \[comment-path\] src\/gone\.ts/);
+});
+
+test("changelog: false — `enabled` prints false, check and lint pass with a note, release and print refuse", (t) => {
+  const r = makeRepo(t);
+  const base = r.commit("init", { "src/a.ts": "", ".github/fleet-checks.json": '{"changelog": false}' });
+  r.commit("change", { "src/a.ts": "1" });
+  const on = run(r, ["changelog", "enabled"]);
+  assert.equal(on.code, 0);
+  assert.equal(on.out, "false\n");
+  const check = run(r, ["changelog", "check", "--base", base]);
+  assert.equal(check.code, 0, check.err);
+  assert.match(check.out, /"changelog": false, so this repo is not asked for fragments/);
+  assert.equal(run(r, ["changelog", "lint"]).code, 0);
+  r.git("tag", "v1.0.0");
+  const rel = run(r, ["changelog", "release", "v1.0.0"]);
+  assert.equal(rel.code, 2);
+  assert.match(rel.err, /changelog release: .*"changelog": false/);
+  assert.equal(run(r, ["changelog", "print"]).code, 2);
+});
+
+test("`changelog enabled` prints true with no config, and a bad config is exit 2, never a value", (t) => {
+  const r = makeRepo(t);
+  r.commit("init", { "src/a.ts": "" });
+  const on = run(r, ["changelog", "enabled"]);
+  assert.equal(on.code, 0);
+  assert.equal(on.out, "true\n");
+  r.commit("cfg", { ".github/fleet-checks.json": '{"changelog": "off"}' });
+  const bad = run(r, ["changelog", "enabled"]);
+  assert.equal(bad.code, 2);
+  assert.equal(bad.out, "");
+});
