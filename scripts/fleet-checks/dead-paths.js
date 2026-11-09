@@ -26,8 +26,9 @@
  *     is a pattern, not a path, and is skipped whole rather than cut short.
  *   - A gitignored path is a build output or a per-machine file. A comment may
  *     name one ("the build writes target/release/…"), so it is skipped.
- *   - A path that resolves file-relative, or with a source extension added
- *     (`src/lib/cache-headers` → `.ts`), resolves.
+ *   - A path that resolves file-relative, from any folder above the file, or
+ *     with a source extension added (`src/lib/cache-headers` → `.ts`), resolves.
+ *   - A doc link inside a code span is an example of link syntax, not a link.
  *
  * ── THE SLUG ALGORITHM ──────────────────────────────────────────────────────
  *
@@ -281,11 +282,22 @@ function anchorsInSource(src) {
 const anchorsOf = (relPath, root) => anchorsInSource(fs.readFileSync(path.join(root, relPath), "utf8"));
 
 /**
- * Markdown inline links. Fenced code is blanked rather than deleted, so line
- * numbers survive; a label may hold one level of brackets (`[`#475`]`).
+ * A CommonMark code span: a backtick run, then the next run of the same length.
+ * It stays inside one paragraph, so an unmatched backtick cannot swallow the
+ * text after a blank line, and a backslash-escaped backtick opens none.
+ */
+const CODE_SPAN = /(?<![`\\])(`+)(?!`)((?:[^`\n]|`+(?!`)|\n(?![ \t]*\n))*?[^`])\1(?!`)/g;
+
+const blank = (s) => s.replace(/[^\n]/g, " ");
+
+/**
+ * Markdown inline links. Fenced code and code spans are blanked rather than
+ * deleted, so line numbers survive: a link written inside backticks is an
+ * example of the syntax, not a link. A label may hold one level of brackets
+ * (`[`#475`]`), and a code span inside a label leaves the link standing.
  */
 function linksOf(src) {
-  const prose = src.replace(FENCE, (b) => b.replace(/[^\n]/g, " "));
+  const prose = src.replace(FENCE, blank).replace(CODE_SPAN, blank);
   const out = [];
   for (const m of prose.matchAll(/\[((?:[^\][]|\[[^\][]*\])*)\]\(([^()\s]+)\)/g)) {
     out.push({ label: m[1], target: m[2], line: prose.slice(0, m.index).split("\n").length });
@@ -548,6 +560,13 @@ function foreignContext(foreignNames = []) {
   return new RegExp(words.join("|"), "i");
 }
 
+/** `dir` and each folder above it, nearest first, stopping short of the repo root. */
+function ancestors(dir) {
+  const out = [];
+  for (let d = dir; d && d !== "."; d = path.posix.dirname(d)) out.push(d);
+  return out;
+}
+
 // ── the judge ───────────────────────────────────────────────────────────────
 
 /**
@@ -626,18 +645,23 @@ function findDeadPaths({ root, tracked, docs = [], code = [], linksResolveElsewh
         const clean = raw.replace(/\/$/, "");
         if (!relative && !idx.top.has(clean.split("/")[0])) continue;
         // `./x` is read both ways: a script's comment means its cwd (the repo root) as often as its own directory.
+        // A bare path is read from the root and from each folder above the file, because a package in the repo
+        // has its own root: a skill's `docs/x.md`, cited from that skill's code, sits under the skill (#1825).
         const bases = raw.startsWith("../") ? [path.posix.join(dir, clean)]
           : raw.startsWith("./") ? [path.posix.join(dir, clean), clean.slice(2)]
-          : [clean, path.posix.join(dir, clean)];
+          : [clean, ...ancestors(dir).map((d) => path.posix.join(d, clean))];
         const norm = bases.map((b) => path.posix.normalize(b));
         if (norm[0].startsWith("..")) continue;   // leaves the repo: another checkout's path, not judged
         // A unique tracked file ending in the token resolves too: `design/x.test.ts`
         // written from inside `src/__tests__/` is findable, if imprecise (#1561).
-        const hit = norm.flatMap((b) => MODULE_SUFFIXES.map((s) => b + s)).find((p) => idx.has(p)) ??
-          (relative ? undefined : idx.uniqueSuffix(clean));
+        const hits = norm.flatMap((b) => MODULE_SUFFIXES.map((s) => b + s)).filter((p) => idx.has(p));
+        const hit = hits[0] ?? (relative ? undefined : idx.uniqueSuffix(clean));
         if (hit) {
-          if (frag && hit.endsWith(".md") && idx.files.has(hit) && !anchors(hit).has(frag)) {
-            findings.push({ file, line, target: token, kind: "comment-anchor", reason: `no heading in ${hit} slugs to it` });
+          // The anchor is judged against every document a reading reached: the root's copy and a
+          // package's own can both exist, and either may be the one the comment means.
+          const docs = (hits.length ? hits : [hit]).filter((h) => h.endsWith(".md") && idx.files.has(h));
+          if (frag && docs.length && !docs.some((h) => anchors(h).has(frag))) {
+            findings.push({ file, line, target: token, kind: "comment-anchor", reason: `no heading in ${docs.join(" or ")} slugs to it` });
           }
           continue;
         }

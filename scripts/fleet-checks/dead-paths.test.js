@@ -266,6 +266,67 @@ test("a suffix shared by two tracked files resolves to neither", () => {
   assert.deepEqual(findings.map((f) => f.target), ["design/x-css.test.ts"]);
 });
 
+test("a bare path resolves from a folder above the citing file: each package's own docs/ (#1825)", () => {
+  // The measured shape: three skills each keep a canon-changes doc in their own docs folder, and a skill's code
+  // cites its own by that folder-relative path. Three copies defeat the unique-suffix rule; the root holds none.
+  const { findings } = judge({
+    "docs/README.md": "",
+    "skills/a/docs/canon-changes.md": "# Changes\n",
+    "skills/b/docs/canon-changes.md": "",
+    "skills/c/docs/canon-changes.md": "",
+    "skills/a/public/colors.css": "/* tokens follow docs/canon-changes.md#changes */\n",
+    "skills/a/renderers/lib/x.test.mjs": "// see docs/canon-changes.md\n",
+  });
+  assert.deepEqual(findings, []);
+});
+
+test("a folder above the file is the only extra reading: a path under no ancestor is still a finding", () => {
+  const { findings } = judge({
+    "docs/README.md": "",
+    "skills/a/docs/canon-changes.md": "# Changes\n",
+    "skills/b/docs/canon-changes.md": "",
+    "tools/x.mjs": "// see docs/canon-changes.md\n",
+    "skills/a/y.mjs": "// docs/canon-changes.md#nope\n",
+  });
+  assert.deepEqual(findings.map((f) => [f.file, f.kind, f.target]), [
+    ["skills/a/y.mjs", "comment-anchor", "docs/canon-changes.md#nope"],
+    ["tools/x.mjs", "comment-path", "docs/canon-changes.md"],
+  ]);
+});
+
+test("an anchor resolves in a package's own copy when the root's copy lacks it", () => {
+  const { findings } = judge({
+    "docs/canon-changes.md": "# Root\n",
+    "skills/a/docs/canon-changes.md": "# Changes\n",
+    "skills/a/x.mjs": "// docs/canon-changes.md#changes, and docs/canon-changes.md#gone\n",
+  });
+  assert.deepEqual(findings.map((f) => [f.target, f.reason]), [
+    ["docs/canon-changes.md#gone", "no heading in docs/canon-changes.md or skills/a/docs/canon-changes.md slugs to it"],
+  ]);
+});
+
+test("a backslash-escaped backtick opens no code span, so the links after it are still judged", () => {
+  const { findings } = judge({ "docs/a.md": "Type \\` to quote, see [guide](gone.md), then `x`.\n" });
+  assert.deepEqual(findings.map((f) => f.target), ["gone.md"]);
+});
+
+test("a link written inside a code span is an example of the syntax, not a link (#1825)", () => {
+  // The measured shape: a vault doc showing `[<name>](<url>)` read as a dead link to `<url>`.
+  const { findings } = judge({
+    "docs/a.md": [
+      "Write it as `[<name>](<url>)`, or ``[x](`gone.md`)`` with backticks inside.",
+      "A span may wrap a line: `[y](",
+      "gone-too.md)` and still be code.",
+      "",
+      "[`#475`](missing.md) is a link whose label is code, and still judged.",
+      "An unmatched ` backtick",
+      "",
+      "does not hide [this](also-missing.md) past a blank line.",
+    ].join("\n"),
+  });
+  assert.deepEqual(findings.map((f) => [f.target, f.line]), [["missing.md", 5], ["also-missing.md", 8]]);
+});
+
 // ── the ratchet ─────────────────────────────────────────────────────────────
 
 test("the ratchet is keyed by target: fixing one and adding another in the same file fails both ways", () => {
