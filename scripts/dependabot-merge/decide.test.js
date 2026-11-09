@@ -264,9 +264,73 @@ test("judgePr refuses a message-read major, and says why a read failed", () => {
   assert.match(judge({ commits: [other] }).reason, /node-forge \(no update-type; the message's from-to versions do not all name node-forge from 1.4.0 to 1.4.3\)/);
 });
 
-test("judgePr never reads the message for a block with two or more dependencies", () => {
-  const two = securityCommit({ extra: ["- dependency-name: other", "  dependency-version: 1.4.3", "  dependency-type: indirect"] });
-  assert.match(judge({ commits: [two] }).reason, /not patch or minor: node-forge \(no update-type\), other \(no update-type\)/);
+// A grouped security update's message, in the shape a live one took: a group subject and `Bumps`
+// line that name no versions, one ``Updates `x` from A to B`` line per member, and a block with no
+// `update-type` that tags each member with its group.
+const grouped = (members, { lines } = {}) => [
+  `chore(deps): bump the npm_and_yarn group across 1 directory with ${members.length} updates`, "",
+  `Bumps the npm_and_yarn group with ${members.length} updates in the / directory: ${members.map((m) => `[${m.name}](https://example.com/${m.name})`).join(" and ")}.`, "", "",
+  ...(lines ?? members.map((m) => `Updates \`${m.name}\` from ${m.from} to ${m.version}`)).flatMap((l) => [l, "- [Commits](https://example.com/compare)", ""]),
+  "---", "updated-dependencies:",
+  ...members.flatMap((m) => [`- dependency-name: ${m.name}`, `  dependency-version: ${m.version}`, "  dependency-type: indirect", "  dependency-group: npm_and_yarn"]),
+  "...", "", "Signed-off-by: dependabot[bot] <support@github.com>",
+].join("\n");
+const groupedCommit = (members, o) => commit({ commit: { message: grouped(members, o), verification: { verified: true } } });
+const GROUP = [
+  { name: "astro", from: "7.3.1", version: "7.3.3" },
+  { name: "fast-uri", from: "3.1.8", version: "3.1.9" },
+  { name: "undici", from: "8.11.2", version: "8.12.3" },
+];
+
+test("judgePr merges a grouped security update whose every member is a patch or minor, each read from its own line", () => {
+  assert.deepStrictEqual(judge({ commits: [groupedCommit(GROUP)] }), {
+    merge: true,
+    reason: "npm_and_yarn: astro semver-patch (read from the message), fast-uri semver-patch (read from the message), undici semver-minor (read from the message)",
+  });
+});
+
+test("judgePr refuses a grouped security update with one major among its members, and names it", () => {
+  const r = judge({ commits: [groupedCommit([...GROUP, { name: "zod", from: "3.25.0", version: "4.0.1" }])] });
+  assert.strictEqual(r.merge, false);
+  assert.match(r.reason, /^not patch or minor: zod \(version-update:semver-major; read from the message\)$/);
+});
+
+test("judgePr refuses a group it cannot read line by line, and says which member and why", () => {
+  const cases = [
+    // A member the body writes no line for.
+    [{ lines: ["Updates `astro` from 7.3.1 to 7.3.3", "Updates `undici` from 8.11.2 to 8.12.3"] }, /fast-uri \(no update-type; the body writes no from-to versions for fast-uri\)/],
+    // A line naming a dependency the block does not list.
+    [{ lines: [...GROUP.map((m) => `Updates \`${m.name}\` from ${m.from} to ${m.version}`), "Updates `lodash` from 4.17.20 to 4.17.21"] }, /which the block does not list/],
+    // A line the pair pattern cannot read, which could hide a second copy at a major.
+    [{ lines: [...GROUP.map((m) => `Updates \`${m.name}\` from ${m.from} to ${m.version}`), "Updates `undici` from 8.11.2 to 9.0.0 in /web"] }, /an Updates line it cannot read: Updates `undici` from 8.11.2 to 9.0.0 in \/web/],
+    // One member locked at two versions.
+    [{ lines: [...GROUP.map((m) => `Updates \`${m.name}\` from ${m.from} to ${m.version}`), "Updates `astro` from 6.0.0 to 7.3.3"] }, /astro \(no update-type; the message's from-to versions do not all name astro from 7.3.1 to 7.3.3\)/],
+    // A member whose line disagrees with the block's version.
+    [{ lines: ["Updates `astro` from 7.3.1 to 7.3.4", ...GROUP.slice(1).map((m) => `Updates \`${m.name}\` from ${m.from} to ${m.version}`)] }, /do not all name astro/],
+  ];
+  for (const [o, why] of cases) {
+    const r = judge({ commits: [groupedCommit(GROUP, o)] });
+    assert.strictEqual(r.merge, false, JSON.stringify(o.lines));
+    assert.match(r.reason, why, JSON.stringify(o.lines));
+  }
+});
+
+test("updateTypeFromMessage reads one member of a group from the lines naming it alone", () => {
+  const names = GROUP.map((m) => m.name);
+  assert.deepStrictEqual(updateTypeFromMessage(grouped(GROUP), dep("undici", "8.12.3"), names), { type: MINOR });
+  // Read without the group's names, the other members' lines stop it: that is the one-dependency rule.
+  assert.match(updateTypeFromMessage(grouped(GROUP), dep("undici", "8.12.3")).why, /do not all name undici/);
+});
+
+test("a grouped member's written update-type is judged as written, and only the members without one are read", () => {
+  const m = grouped(GROUP).replace("  dependency-version: 7.3.3\n", "  dependency-version: 7.3.3\n  update-type: version-update:semver-major\n");
+  const r = judge({ commits: [commit({ commit: { message: m, verification: { verified: true } } })] });
+  assert.match(r.reason, /^not patch or minor: astro \(version-update:semver-major\)$/);
+});
+
+test("a grouped member below 1.0 is judged as breaking, as a lone one is", () => {
+  const r = judge({ commits: [groupedCommit([...GROUP, { name: "tiny", from: "0.3.9", version: "0.4.0" }])] });
+  assert.match(r.reason, /below 1.0, or no version to read: tiny 0.4.0$/);
 });
 
 test("judgePr judges a message-read 0.y step as breaking, as it does a written one", () => {

@@ -9,8 +9,8 @@
 //   - every commit on it is authored by `dependabot[bot]` with a verified signature, so a commit
 //     pushed onto the branch by anyone else stops the merge;
 //   - every dependency it updates is `version-update:semver-patch` or `-minor`, read from the
-//     metadata block Dependabot writes into its commit message, or, for a one-dependency block
-//     with no `update-type`, from the versions its message names (updateTypeFromMessage);
+//     metadata block Dependabot writes into its commit message, or, for a dependency the block
+//     gives no `update-type`, from the versions its message names (updateTypeFromMessage);
 //   - the ecosystem is not `github_actions`, and neither its metadata nor its diff names a
 //     dependency the caller's `hold` globs match;
 //   - the default branch requires at least one status check besides `fleet-checks-gate`: that
@@ -25,11 +25,12 @@
 // the PR from a `pull_request` event payload, and this workflow runs on `workflow_run`, whose
 // payload has none. It applies the same checks as that action (author, commit author, verified
 // signature) and reads the same block. Dependabot leaves `update-type` out of a security update's
-// block (and of a version update it cannot classify), so a one-dependency block without one takes
-// its step from the old and new versions the message names, as the action infers a step from
-// version strings, but stricter: every `from A to B` pair the message writes for it must name the
-// block's own dependency and version and agree on the old one, and both versions must be
-// `x.y.z` with no pre-release (updateTypeFromMessage).
+// block (and of a version update it cannot classify), so a dependency without one takes its step
+// from the old and new versions the message names, as the action infers a step from version
+// strings, but stricter: every `from A to B` pair the message writes for it must name the block's
+// own version and agree on the old one, and both versions must be `x.y.z` with no pre-release
+// (updateTypeFromMessage). A grouped security update is a block of several such dependencies, each
+// read from its own ``Updates `x` from A to B`` line, so one major among them refuses the PR.
 
 const DEPENDABOT = "dependabot[bot]";
 const MERGEABLE_UPDATES = new Set(["version-update:semver-patch", "version-update:semver-minor"]);
@@ -103,23 +104,39 @@ const BODY_PAIRS = [
   /^Updates `([^`\n]+)`()() from (\S+) to (\S+)$/gm,
 ];
 
+// An `Updates` line the pair pattern cannot read could carry a member's other version (a second
+// directory's copy at a major), so any such line refuses rather than being passed over.
+const UPDATES_LINE = /^Updates `[^\n]*$/gm;
+const UPDATES_READ = new RegExp(BODY_PAIRS[1].source);
+
 /**
- * The semver step of a one-dependency update whose block has no `update-type`, read from the
- * versions its commit message names: `{ type }`, or `{ type: null, why }`, which is refused.
- * The body must write at least one `from A to B` pair, and every pair, the subject's included,
- * must name the block's own dependency and version and agree on the old version, so a lockfile
- * holding the dependency at two versions refuses. Both versions must be `x.y.z` with no
- * pre-release, and the step must go up.
+ * The semver step of one dependency whose block entry has no `update-type`, read from the versions
+ * its commit message names: `{ type }`, or `{ type: null, why }`, which is refused. `blockNames`
+ * is every dependency the block lists; with one, every pair the message writes, the subject's
+ * included, must name it. With several (a group), each pair must name one of them, and the pairs
+ * naming this dependency are the ones judged, so a member the body writes no line for refuses.
+ * The judged pairs must name the block's version and agree on the old one, so a lockfile holding
+ * the dependency at two versions refuses. Both versions must be `x.y.z` with no pre-release, and
+ * the step must go up.
  */
-function updateTypeFromMessage(message, { name, version }) {
+function updateTypeFromMessage(message, { name, version }, blockNames = [name]) {
   if (!name || !version) return { type: null, why: "the block names no dependency-name or no dependency-version" };
   const text = String(message ?? "").replace(/\r\n/g, "\n");
   const pairs = BODY_PAIRS.flatMap((re) => [...text.matchAll(re)].map((m) => ({ name: m[1] ?? m[2], from: m.at(-2), to: m.at(-1) })));
   if (!pairs.length) return { type: null, why: "the body writes no from-to versions" };
+  const unread = (text.match(UPDATES_LINE) ?? []).find((l) => !UPDATES_READ.test(l));
+  if (unread) return { type: null, why: `the body has an Updates line it cannot read: ${unread}` };
   const s = text.split("\n", 1)[0].match(SUBJECT);
   if (s) pairs.push({ name: s[1], from: s[2], to: s[3] });
-  const from = pairs[0].from;
-  if (pairs.some((p) => p.name !== name || p.to !== version || p.from !== from)) {
+  let own = pairs;
+  if (blockNames.length > 1) {
+    const stranger = pairs.find((p) => !blockNames.includes(p.name));
+    if (stranger) return { type: null, why: `the message writes versions for ${stranger.name}, which the block does not list` };
+    own = pairs.filter((p) => p.name === name);
+    if (!own.length) return { type: null, why: `the body writes no from-to versions for ${name}` };
+  }
+  const from = own[0].from;
+  if (own.some((p) => p.name !== name || p.to !== version || p.from !== from)) {
     return { type: null, why: `the message's from-to versions do not all name ${name} from ${from} to ${version}` };
   }
   const [a, b] = [parseVersion(from), parseVersion(version)];
@@ -283,12 +300,14 @@ function judgePr({ repo, defaultBranch, pr, commits, runHeadSha, held = () => fa
 
   const parsed = parseUpdates(head.commit?.message);
   if (!parsed) return no("the head commit carries no readable Dependabot metadata");
-  // The message's versions describe one dependency, so they fill in only a one-dependency block.
-  let updates = parsed;
-  if (parsed.length === 1 && parsed[0].updateType == null) {
-    const read = updateTypeFromMessage(head.commit.message, parsed[0]);
-    updates = [{ ...parsed[0], updateType: read.type, readFromMessage: true, unread: read.why ?? null }];
-  }
+  // Each dependency the block gives no step is read from the message's versions for it, so a
+  // grouped security update is judged member by member (updateTypeFromMessage).
+  const names = parsed.map((u) => u.name);
+  const updates = parsed.map((u) => {
+    if (u.updateType != null) return u;
+    const read = updateTypeFromMessage(head.commit.message, u, names);
+    return { ...u, updateType: read.type, readFromMessage: true, unread: read.why ?? null };
+  });
   const holding = [...new Set(updates.filter((u) => held(u.name)).map((u) => u.name))];
   if (holding.length) return no(`held by this repo's stub, merged in a session: ${holding.join(", ")}`);
   const blocked = updates.filter((u) => !MERGEABLE_UPDATES.has(u.updateType));
