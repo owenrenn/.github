@@ -99,44 +99,41 @@ function parseVersion(v) {
 // length rule changes: `Bumps [<name>](<url>) from <old> to <new>.`, and per copy or group member
 // ``Updates `<name>` from <old> to <new>``.
 const SUBJECT = /(?:^|\s)[Bb]ump (\S+) from (\S+) to (\S+)(?: in .+)?$/;
+const UPDATES_PAIR = "^Updates `([^`\\n]+)`()() from (\\S+) to (\\S+)$";
 const BODY_PAIRS = [
   /^Bumps (?:\[([^\]\n]+)\]\([^)\n]*\)|(\S+)) from (\S+) to (\S+)\.$/gm,
-  /^Updates `([^`\n]+)`()() from (\S+) to (\S+)$/gm,
+  new RegExp(UPDATES_PAIR, "gm"),
 ];
 
-// An `Updates` line the pair pattern cannot read could carry a member's other version (a second
-// directory's copy at a major), so any such line refuses rather than being passed over.
+// An `Updates` line the pair pattern cannot read could carry a dependency's other version (a
+// second directory's copy at a major), so any such line refuses, lone dependency or group.
 const UPDATES_LINE = /^Updates `[^\n]*$/gm;
-const UPDATES_READ = new RegExp(BODY_PAIRS[1].source);
+const UPDATES_READ = new RegExp(UPDATES_PAIR);
 
 /**
  * The semver step of one dependency whose block entry has no `update-type`, read from the versions
  * its commit message names: `{ type }`, or `{ type: null, why }`, which is refused. `blockNames`
- * is every dependency the block lists; with one, every pair the message writes, the subject's
- * included, must name it. With several (a group), each pair must name one of them, and the pairs
- * naming this dependency are the ones judged, so a member the body writes no line for refuses.
- * The judged pairs must name the block's version and agree on the old one, so a lockfile holding
- * the dependency at two versions refuses. Both versions must be `x.y.z` with no pre-release, and
- * the step must go up.
+ * is every dependency the block lists (one for a lone update, several for a group). Every pair the
+ * message writes, the subject's included, must name one of them, and the pairs naming this
+ * dependency are the ones judged, so one the body writes no line for refuses. The judged pairs
+ * must name the block's version and agree on the old one, so a lockfile holding the dependency at
+ * two versions refuses. Both versions must be `x.y.z` with no pre-release, and the step must go up.
  */
 function updateTypeFromMessage(message, { name, version }, blockNames = [name]) {
   if (!name || !version) return { type: null, why: "the block names no dependency-name or no dependency-version" };
   const text = String(message ?? "").replace(/\r\n/g, "\n");
-  const pairs = BODY_PAIRS.flatMap((re) => [...text.matchAll(re)].map((m) => ({ name: m[1] ?? m[2], from: m.at(-2), to: m.at(-1) })));
-  if (!pairs.length) return { type: null, why: "the body writes no from-to versions" };
   const unread = (text.match(UPDATES_LINE) ?? []).find((l) => !UPDATES_READ.test(l));
   if (unread) return { type: null, why: `the body has an Updates line it cannot read: ${unread}` };
+  const pairs = BODY_PAIRS.flatMap((re) => [...text.matchAll(re)].map((m) => ({ name: m[1] ?? m[2], from: m.at(-2), to: m.at(-1) })));
+  if (!pairs.length) return { type: null, why: "the body writes no from-to versions" };
   const s = text.split("\n", 1)[0].match(SUBJECT);
   if (s) pairs.push({ name: s[1], from: s[2], to: s[3] });
-  let own = pairs;
-  if (blockNames.length > 1) {
-    const stranger = pairs.find((p) => !blockNames.includes(p.name));
-    if (stranger) return { type: null, why: `the message writes versions for ${stranger.name}, which the block does not list` };
-    own = pairs.filter((p) => p.name === name);
-    if (!own.length) return { type: null, why: `the body writes no from-to versions for ${name}` };
-  }
+  const stranger = pairs.find((p) => !blockNames.includes(p.name));
+  if (stranger) return { type: null, why: `the message writes versions for ${stranger.name}, which the block does not list` };
+  const own = pairs.filter((p) => p.name === name);
+  if (!own.length) return { type: null, why: `the body writes no from-to versions for ${name}` };
   const from = own[0].from;
-  if (own.some((p) => p.name !== name || p.to !== version || p.from !== from)) {
+  if (own.some((p) => p.to !== version || p.from !== from)) {
     return { type: null, why: `the message's from-to versions do not all name ${name} from ${from} to ${version}` };
   }
   const [a, b] = [parseVersion(from), parseVersion(version)];

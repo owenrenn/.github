@@ -222,7 +222,7 @@ test("updateTypeFromMessage allows build metadata, and refuses a pre-release or 
 
 test("updateTypeFromMessage refuses, with a reason, anything it cannot read exactly", () => {
   const cases = [
-    [security({ subject: "chore(deps): bump lodash from 1.4.0 to 1.4.3" }), /do not all name node-forge/],
+    [security({ subject: "chore(deps): bump lodash from 1.4.0 to 1.4.3" }), /versions for lodash, which the block does not list/],
     [security({ subject: "chore(deps): bump node-forge from 1.4.0 to 1.4.5" }), /do not all name/],
     [security({ bumps: ["Bumps [node-forge](https://x) from 0.10.0 to 1.4.3."] }), /do not all name/],
     [security({ bumps: [] }), /writes no from-to versions/],
@@ -230,7 +230,11 @@ test("updateTypeFromMessage refuses, with a reason, anything it cannot read exac
     // A lockfile holding the dependency at two versions, written either way.
     [security({ bumps: ["Bumps [node-forge](https://x) from 1.4.0 to 1.4.3.", "Bumps [node-forge](https://x) from 0.10.0 to 1.4.3."] }), /do not all name/],
     [security({ bumps: ["Bumps [node-forge](https://x) from 1.4.0 to 1.4.3.", "Updates `node-forge` from 0.10.0 to 1.4.3"] }), /do not all name/],
-    [security({ bumps: ["Bumps [node-forge](https://x) from 1.4.0 to 1.4.3.", "Updates `lodash` from 4.17.20 to 4.17.21"] }), /do not all name/],
+    [security({ bumps: ["Bumps [node-forge](https://x) from 1.4.0 to 1.4.3.", "Updates `lodash` from 4.17.20 to 4.17.21"] }), /versions for lodash, which the block does not list/],
+    // An Updates line the pattern cannot read refuses a lone update too: it could hold another copy's version.
+    [security({ bumps: ["Bumps [node-forge](https://x) from 1.4.0 to 1.4.3.", "Updates `node-forge` from 1.4.0 to 2.0.0 in /web"] }), /an Updates line it cannot read/],
+    // ...and is named even when it is the only versions line in the body.
+    [security({ bumps: ["Updates `node-forge` from 1.4.0 to 2.0.0 in /web"] }), /an Updates line it cannot read/],
     [security({ from: "1.4.5" }), /not a step up/],
     [security({ from: "1.4.3" }), /not a step up/],
     [security({ from: "1.4" }), /not an x.y.z step/],
@@ -261,7 +265,7 @@ test("judgePr refuses a message-read major, and says why a read failed", () => {
   const major = securityCommit({ from: "1.4.0", version: "2.0.0" });
   assert.match(judge({ commits: [major] }).reason, /not patch or minor: node-forge \(version-update:semver-major; read from the message\)/);
   const other = securityCommit({ subject: "chore(deps): bump lodash from 1.4.0 to 1.4.3" });
-  assert.match(judge({ commits: [other] }).reason, /node-forge \(no update-type; the message's from-to versions do not all name node-forge from 1.4.0 to 1.4.3\)/);
+  assert.match(judge({ commits: [other] }).reason, /node-forge \(no update-type; the message writes versions for lodash, which the block does not list\)/);
 });
 
 // A grouped security update's message, in the shape a live one took: a group subject and `Bumps`
@@ -319,7 +323,19 @@ test("updateTypeFromMessage reads one member of a group from the lines naming it
   const names = GROUP.map((m) => m.name);
   assert.deepStrictEqual(updateTypeFromMessage(grouped(GROUP), dep("undici", "8.12.3"), names), { type: MINOR });
   // Read without the group's names, the other members' lines stop it: that is the one-dependency rule.
-  assert.match(updateTypeFromMessage(grouped(GROUP), dep("undici", "8.12.3")).why, /do not all name undici/);
+  assert.match(updateTypeFromMessage(grouped(GROUP), dep("undici", "8.12.3")).why, /versions for astro, which the block does not list/);
+});
+
+test("a subject naming a dependency the group does not list refuses it", () => {
+  const m = grouped(GROUP).replace(/^.*\n/, "chore(deps): bump lodash from 4.17.20 to 4.17.21\n");
+  assert.match(judge({ commits: [commit({ commit: { message: m, verification: { verified: true } } })] }).reason, /versions for lodash, which the block does not list/);
+});
+
+test("a block listing one dependency once per directory merges when every copy's line agrees, and refuses when one differs", () => {
+  const twice = [GROUP[2], GROUP[2]];
+  assert.strictEqual(judge({ commits: [groupedCommit(twice)] }).merge, true);
+  const apart = groupedCommit(twice, { lines: ["Updates `undici` from 8.11.2 to 8.12.3", "Updates `undici` from 7.0.0 to 8.12.3"] });
+  assert.match(judge({ commits: [apart] }).reason, /do not all name undici from 8.11.2 to 8.12.3/);
 });
 
 test("a grouped member's written update-type is judged as written, and only the members without one are read", () => {
