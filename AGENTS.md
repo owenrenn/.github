@@ -195,6 +195,11 @@ The panel reconnects after the machine wakes.
   stream's prefix containing the commit that added it. `cli.js changelog release <tag>` renders
   one release (an uncut tag renders what would ship); `cli.js changelog print`, the whole
   changelog. How releases, pre-releases and PR numbers resolve: `changelog.js`.
+- **A ticket in another repo goes in `issue: owner/repo#N`**, an optional frontmatter line. The
+  release line then cites `owner/repo#N` in place of `#<digits>`, which would link a ticket in
+  the caller's own repo; the filename keeps its digits, which still set the order. Any other
+  value fails the check. ⚠️ A release renders with the copy its `FLEET_CHECKS_REF` pins, and a
+  pin older than this key refuses it as unknown, so move the pin before a fragment uses it.
 - **The opt-out is a line in the PR body**, `Changelog: none — <why>`, for a change no user of
   the repo can see. The reason is required, and a literal `<why>` is not one. Docs-only PRs
   (every path under `docs/` or ending `.md`) and `[bot]` PRs are not asked for a fragment.
