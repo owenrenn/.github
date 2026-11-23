@@ -33,6 +33,19 @@ test("dead-paths: no baseline fails on an existing dead path; --write-baseline r
   } finally { r.cleanup(); }
 });
 
+test("dead-paths: a repo with a submodule runs, and the summary counts the paths it did not judge (#1909)", () => {
+  // The measured failure was exit 2: git check-ignore refused a path under the submodule.
+  const r = makeRepo();
+  try {
+    r.commit("init", { "src/a.ts": "// built by base/tools/build.py\n" });
+    r.git("update-index", "--add", "--cacheinfo", `160000,${r.git("rev-parse", "HEAD").trim()},base`);
+    r.git("commit", "-q", "-m", "add the submodule");   // not r.commit: its `add -A` would stage the gitlink's removal
+    const ok = run(r, ["dead-paths"]);
+    assert.equal(ok.code, 0, ok.err);
+    assert.match(ok.out, /0 dead path\(s\).*· 1 path\(s\) under a submodule or symlink skipped/);
+  } finally { r.cleanup(); }
+});
+
 test("dead-paths: a comment naming the baseline file is not recorded dead by the write that creates it", () => {
   const r = makeRepo();
   try {
