@@ -153,7 +153,7 @@ function deadPaths(flags, root, cfg) {
   // next run reports it fixed (#1561).
   if (flags["write-baseline"] && !tracked.includes(dp.BASELINE_PATH)) tracked.push(dp.BASELINE_PATH);
   const { docs, code, excused } = dp.selectCorpus(tracked, cfg.deadPaths);
-  const { findings, skippedIgnored } = dp.findDeadPaths({
+  const { findings, skippedIgnored, skippedOpaque } = dp.findDeadPaths({
     root, tracked, docs, code,
     linksResolveElsewhere: cfg.deadPaths.linksResolveElsewhere, foreignNames: cfg.deadPaths.foreignNames,
   });
@@ -162,10 +162,11 @@ function deadPaths(flags, root, cfg) {
   // The denominator is printed every run: a quiet run over a smaller corpus
   // must not read the same as a clean one (#867).
   const summary = `${findings.length} dead path(s) in ${Object.keys(live).length} file(s) · ${docs.length} docs, ` +
-    `${code.length} code files judged · ${excused.length} excused · ${skippedIgnored} gitignored path(s) skipped`;
+    `${code.length} code files judged · ${excused.length} excused · ${skippedIgnored} gitignored path(s) skipped · ` +
+    `${skippedOpaque} path(s) under a submodule or symlink skipped`;
 
   if (flags.json) {
-    process.stdout.write(`${JSON.stringify({ findings, targets: live, docs: docs.length, code: code.length, excused: excused.length, skippedIgnored }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ findings, targets: live, docs: docs.length, code: code.length, excused: excused.length, skippedIgnored, skippedOpaque }, null, 2)}\n`);
     return 0;
   }
   if (flags["write-baseline"]) {

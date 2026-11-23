@@ -26,6 +26,9 @@
  *     is a pattern, not a path, and is skipped whole rather than cut short.
  *   - A gitignored path is a build output or a per-machine file. A comment may
  *     name one ("the build writes target/release/…"), so it is skipped.
+ *   - A path under a submodule is another repository's tree, and a path
+ *     through a tracked symlink is not one git tracks. A link or comment path
+ *     under either one is skipped.
  *   - A path that resolves file-relative, from any folder above the file, or
  *     with a source extension added (`src/lib/cache-headers` → `.ts`), resolves.
  *   - A doc link inside a code span is an example of link syntax, not a link.
@@ -60,6 +63,16 @@ function trackedFiles(root) {
   // An empty answer from a repo is impossible; a clean verdict over zero files is the vacuous green (#867).
   if (files.length === 0) throw new Error(`trackedFiles(): git ls-files returned nothing under ${root}`);
   return files;
+}
+
+/**
+ * Every tracked entry git cannot see beneath, from the index: a submodule (mode 160000), whose files are another
+ * repository's tree, and a symlink (120000). `git ls-files` lists neither one's contents, and `git check-ignore`
+ * exits 128 on a path under either one (#1909).
+ */
+function opaqueEntries(root) {
+  const out = execFileSync("git", ["ls-files", "-s", "-z"], { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  return out.split("\0").filter((e) => /^1[26]0000 /.test(e)).map((e) => e.slice(e.indexOf("\t") + 1));
 }
 
 /** The subset of `paths` git would ignore. `check-ignore` matches patterns, so the paths need not exist. */
@@ -581,11 +594,16 @@ function ancestors(dir) {
  *        at a destination (a seeded template), so only their anchors are judged
  * @param {string[]} [o.foreignNames]  names of other repositories this repo's
  *        comments cite; a line near one is not judged (see foreignContext)
- * @returns {{findings:object[], skippedIgnored:number}}
+ * @param {string[]} [o.opaque]         submodule and symlink paths (see opaqueEntries); read
+ *        from `root`'s index when not given, so no caller can pass one to `git check-ignore`
+ * @returns {{findings:object[], skippedIgnored:number, skippedOpaque:number}}
  */
-function findDeadPaths({ root, tracked, docs = [], code = [], linksResolveElsewhere = new Set(), foreignNames = [] }) {
+function findDeadPaths({ root, tracked, docs = [], code = [], linksResolveElsewhere = new Set(), foreignNames = [], opaque = opaqueEntries(root) }) {
   const idx = makeIndex(tracked);
   const foreign = foreignContext(foreignNames);
+  // The entry itself is tracked and resolves; only what is beneath it is out of git's sight.
+  const underOpaque = (p) => opaque.some((s) => p.startsWith(`${s}/`));
+  let skippedOpaque = 0;
   const findings = [];
   const anchorCache = new Map();
   const anchors = (f) => {
@@ -619,6 +637,7 @@ function findDeadPaths({ root, tracked, docs = [], code = [], linksResolveElsewh
         }
         continue;
       }
+      if (underOpaque(resolved)) { skippedOpaque++; continue; }
       const onDisk = fs.existsSync(path.join(root, resolved));
       findings.push({
         file, line, target, resolved, kind: "link",
@@ -665,6 +684,8 @@ function findDeadPaths({ root, tracked, docs = [], code = [], linksResolveElsewh
           }
           continue;
         }
+        // Any reading under one may be the one the comment means, and git refuses to be asked about it.
+        if (norm.some(underOpaque)) { skippedOpaque++; continue; }
         // Every reading is probed for ignore, as every reading was tried for existence (#1695).
         pending.push({ file, line, target: token, resolved: norm[0], readings: norm });
       }
@@ -682,7 +703,7 @@ function findDeadPaths({ root, tracked, docs = [], code = [], linksResolveElsewh
     if (p.readings.some(isIgnored)) { skippedIgnored++; continue; }
     findings.push({ file: p.file, line: p.line, target: p.target, resolved: p.resolved, kind: "comment-path", reason: "names a path that does not exist in the repository" });
   }
-  return { findings, skippedIgnored };
+  return { findings, skippedIgnored, skippedOpaque };
 }
 
 // ── the ratchet ─────────────────────────────────────────────────────────────
@@ -759,7 +780,7 @@ function compareToBaseline(live, baseline) {
 
 module.exports = {
   DATED_RECORD_EXEMPTIONS, CHANGELOG_EXEMPTIONS, DEFAULT_EXEMPTIONS, DOC_EXTENSIONS,
-  trackedFiles, ignoredPaths, foreignContext, selectCorpus, globToRegExp, matchesAny, commentSyntax,
+  trackedFiles, opaqueEntries, ignoredPaths, foreignContext, selectCorpus, globToRegExp, matchesAny, commentSyntax,
   slugify, decode, anchorsInSource, anchorsOf, linksOf,
   hashComments, slashComments, commentsOf, pathCandidates,
   findDeadPaths, BASELINE_PATH, targetsByFile, renderBaseline, compareToBaseline,

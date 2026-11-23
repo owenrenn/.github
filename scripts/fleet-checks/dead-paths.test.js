@@ -8,6 +8,8 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const dp = require("./dead-paths.js");
 const { makeRepo } = require("./fixture.js");
@@ -185,6 +187,87 @@ test("a ./ path ignored under NEITHER reading is still a finding", () => {
     "config/foyer/dump.sh": "# reads ./supabase/gone.sql\n",
   });
   assert.deepEqual(findings.map((f) => f.target), ["./supabase/gone.sql"]);
+});
+
+/**
+ * The judge over a repo with a submodule at `base/`: a gitlink entry (mode 160000), which is what a checkout
+ * without `--recurse-submodules` holds. `git check-ignore` exits 128 on any path under it (#1909).
+ */
+function judgeWithSubmodule(files, opts = {}) {
+  const r = makeRepo();
+  try {
+    r.commit("init", files);
+    const sha = r.git("rev-parse", "HEAD").trim();
+    r.git("update-index", "--add", "--cacheinfo", `160000,${sha},base`);
+    r.git("commit", "-q", "-m", "add the submodule");
+    const tracked = dp.trackedFiles(r.root);
+    const { docs, code } = dp.selectCorpus(tracked, opts);
+    return { opaque: dp.opaqueEntries(r.root), ...dp.findDeadPaths({ root: r.root, tracked, docs, code, ...opts }) };
+  } finally {
+    r.cleanup();
+  }
+}
+
+test("opaqueEntries lists a submodule's path, and no ordinary file", () => {
+  const { opaque } = judgeWithSubmodule({ "src/a.ts": "" });
+  assert.deepEqual(opaque, ["base"]);
+});
+
+test("⚠️ a path through a tracked symlink is not judged, and the run does not crash (#1909)", (t) => {
+  // git check-ignore exits 128 on a path beyond a symlink too ("is beyond a symbolic link"), and a doc link
+  // through one exists on disk, so without the skip it read as "exists but is NOT tracked".
+  const r = makeRepo(t);
+  r.commit("init", { "real/a.ts": "", "docs/a.md": "[via](../lib/a.ts) [gone](missing.md)\n", "src/b.ts": "// see lib/gone.ts\n" });
+  fs.symlinkSync("real", path.join(r.root, "lib"));
+  r.commit("add the symlink");
+  const tracked = dp.trackedFiles(r.root);
+  assert.deepEqual(dp.opaqueEntries(r.root), ["lib"]);
+  const { docs, code } = dp.selectCorpus(tracked);
+  const { findings, skippedOpaque } = dp.findDeadPaths({ root: r.root, tracked, docs, code });
+  assert.deepEqual(findings.map((f) => [f.kind, f.target]), [["link", "missing.md"]]);
+  assert.equal(skippedOpaque, 2);
+});
+
+test("⚠️ a comment path inside a submodule is not judged, and the run does not crash (#1909)", () => {
+  // The measured shape: a comment citing the submodule's build script. Before the fix,
+  // git check-ignore exited 128 ("is in submodule 'base'") and the check could not run.
+  const { findings, skippedOpaque } = judgeWithSubmodule({
+    "src/a.ts": "// built by base/tools/build.py, see src/gone.ts\n",
+    "src/b.ts": "",
+  });
+  assert.deepEqual(findings.map((f) => f.target), ["src/gone.ts"]);
+  assert.equal(skippedOpaque, 1);
+});
+
+test("a comment path read from a folder above the file into a submodule is not judged either", () => {
+  // `tools/build.py` cited from `pkg/a.ts` is also read as `pkg/tools/build.py`; under a submodule at `pkg/tools`
+  // that reading is the submodule's tree, and it must not reach git check-ignore.
+  const r = makeRepo();
+  try {
+    r.commit("init", { "pkg/a.ts": "// runs tools/build.py\n", "tools/keep.sh": "" });
+    r.git("update-index", "--add", "--cacheinfo", `160000,${r.git("rev-parse", "HEAD").trim()},pkg/tools`);
+    r.git("commit", "-q", "-m", "add the submodule");
+    const tracked = dp.trackedFiles(r.root);
+    const { docs, code } = dp.selectCorpus(tracked);
+    const { findings, skippedOpaque } = dp.findDeadPaths({ root: r.root, tracked, docs, code });
+    assert.deepEqual(findings, []);
+    assert.equal(skippedOpaque, 1);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("⚠️ a doc link into a submodule is not judged; one beside it still is (#1909)", () => {
+  const { findings, skippedOpaque } = judgeWithSubmodule({
+    "docs/a.md": "[build](../base/tools/build.py) [dir](../base/docs/) [root](../base) [gone](missing.md)\n",
+  });
+  assert.deepEqual(findings.map((f) => [f.kind, f.target]), [["link", "missing.md"]]);
+  assert.equal(skippedOpaque, 2);
+});
+
+test("a path that only shares a submodule's name as a prefix is still judged", () => {
+  const { findings } = judgeWithSubmodule({ "basement/keep.ts": "", "src/a.ts": "// see basement/gone.ts\n" });
+  assert.deepEqual(findings.map((f) => f.target), ["basement/gone.ts"]);
 });
 
 test("a doc link and a comment anchor are judged against headings", () => {
